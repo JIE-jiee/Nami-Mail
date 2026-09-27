@@ -57,7 +57,7 @@ Request body:
 }
 ```
 
-For bodies up to 50,000 characters the response is a single JSON result:
+For bodies within the 5,000-character single-chunk limit the response is a single JSON result:
 
 ```json
 {
@@ -67,7 +67,7 @@ For bodies up to 50,000 characters the response is a single JSON result:
 }
 ```
 
-An external LibreTranslate-compatible runtime can additionally return `detectedLanguage`. For bodies over 50,000 characters the response becomes a `text/event-stream` SSE event stream: results are pushed as chunk events, and callers must consume the event stream rather than parsing JSON. See [Message Translation](TRANSLATION.en.md) for data boundaries, the three translation paths, and recovery guidance.
+An external LibreTranslate-compatible runtime can additionally return `detectedLanguage`. For bodies over 5,000 characters the text is split into multiple chunks and the response becomes a `text/event-stream` SSE event stream: results are pushed as chunk events, and callers must consume the event stream rather than parsing JSON. See [Message Translation](TRANSLATION.en.md) for data boundaries, the three translation paths, and recovery guidance.
 
 ## Compatibility and Evolution
 

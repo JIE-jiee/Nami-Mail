@@ -10,7 +10,7 @@ Message translation in Nami Mail is opt-in. It runs only when you explicitly cli
 
 With no translation service configured, Nami Mail uses a built-in free chain: the plain-text body is sent to the Google Translate public endpoint (`translate.googleapis.com`), with automatic fallback to MyMemory (`api.mymemory.translated.net`), using a 15-second timeout per request. Long bodies are chunked and stitched automatically.
 
-**Note: this path sends the message body to those third-party public endpoints.** It does not detect the source language; the language label on results reflects the target interface language. Accuracy caveats still apply. Translations live only in the current reader view — closing the reader, refreshing, or restarting the app requires translating again.
+**Note: this path sends the message body to those third-party public endpoints.** The built-in chain auto-detects the source language and surfaces the detected language on the result; the language label reflects the target interface language. Accuracy caveats still apply. Translations live only in the current reader view — closing the reader, refreshing, or restarting the app requires translating again.
 
 ### LibreTranslate-compatible service (optional)
 
