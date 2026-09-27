@@ -37,8 +37,12 @@ npm.cmd ci
 | `apps/web` | React/Vite 阅读、撰写、设置和服务商引导界面。 |
 | `apps/server` | 本地 Fastify API、IMAP/SMTP、OAuth、SQLite、同步和加密数据处理。 |
 | `apps/desktop` | Electron 主进程、preload、本机密钥保护、托盘/单实例和更新边界。 |
+| `packages/agent-contracts` | Agent、CLI 与 MCP 共享的接口契约（外部 Mail v1 工具、Broker 协议、错误码）。 |
+| `packages/agent-core` | Agent 会话编排与工具执行核心。 |
 | `scripts` | 原生模块验证、构建、安装包 smoke 和 GitHub Release 校验。 |
 | `build` | 受版本控制的品牌与 Windows 安装器资源。 |
+| `e2e` | Playwright 端到端测试。 |
+| `site` | 项目官网（GitHub Pages）构建源。 |
 
 本地运行数据和生成输出不应提交。`data/`、`.env`、旧本地构建目录 `release/`、`release-current/`、当前版本化输出 `release-artifacts/`、`artifacts/`、`output/`、SQLite 旁车文件、证书和密钥文件已经由 [`.gitignore`](../.gitignore) 排除。`build/` 保留品牌资源、安装器脚本和默认的空更新信任配置，属于受版本控制的源码，不能用宽泛忽略规则排除。
 
@@ -50,6 +54,8 @@ npm.cmd ci
 npm.cmd run build:brand:check
 npm.cmd run typecheck
 npm.cmd run test
+npm.cmd run lint
+npm.cmd run test:e2e
 npm.cmd run test:desktop-security
 npm.cmd run build
 npm.cmd run smoke:runtime

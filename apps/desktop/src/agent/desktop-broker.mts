@@ -335,7 +335,7 @@ function cliToolInput(command: string, argumentsValue: BrokerJsonValue): { toolN
   return mcpToolInput(command, argumentsValue);
 }
 
-const externalReadToolNames = ["accounts.list", "folders.list", "messages.list", "mail.summarize", "messages.get", "messages.batch_get", "threads.get", "attachments.list"] as const;
+const externalReadToolNames = ["accounts.list", "folders.list", "messages.list", "messages.search", "mail.summarize", "messages.get", "messages.batch_get", "threads.get", "attachments.list"] as const;
 const externalWriteToolNames = [
   "mail.draft.create",
   "mail.draft.update",

@@ -1,66 +1,72 @@
-# Message Translation
+# Message Body Translation
 
-[简体中文](TRANSLATION.zh-CN.md) | [English](TRANSLATION.en.md)
+[English](TRANSLATION.en.md) | [简体中文](TRANSLATION.zh-CN.md)
 
-Message translation is optional. Nami Mail runs it only after you explicitly select Translate while reading a message. It does not translate or send mail content automatically while receiving or syncing mail, opening a message, changing the interface language, or refreshing in the background.
+Message translation in Nami Mail is opt-in. It runs only when you explicitly click "Translate" while reading a message — collecting, syncing, opening mail, switching the interface language, or background refreshes never translate or send message content.
 
-## Two Runtime Modes
+## Three translation paths
 
-### Windows desktop: experimental local NLLB-200
+### Built-in free translation (default, no configuration)
 
-The current Windows desktop runtime injects a local NLLB-200 translation service instead of sending a message body to a LibreTranslate endpoint. On the first explicit translation, `@huggingface/transformers` prepares the model assets required for `Xenova/nllb-200-distilled-600M`; this can require network access and take time. Model assets are cached in Electron's user-data `translation-models` directory, typically `%APPDATA%\Nami Mail\translation-models`.
+With no translation service configured, Nami Mail uses a built-in free chain: the plain-text body is sent to the Google Translate public endpoint (`translate.googleapis.com`), with automatic fallback to MyMemory (`api.mymemory.translated.net`), using a 15-second timeout per request. Long bodies are chunked and stitched automatically.
 
-After the model is available, the selected message's plain-text body is processed by the local translation engine and is not sent to a translation endpoint. The cache contains model assets only, not message bodies or translation results. Removing the cache means a later first translation must prepare the model again. Translation results remain only in the current reader view; closing it, refreshing, or restarting the app requires another explicit translation request.
+**Note: this path sends the message body to those third-party public endpoints.** It does not detect the source language; the language label on results reflects the target interface language. Accuracy caveats still apply. Translations live only in the current reader view — closing the reader, refreshing, or restarting the app requires translating again.
 
-This is experimental machine translation. It does not detect the source language, and its reported language identifies the target interface language; the accuracy warning still applies. The desktop runtime manages its translation service, so Settings > Translation service cannot replace it with an external endpoint.
+### LibreTranslate-compatible service (optional)
 
-### LibreTranslate-compatible service: a runtime without injected local translation
+In "Settings > Translation service" you can configure a service that speaks the LibreTranslate `POST /translate` protocol, with an optional API key and timeout; saving takes effect immediately. Saving requires a valid service URL; to stop using the local configuration choose "Remove translation service" and confirm. That deletes the service URL and API key stored on this device; if the startup environment provides a configuration, removal falls back to it. To remove only a saved API key, choose "Remove saved key" separately; that action asks for confirmation again and does not save the service URL or timeout being edited. The API key is never shown again and is stored encrypted like local mail data. On Windows the database master key is protected by Electron's DPAPI.
 
-A command-line development runtime or another runtime that has not injected local NLLB can use a LibreTranslate-compatible `POST /translate` service. Only that kind of runtime allows Settings > Translation service to set a service address, optional API key, and timeout; saved changes take effect immediately. Saving requires a valid service address. To stop using a locally saved configuration, select Remove translation service and confirm the deletion. This removes the service address and API key saved on the device; if startup environment configuration exists, Nami Mail falls back to it. To remove only a saved API key, select Remove saved API key; the action requires confirmation and does not save an address or timeout currently being edited. An API key is never shown again after saving and is encrypted with local mail data. On Windows, the database master key is protected by Electron DPAPI.
-
-The process environment that starts Nami Mail, or the project-root `.env` in development, can still provide initial or deployment configuration:
+The startup process environment or a `.env` file in the repository root (development) can still provide initial/deployment configuration:
 
 ```dotenv
 NAMI_MAIL_TRANSLATION_ENDPOINT=https://translate.example.com/translate
-# Set this only when the service requires it.
+# Only when your provider requires it
 NAMI_MAIL_TRANSLATION_API_KEY=
-# 1000-60000; defaults to 25000.
+# 1000-60000; default 25000
 NAMI_MAIL_TRANSLATION_TIMEOUT_MS=25000
 ```
 
-- `NAMI_MAIL_TRANSLATION_ENDPOINT` must be a complete `/translate` URL with no query string, fragment, username, or password. It must use HTTPS, or local loopback HTTP such as `http://127.0.0.1:5000/translate` or `http://localhost:5000/translate`.
-- `NAMI_MAIL_TRANSLATION_API_KEY` is optional and is sent as the `api_key` field only when your service requires it. Do not commit it or put it in logs or screenshots.
-- `NAMI_MAIL_TRANSLATION_TIMEOUT_MS` accepts 1000 through 60000 milliseconds and defaults to 25000. Environment configuration is read at startup; a local configuration subsequently saved in Settings takes precedence and takes effect immediately.
+- `NAMI_MAIL_TRANSLATION_ENDPOINT` must be a full `/translate` URL without query parameters, fragments, usernames, or passwords. Only HTTPS is allowed, or loopback HTTP, e.g. `http://127.0.0.1:5000/translate`, `http://localhost:5000/translate`.
+- `NAMI_MAIL_TRANSLATION_API_KEY` is optional and is only sent as the `api_key` field when your service requires it. Never commit it to the repository, logs, or screenshots.
+- `NAMI_MAIL_TRANSLATION_TIMEOUT_MS` is 1000 to 60000 ms; when unset it defaults to 25000 ms. Environment configuration is read at startup; a local configuration saved in Settings later takes priority and applies immediately.
 
-A Windows runtime using the external service can still read an endpoint and timeout from `%APPDATA%\Nami Mail\nami-mail.env` as startup configuration. That file cannot store an API key; use Settings > Translation service to save a key, or provide it from a managed startup environment. The current Windows desktop local-NLLB path does not use that configuration as a translation endpoint. Do not commit an API key or put it in logs or screenshots.
+Windows runtimes using an external service can also read the endpoint and timeout from `%APPDATA%\Nami Mail\nami-mail.env` as startup configuration. That file cannot hold an API key; save the key in "Settings > Translation service" or provide it through a managed startup environment. Never commit the API key to the repository, logs, or screenshots.
 
-The service must accept a request like this and return JSON containing at least a `translatedText` string:
+The service should accept a JSON request like the one below and return JSON with at least a `translatedText` string:
 
 ```json
 {
-  "q": "The message plain-text body",
+  "q": "plain text body of the message",
   "source": "auto",
   "target": "en",
   "format": "text"
 }
 ```
 
-The target is the base language code of the current interface locale. For example, `zh-CN` becomes `zh`. If the service requires an API key, it must handle the `api_key` field according to the LibreTranslate-compatible protocol.
+The target language is derived from the current interface language, e.g. `zh-CN` becomes `zh`. When the provider requires an API key, handle the `api_key` field per its LibreTranslate-compatible protocol. External services may additionally return `detectedLanguage` as the detection result.
 
-## Data And Control
+### LLM translation (fallback path, requires a configured model)
 
-When a LibreTranslate-compatible service is used, Nami Mail decrypts the current message's plain-text body locally and sends that body to the configured endpoint only after Translate is selected. The subject, account addresses, attachments, attachment contents, and local database are not automatically uploaded for translation.
+After configuring and verifying a model under "Agent model providers", the reader's translation panel can translate the current message through a large language model: pick a configured provider and model, and the body is sent to that model endpoint with results streamed back. This path:
 
-External translation does not fall back to another service, and it does not persist or cache translation results in the local database, files, or a separate cache. Service configuration is encrypted on this device. The Windows desktop local-NLLB model cache likewise stores neither translation results nor message bodies. Demo mode contacts no translation endpoint and shows a locally deterministic preview instead.
+- follows the Agent cloud authorization gate — unavailable unless "allow sending selected message content to cloud models" is enabled;
+- rejects bodies over 50,000 characters with `413`;
+- incurs provider-side costs; the UI shows a cost and scope notice before the call.
 
-Before sending a message body to a third-party translation service, review its privacy policy, processing location, and organization compliance requirements. Messages can contain sensitive information. HTTPS does not replace your assessment of the selected provider.
+LLM translation is an alternative when the regular paths fail or are unavailable — it is not the default.
 
-## Results And Errors
+## Data and control
 
-Machine translation can misread terminology, dates, negation, names, code samples, or formatting. It is reading assistance, not the sole basis for legal, financial, medical, safety, or business decisions. Check important content against the original message.
+All three paths send the **plain-text body of the current message** to the target you chose: the built-in chain sends it to the Google Translate / MyMemory public endpoints; the LibreTranslate-compatible path sends it to your configured service endpoint; the LLM path sends it to your configured model provider. Beyond that, subjects, account addresses, attachments, attachment content, and the local database are never uploaded automatically by translation.
 
-When the body is empty or exceeds 50000 characters, Nami Mail keeps the original message and shows a specific error. A LibreTranslate-compatible service also reports a configuration error when no endpoint is configured. For external translation-service connections it distinguishes certificate validation, TLS handshake, DNS resolution, network reachability, connection refusal, connection interruption, and timeout. Do not disable certificate verification when a TLS certificate error occurs; instead check the system time, proxy, and service certificate.
+Translation requests are not retried against other services, and results are not persisted in the local database, files, or a separate cache. Service configuration is stored encrypted on the device. Demo mode never contacts a translation endpoint and shows a local deterministic preview.
 
-For external service responses, 401/403/407 means that the API key, access permission, or proxy authentication should be checked; 429 means the service is rate limiting; and 5xx means the service is temporarily unavailable. Nami Mail never exposes a translation service response body in the interface. Check that the endpoint ends with `/translate`, then verify network/proxy policy, the service API key, and the timeout before manually retrying.
+Before sending a body to a third-party translation service or model provider, review its privacy policy, data-processing location, and compliance requirements. Mail can contain sensitive information; even over HTTPS, Nami Mail cannot replace your own security assessment of the provider. If you do not want the body to leave the machine, do not use translation.
 
-When initial local-NLLB preparation fails or the local engine is unavailable, Nami Mail reports local translation as unavailable. Check network availability for the first use, free writable space in the user-data directory, and model-cache integrity, then restart and retry manually. Do not disable TLS verification to work around a model-asset download problem.
+## Results and troubleshooting
+
+Machine translation can mistranslate terminology, dates, negation, names, code snippets, or formatting. Use it as reading aid only — never as the sole basis for legal, financial, medical, safety, or business decisions; verify important content against the original.
+
+The built-in and LibreTranslate paths chunk long bodies automatically; the LLM path caps bodies at 50,000 characters and returns `413` beyond that. With a LibreTranslate-compatible service, a missing endpoint also reports a configuration error; connection problems distinguish TLS certificate verification failures, TLS negotiation failures, unresolvable DNS, unreachable networks, refused connections, dropped connections, and timeouts. On TLS certificate errors, do not disable verification — check system time, proxies, and the server certificate.
+
+When an external translation service returns 401/403/407, check the API key, access rights, or proxy authentication; 429 means rate limiting; 5xx means the service is temporarily unavailable. Nami Mail never shows the service's response body in the UI. Check that the endpoint ends with `/translate`, your network/proxy policy, the service API key, and the timeout, then retry manually.

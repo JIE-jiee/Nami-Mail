@@ -4,7 +4,7 @@
 
 ## Scope
 
-This plan covers only Agent-owned `agent_*` tables, encrypted pages, source events, conversations, confirmations, audit, and provider configuration. It does not rewrite existing mail schema, IMAP cache, SMTP outbox, or experimental local NLLB translation data.
+This plan covers only Agent-owned `agent_*` tables, encrypted pages, source events, conversations, confirmations, audit, and provider configuration. It does not rewrite existing mail schema, IMAP cache, SMTP outbox, or translation service configuration data.
 
 ## Preconditions
 

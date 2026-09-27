@@ -15,13 +15,13 @@ See [Architecture and Trust Boundaries](ARCHITECTURE.en.md) for process and data
 
 ## Translation Capability
 
-Translation processes the selected message's plain-text body only after an explicit reader request. These endpoints do not send the subject, addresses, attachments, HTML, or raw message to a translation service.
+Translation processes the plain-text body of the selected message only after the reader explicitly requests it. Subjects, addresses, attachments, HTML, and the raw message never reach a translation service through these endpoints. The three runtime paths (built-in free translation, LibreTranslate-compatible services, LLM translation) are described in [Message Translation](TRANSLATION.en.md).
 
 ### `GET /api/translation/status`
 
-Returns runtime availability without returning a service address, API key, model-cache path, or message content.
+Returns the runtime's capability without exposing the service URL, API key, or message content. Possible response shapes:
 
-Example for a LibreTranslate-compatible runtime:
+Runtimes that do not manage translation configuration (e.g. development):
 
 ```json
 {
@@ -29,45 +29,23 @@ Example for a LibreTranslate-compatible runtime:
 }
 ```
 
-Example for the Windows local NLLB runtime:
+With managed configuration and no external service configured, the built-in free translator (Google Translate + MyMemory fallback) is always available:
+
+```json
+{
+  "enabled": true,
+  "mode": "builtin"
+}
+```
+
+With an external service configured, the response reports the enabled state and, on configuration errors, a stable `configurationError` category:
 
 ```json
 {
   "enabled": false,
-  "mode": "local",
-  "local": {
-    "mode": "local",
-    "state": "unprepared",
-    "downloadEstimatedBytes": 900000000,
-    "progress": null
-  }
+  "configurationError": "configuration_invalid_endpoint"
 }
 ```
-
-`local.state` is `unprepared`, `preparing`, `ready`, or `failed`. `enabled` is `true` only for `ready`. On a preparation failure, `local.errorCode` provides only a stable recovery category, never a download URL, file path, or underlying error text.
-
-### `POST /api/translation/prepare`
-
-Supported only by the Windows local NLLB runtime. This request contains no message content. It starts loading or downloading the model only after the user has explicitly chosen Prepare local translation in the UI. The request returns `202 Accepted` immediately; poll the status endpoint instead of submitting it repeatedly.
-
-```json
-{
-  "ok": true,
-  "mode": "local",
-  "local": {
-    "mode": "local",
-    "state": "preparing",
-    "downloadEstimatedBytes": 900000000,
-    "progress": 42
-  }
-}
-```
-
-The response returns `409` with `translation_preparation_unavailable` when the runtime does not use a local model. It returns `503` when local preparation cannot start. Common stable error codes are:
-
-- `translation_model_download_failed`: check the network, VPN/proxy, and firewall.
-- `translation_model_cache_unavailable`: check free space and write permission for Nami Mail's data directory.
-- `translation_model_unavailable`: prepare again; if it keeps failing, restart Nami Mail and try again.
 
 ### `POST /api/messages/:id/translate`
 
@@ -79,7 +57,7 @@ Request body:
 }
 ```
 
-Successful response:
+For bodies up to 50,000 characters the response is a single JSON result:
 
 ```json
 {
@@ -89,12 +67,10 @@ Successful response:
 }
 ```
 
-An external LibreTranslate-compatible runtime can additionally return `detectedLanguage`. Local NLLB never presents a language guess as a detection result. See [Message Translation](TRANSLATION.en.md) for data boundaries, first model preparation, and recovery guidance.
-
-Local NLLB accepts this request only when `local.state` is `ready`. When the model is `unprepared`, `preparing`, or `failed`, it returns `409` with `translation_preparation_required` and does not implicitly download or load the model. The caller must first show an explicit preparation action, then poll the status endpoint until the model is ready.
+An external LibreTranslate-compatible runtime can additionally return `detectedLanguage`. For bodies over 50,000 characters the response becomes a `text/event-stream` SSE event stream: results are pushed as chunk events, and callers must consume the event stream rather than parsing JSON. See [Message Translation](TRANSLATION.en.md) for data boundaries, the three translation paths, and recovery guidance.
 
 ## Compatibility and Evolution
 
 - Consumers must branch on HTTP status and stable `code`; never parse Chinese or English error text.
-- When `mode` and `local` are absent, consumers must handle the existing external-translation configuration runtime and must not assume a local model exists.
+- When `mode` and `local` are absent, consumers must handle the runtime as an existing external-translation configuration; `mode: "builtin"` means no external service is configured and the built-in translator is always available.
 - This page describes only the protected local protocol used by the GUI. External Mail v1 has its own Broker, pairing, account-snapshot, and permission contract. Changes to an external CLI, MCP, IPC, or network interface must retain an independent threat model, permission design, and end-to-end validation.

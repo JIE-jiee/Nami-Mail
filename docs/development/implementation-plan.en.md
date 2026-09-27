@@ -12,7 +12,7 @@ This plan defines the implementation order for the local-first NamiMail Agent, m
 - Mail and attachments are untrusted data. Models may receive them only as context, never as instructions or authorization.
 - Cloud-model egress is off by default. A user must visibly consent for a provider before selected context may be sent to it.
 - Send, forward, permanent delete, and bulk writes require a visible, immutable, one-time GUI confirmation. `--yes`, MCP, and model output cannot bypass it.
-- Experimental local NLLB-200 translation remains separate and optional. It is not the default Agent model, does not translate mail automatically, and preserves the existing explicit translation notice.
+- Message translation remains separate and optional. It is not the default Agent model, does not translate mail automatically, and preserves the existing explicit translation notice; the body goes to the endpoint of the chosen translation path.
 
 ## Phases
 

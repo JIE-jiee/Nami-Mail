@@ -471,11 +471,11 @@ test("Broker allow-list routes only declared external tools and rejects unknown 
     assert.equal(unknown.response.payload.success, false);
     assert.equal(unknown.response.payload.error?.code, "NOT_SUPPORTED");
 
-    const obsolete = await send("messages.search", "5", { query: "invoice" });
-    assert.equal(obsolete.response.payload.success, false);
-    assert.equal(obsolete.response.payload.error?.code, "NOT_SUPPORTED");
+    const search = await send("messages.search", "5", { query: "invoice" });
+    assert.equal(search.response.payload.success, true);
+    assert.equal(search.response.payload.data?.tool, "messages.search");
 
-    assert.deepEqual(routed.map((entry) => entry.toolName), ["mail.summarize", "messages.move", "messages.batch_get"]);
+    assert.deepEqual(routed.map((entry) => entry.toolName), ["mail.summarize", "messages.move", "messages.batch_get", "messages.search"]);
     await host.close();
   });
 });
