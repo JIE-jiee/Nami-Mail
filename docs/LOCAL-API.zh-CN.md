@@ -57,7 +57,7 @@
 }
 ```
 
-正文不超过 50,000 字符时返回单个 JSON 结果：
+正文不超过单块上限 5,000 字符时返回单个 JSON 结果：
 
 ```json
 {
@@ -67,7 +67,7 @@
 }
 ```
 
-外部 LibreTranslate 兼容运行时可以额外返回 `detectedLanguage`。正文超过 50,000 字符时，响应改为 `text/event-stream` 的 SSE 事件流：结果按块以事件形式推送，调用方必须按事件流消费，不能按 JSON 解析。完整的数据边界、三条翻译路径与故障处理见[邮件正文翻译](TRANSLATION.zh-CN.md)。
+外部 LibreTranslate 兼容运行时可以额外返回 `detectedLanguage`。正文超过 5,000 字符（单块上限）时会被拆分为多个分块，响应改为 `text/event-stream` 的 SSE 事件流：结果按块以事件形式推送，调用方必须按事件流消费，不能按 JSON 解析。完整的数据边界、三条翻译路径与故障处理见[邮件正文翻译](TRANSLATION.zh-CN.md)。
 
 ## 兼容性与演进
 
