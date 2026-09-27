@@ -48,6 +48,6 @@ npm.cmd run smoke:installer
 
 ## 发布前人工验证
 
-至少在安装版 Windows 应用中验证安全管道真实 DACL（不是 mock）、CLI/MCP 只读访问、用户可见确认、账号删除不可读取旧内容、更新排空、应用重启后的 RAG 重建以及本地 NLLB 翻译仍是可选主动功能。没有这些证据，不得将功能标记为 release-ready。
+至少在安装版 Windows 应用中验证安全管道真实 DACL（不是 mock）、CLI/MCP 只读访问、用户可见确认、账号删除不可读取旧内容、更新排空、应用重启后的 RAG 重建以及邮件正文翻译仍是可选主动功能。没有这些证据，不得将功能标记为 release-ready。
 
 参见 [发布检查清单](release-checklist.zh-CN.md) 和 [RAG 故障排查](../rag/troubleshooting.zh-CN.md)。

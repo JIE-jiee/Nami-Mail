@@ -9,7 +9,7 @@ This checklist is a release gate, not a future-work wish list. Do not publish an
 - [ ] Chinese/English documentation pairs, relative links, and commands are checked; planned capabilities are not written as shipped.
 - [ ] Agent/RAG/CLI/MCP schemas, error codes, permissions, and user copy are reviewed.
 - [ ] All new code comments are English; no debug keys, test credentials, real mail, or local databases enter version control.
-- [ ] Local NLLB-200 translation remains explicitly experimental, opt-in, and not an Agent provider.
+- [ ] Message translation remains explicitly opt-in and is not an Agent provider.
 
 ## Security blockers
 
