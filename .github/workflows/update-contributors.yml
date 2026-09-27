@@ -20,6 +20,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 concurrency:
   group: update-contributors
@@ -48,6 +49,7 @@ jobs:
       # is set to auto-merge (squash) so it merges automatically once the
       # required "validate" status check passes — no manual review needed.
       - name: Open or update pull request
+        id: pr
         if: steps.update.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f
         with:
@@ -63,5 +65,15 @@ jobs:
             merge automatically once the required status checks pass.
           labels: "automated,documentation"
           author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+      # PRs created with the default GITHUB_TOKEN do not trigger the validate
+      # workflow (GitHub's recursion prevention), so the required check would
+      # never report and the auto-merge would stall. workflow_dispatch is the
+      # documented exception: dispatch validation onto the PR branch
+      # explicitly, then let the branch's auto-merge finish the job.
+      - name: Trigger validation for the pull request
+        if: steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run validate.yml --ref "chore/update-contributors"
           auto-merge: squash
 
