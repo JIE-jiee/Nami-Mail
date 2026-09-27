@@ -23,6 +23,8 @@ concurrency:
 
 jobs:
   deploy:
+    # The public docs site belongs to the upstream repository.
+    if: github.repository == 'QinIndexCode/nami-mail'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
