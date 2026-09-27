@@ -29,6 +29,8 @@ concurrency:
 
 jobs:
   sync:
+    # This wiki is maintained by the upstream repository, not this fork.
+    if: github.repository == 'QinIndexCode/nami-mail'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
