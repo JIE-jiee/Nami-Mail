@@ -18,7 +18,6 @@ Choose a scope before asking. The scope defines which mail the assistant may ret
 | --- | --- |
 | All accounts | Analyzes mail across all accounts; suitable for cross-account summaries |
 | Current account | Only the account of the currently selected message (a message must be selected) |
-| Current message | Only the currently selected single message (a message must be selected) |
 
 Mail outside the scope is never retrieved or sent; content sent to cloud models is always bounded by the selected scope.
 

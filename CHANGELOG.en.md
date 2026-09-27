@@ -1,5 +1,24 @@
 ## [Unreleased]
 
+### Added
+
+- Sidebar folder display mode: switch between focused (single-account view with a bottom folder list) and a multi-account tree mode (every account stays visible and folds its folders independently); the preference is stored locally. (#95, Issue #88)
+- Gmail sign-in guidance: defaults to the 16-digit app password with OAuth as an opt-in path, a direct shortcut to Google's app-passwords page, a side drawer covering the 2FA prerequisite and guided steps, and automatic whitespace stripping for credentials. (#95, Issue #86)
+
+### Fixed
+
+- Conversation strip resilience: server thread snapshots merge instead of replacing, the reader resolves members through a strip-membership witness, and background refreshes no longer evict messages opened from conversation chips — eliminating the "click a chip, back to the list" defect. Chips gained hover explanations and a member count.
+- External Agent channel: `messages search` (CLI) / `namimail_messages_search` (MCP) is available again through the Broker forwarding list.
+- The contributor-list auto-update workflow resumes automatic runs now that the repository allows GitHub Actions to create pull requests.
+
+### Changed
+
+- Removed the automated wiki sync workflow: the default GITHUB_TOKEN cannot reach the wiki repository, so syncing is done manually with `scripts/wiki-sync.mjs`; the wiki home template gained a project overview. (#97/#98)
+
+### Dependencies
+
+- dompurify 3.4.15, @fastify/static 10.1.4 (with content-disposition 3.0.0), jszip 3.10.2.
+
 ## [0.4.2] - 2026-09-25
 
 ### Fixed
