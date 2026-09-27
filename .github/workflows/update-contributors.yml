@@ -1,39 +1,34 @@
 name: Update contributors
 
-# Runs every day at 03:00 UTC, or manually, or whenever README files change.
-# GitHub Actions allows scheduled runs as frequent as every 5 minutes;
-# once per day is well within limits and consumes only 1–2 API calls
-# against the 5 000 req/h GITHUB_TOKEN quota.
+# Runs daily at 03:00 UTC or manually. This low-risk generated README update
+# commits directly to main and intentionally has no push trigger.
 on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "README.md"
-      - "README.zh-CN.md"
-      - "README.en.md"
-      - "scripts/update-contributors.mjs"
-      - ".github/workflows/update-contributors.yml"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: update-contributors
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        # v7.0.1; keep credentials so this workflow can push its README-only commit.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: true
 
       - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        # v7.0.0 runs on Node.js 24; the project script uses Node 22.
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 22.14.0
 
@@ -44,24 +39,15 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/update-contributors.mjs
 
-      # Opens a PR when the contributor list changes. The PR targets main and
-      # is set to auto-merge (squash) so it merges automatically once the
-      # required "validate" status check passes — no manual review needed.
-      - name: Open or update pull request
+      - name: Commit contributor changes
         if: steps.update.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: update contributor list [skip ci]"
-          branch: chore/update-contributors
-          delete-branch: true
-          title: "chore: update contributor list"
-          body: |
-            Automated contributor list refresh.
-
-            This PR was opened by the **Update contributors** workflow. It will
-            merge automatically once the required status checks pass.
-          labels: "automated,documentation"
-          author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
-          auto-merge: squash
-
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- README.md README.zh-CN.md README.en.md
+          if git diff --cached --quiet; then
+            echo "Contributor READMEs are already up to date."
+            exit 0
+          fi
+          git commit -m "chore: update contributor list [skip ci]"
+          git push origin HEAD:main
