@@ -637,23 +637,23 @@ test("release workflow isolates read-only validation from credential-minimized p
   assert.equal(workflow.concurrency["cancel-in-progress"], false);
   for (const jobName of ["validate", "release"]) {
     const checkout = workflow.jobs[jobName].steps.find(
-      (step) => step.uses === "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+      (step) => step.uses === "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
     );
     assert.equal(checkout.with["persist-credentials"], false, `${jobName} checkout must not persist its token.`);
     assert.ok(
       workflow.jobs[jobName].steps.some(
-        (step) => step.uses === "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+        (step) => step.uses === "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
       ),
       `${jobName} must pin setup-node to its reviewed implementation.`,
     );
     const setupNode = workflow.jobs[jobName].steps.find(
-      (step) => step.uses === "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+      (step) => step.uses === "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
     );
     assert.equal(setupNode.with["node-version"], "22.14.0", `${jobName} must use the supported Node.js minimum.`);
   }
   const packageStep = workflow.jobs.release.steps.find((step) => step.run === "npm run publish:github");
   const diagnosticsStep = workflow.jobs.release.steps.find(
-    (step) => step.uses === "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    (step) => step.uses === "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   );
   const validateCommands = workflow.jobs.validate.steps.map((step) => step.run).filter(Boolean);
   assert.deepEqual(validateCommands, [
@@ -715,19 +715,19 @@ test("pull request validation runs the release gate without write credentials", 
   assert.equal(workflow.permissions.contents, "read");
   assert.equal(workflow.jobs.validate.permissions.contents, "read");
   assert.equal("environment" in workflow.jobs.validate, false, "Pull-request validation must not receive a protected environment.");
-  assert.equal(workflow.jobs.validate["runs-on"], "windows-latest");
+  assert.equal(workflow.jobs.validate["runs-on"], "windows-2025");
   assert.equal(workflow.concurrency["cancel-in-progress"], true);
   const checkout = workflow.jobs.validate.steps.find(
-    (step) => step.uses === "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+    (step) => step.uses === "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   );
   assert.equal(checkout.with["persist-credentials"], false);
   const setupNode = workflow.jobs.validate.steps.find(
-    (step) => step.uses === "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+    (step) => step.uses === "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
   );
   assert.equal(setupNode.with["node-version"], "22.14.0", "Pull-request validation must use the supported Node.js minimum.");
   assert.ok(
     workflow.jobs.validate.steps.some(
-      (step) => step.uses === "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+      (step) => step.uses === "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
     ),
   );
   const commands = workflow.jobs.validate.steps.map((step) => step.run).filter(Boolean);
