@@ -275,6 +275,7 @@ const accountOne: Account = {
   id: "account-1",
   email: "me@example.com",
   provider: "demo",
+  authMethod: "password",
   providerName: "Demo",
   status: "connected",
   lastError: null,

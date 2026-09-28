@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import fs from "node:fs";
 import type { Readable } from "node:stream";
 import { z } from "zod";
+import type { Message } from "@nami/agent-contracts";
 import type { RuntimeContext, AccountRecord } from "../types.js";
 import {
   validationMessage,
@@ -114,7 +115,8 @@ function rewriteCidReferences(html: string, messageId: string, attachments: { pa
   });
 }
 
-function messageRow(row: MessageStorageRow, masterKey: Buffer) {
+/** Serializes a message row for the wire. Shape authority: `Message` in @nami/agent-contracts. */
+function messageRow(row: MessageStorageRow, masterKey: Buffer): Message {
   const flags = JSON.parse(String(row.flags_json ?? "[]")) as string[];
   const payload = messagePayloadForRow(row, masterKey);
   const pendingDestination = pendingMoveDestination(row);
@@ -123,11 +125,18 @@ function messageRow(row: MessageStorageRow, masterKey: Buffer) {
   const pendingArchive = pendingDestination !== null
     && (row.pending_move_special_use === "\\Archive"
       || (row.pending_move_special_use === "\\All" && row.all_mail_archived === 1));
+  // Join-derived columns are typed by the list/detail queries, not by
+  // MessageStorageRow itself; assert here once instead of at every call site.
+  const accountEmail = row.account_email as string;
+  const providerName = row.provider_name as string;
+  const sentAt = row.sent_at as string;
+  const size = row.size as number;
+  const snoozedUntil = (row.snoozed_until ?? null) as string | null;
   return {
     id: row.id,
     accountId: row.account_id,
-    accountEmail: row.account_email,
-    providerName: row.provider_name,
+    accountEmail,
+    providerName,
     mailbox: pendingDestination ?? row.mailbox,
     uid: row.uid,
     movePending,
@@ -140,7 +149,7 @@ function messageRow(row: MessageStorageRow, masterKey: Buffer) {
     messageId: payload.messageId,
     inReplyTo: payload.inReplyTo,
     references: payload.references ?? [],
-    sentAt: row.sent_at,
+    sentAt,
     snippet: payload.snippet,
     textBody: payload.textBody,
     htmlBody: rewriteCidReferences(payload.htmlBody, row.id, payload.attachments),
@@ -149,8 +158,8 @@ function messageRow(row: MessageStorageRow, masterKey: Buffer) {
     flagged: flags.includes("\\Flagged"),
     hasAttachments: Boolean(row.has_attachments),
     attachments: payload.attachments ?? [],
-    size: row.size,
-    snoozedUntil: row.snoozed_until,
+    size,
+    snoozedUntil,
   };
 }
 

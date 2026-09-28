@@ -10,6 +10,7 @@ const account: Account = {
   id: "account-1",
   email: "nami@example.com",
   provider: "demo",
+  authMethod: "password",
   providerName: "Demo",
   status: "connected",
   lastError: null,

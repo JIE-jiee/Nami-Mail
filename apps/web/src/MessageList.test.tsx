@@ -24,6 +24,7 @@ const account: Account = {
   id: "account-1",
   email: "me@example.com",
   provider: "imap",
+  authMethod: "password",
   providerName: "Example Mail",
   status: "connected",
   lastError: null,

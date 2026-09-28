@@ -1,43 +1,36 @@
 import {
   appSettingsCoreDefaults,
+  type AccountWire,
   type AppSettingsCore,
 } from "@nami/agent-contracts";
 
-export type Folder = {
-  path: string;
-  name: string;
-  specialUse: string | null;
-  total: number;
-  unseen: number;
+// Mail wire DTOs are single-sourced in @nami/agent-contracts (zod schema authority,
+// consumed at compile time). Do not redeclare them here — extend the contract
+// package instead so server and web cannot drift.
+import type {
+  Contact,
+  Folder,
+  MailAddress,
+  Message,
+  MessageAttachment,
+  Stats,
+} from "@nami/agent-contracts";
+
+export type {
+  Contact,
+  Folder,
+  MailAddress,
+  Message,
+  MessageAttachment,
+  Stats,
 };
 
-export type Account = {
-  id: string;
-  email: string;
-  provider: string;
-  providerName: string;
-  status: string;
-  lastError: string | null;
-  /** Stable server-side classification for lastError, when a sync failed. */
-  lastErrorCode?: string | null;
-  /** Non-fatal condition from the most recent successful sync (e.g. 'sync_limit'). */
-  lastSyncWarningCode?: string | null;
-  lastSyncedAt: string | null;
-  signature: string;
-  createdAt: string;
-  folders: Folder[];
-};
-
-export type MailAddress = { name: string; address: string };
-
-export type MessageAttachment = {
-  partId: string;
-  filename: string;
-  contentType: string;
-  size: number;
-  related: boolean;
-  disposition: "attachment" | "inline";
-};
+/**
+ * `AccountWire` as `publicAccount` serializes it, plus the `folders` payload
+ * that GET /api/accounts assembles per account. (The add-account response
+ * omits `folders`; consumers treat an empty list accordingly.)
+ */
+export type Account = AccountWire & { folders: Folder[] };
 
 export type OutboundAttachment = {
   token: string;
@@ -66,43 +59,6 @@ export type OutboundSubmission = {
   confirmedAt: string | null;
   createdAt: string;
   updatedAt: string;
-};
-
-export type Message = {
-  id: string;
-  accountId: string;
-  accountEmail: string;
-  providerName: string;
-  mailbox: string;
-  uid: number;
-  /** Whether this message is confirmed as archived, including a verified pending move. */
-  archived?: boolean;
-  /** A move is reconciling, so actions that require stable folder membership stay disabled. */
-  movePending?: boolean;
-  /** The server confirmed a move but cannot safely identify the target UID. */
-  moveLocationUnverified?: boolean;
-  subject: string;
-  from: MailAddress;
-  to: MailAddress[];
-  cc: MailAddress[];
-  /** RFC Message-ID of this message, when the provider supplied one. */
-  messageId?: string | null;
-  /** RFC In-Reply-To header retained for re-opening a reply draft. */
-  inReplyTo?: string | null;
-  /** RFC References chain retained for reply threading. */
-  references?: string[];
-  sentAt: string;
-  snippet: string;
-  textBody: string;
-  htmlBody: string;
-  flags: string[];
-  seen: boolean;
-  flagged: boolean;
-  hasAttachments: boolean;
-  attachments: MessageAttachment[];
-  size: number;
-  /** Local "snoozed until" marker. While set, the message is hidden from the unified inbox. */
-  snoozedUntil?: string | null;
 };
 
 export type ProviderInfo = {
@@ -238,18 +194,6 @@ export type FilterRuleInput = {
 
 export type FilterRuleUpdate = Partial<FilterRuleInput>;
 
-/** A local address book entry. Fields are encrypted at rest by the local service. */
-export type Contact = {
-  id: string;
-  email: string;
-  name: string;
-  notes: string;
-  /** True when the row was seeded automatically from an incoming message sender. */
-  autoCollected: boolean;
-  createdAt: string;
-  updatedAt: string;
-};
-
 export type ContactInput = {
   email: string;
   name?: string;
@@ -306,8 +250,6 @@ export type CalendarEventInput = {
 };
 
 export type CalendarEventUpdate = Partial<CalendarEventInput>;
-
-export type Stats = { accounts: number; messages: number; unread: number; starred?: number; snoozed?: number; attachments?: number };
 
 export type {
   AgentAccessLevel,

@@ -8,7 +8,7 @@ import type { TranslationResult } from "./translation.js";
 import type { TranslationServiceError } from "./translation.js";
 import type { AppSettings } from "./settings.js";
 import type { ServerEventBus } from "./events.js";
-import type { ExternalPairingSummary } from "@nami/agent-contracts";
+import type { AccountWire, ExternalPairingSummary } from "@nami/agent-contracts";
 
 /**
  * Structured translation service interface shared by external HTTP endpoints
@@ -101,7 +101,8 @@ export type RuntimeContext = {
   onAccountDeleted?: (accountId: string) => Promise<void> | void;
 };
 
-export function publicAccount(row: AccountRecord) {
+/** Serializes an account row for the wire. Shape authority: `AccountWire` in @nami/agent-contracts. */
+export function publicAccount(row: AccountRecord): AccountWire {
   return {
     id: row.id,
     email: row.email,
