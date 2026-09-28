@@ -73,17 +73,12 @@ import { OpenAiCompatibleProvider } from "./agent/openai-compatible-provider.js"
 import { AnthropicMessagesProvider } from "./agent/anthropic-provider.js";
 import { GeminiProvider } from "./agent/gemini-provider.js";
 import { OpenAiResponsesProvider } from "./agent/openai-responses-provider.js";
-import { McpStdioClient, probeMcpServer, type McpServerCapabilities } from "./agent/mcp-client.js";
+import { type AgentMcpServerInput, type AgentMcpServerSummary } from "./agent/mcp-server-store.js";
 import {
-  AgentMcpServerStore,
-  AgentMcpServerStoreError,
-  configurationFingerprint,
-  type AgentMcpServerCheck,
-  type AgentMcpServerConfiguration,
-  type AgentMcpServerInput,
-  type AgentMcpServerSummary,
-} from "./agent/mcp-server-store.js";
-import { createMcpAgentTools } from "./agent/mcp-tool-adapter.js";
+  AgentMcpServerManager,
+  type AgentMcpServerList,
+  type AgentMcpSyncReport,
+} from "./agent/mcp-server-manager.js";
 export type { AgentMcpServerInput, AgentMcpServerSummary } from "./agent/mcp-server-store.js";
 import { decryptRootAgentRecord, encryptRootAgentRecord, canonicalAgentJson } from "./agent/store-crypto.js";
 import type { AgentSourceEventOutbox } from "./agent/source-events.js";
@@ -209,15 +204,8 @@ const externalReadScopes = ["read:accounts", "read:folders", "read:messages", "r
 /** Ordering used to clamp a paired client's requested level to its configured level. */
 const externalAccessLevelRank: Record<AgentAccessLevel, number> = { "read-only": 0, "send-confirmed": 1, "full-access": 2 };
 
-export type AgentMcpServerList = {
-  items: AgentMcpServerSummary[];
-};
-
-/** Result of a one-shot external MCP server synchronization pass. */
-export type AgentMcpSyncReport = {
-  connected: string[];
-  failed: Array<{ id: string; label: string; error: string }>;
-};
+// MCP 域已抽至 agent/mcp-server-manager.ts；类型在此再导出以保持公共面不变。
+export type { AgentMcpServerList, AgentMcpSyncReport } from "./agent/mcp-server-manager.js";
 
 export type AgentConversationScope = {
   mode: "all_accounts" | "selected_account" | "current_message";
@@ -656,7 +644,7 @@ function linkAbortSignals(controller: AbortController, signals: readonly (AbortS
  */
 export class AgentService {
   private readonly providerService: AgentProviderService;
-  private readonly mcpServers: AgentMcpServerStore;
+  private readonly mcpManager: AgentMcpServerManager;
   private readonly conversations: EncryptedConversationStore;
   private readonly audit: EncryptedAgentAuditStore;
   private readonly rag: AgentRagWorker;
@@ -676,15 +664,9 @@ export class AgentService {
   // In-memory cache for conversation summaries to avoid decrypting all messages
   // on every listConversations()/bootstrap() call. Invalidated on any write.
   private summaryCache: Map<string, AgentConversationSummary> | null = null;
-  // Live external MCP server processes and the registry names they contributed.
-  private readonly mcpClients = new Map<string, McpStdioClient>();
-  private readonly mcpServerToolNames = new Map<string, string[]>();
-  private readonly mcpFingerprints = new Map<string, string>();
-  private mcpSyncPromise: Promise<AgentMcpSyncReport> | null = null;
 
   constructor(private readonly options: AgentServiceOptions) {
     this.providerService = new AgentProviderService(options.db, options.masterKey);
-    this.mcpServers = new AgentMcpServerStore(options.db, options.masterKey);
     this.conversations = new EncryptedConversationStore(options.db, options.lifecycle);
     this.audit = new EncryptedAgentAuditStore(options.db, options.masterKey, options.lifecycle);
     this.memory = options.memoryStore ?? new EncryptedAgentMemoryStore(options.db, options.masterKey);
@@ -717,6 +699,7 @@ export class AgentService {
         ...(options.onSettingsChanged ? { onChanged: options.onSettingsChanged } : {}),
       }),
     ]);
+    this.mcpManager = new AgentMcpServerManager(options.db, options.masterKey, this.tools);
     this.confirmationStore = options.desktopConfirmation
       ? new ImmutableGuiConfirmationStore(
         options.db,
@@ -839,10 +822,7 @@ export class AgentService {
     for (const run of this.activeRuns.values()) run.controller.abort();
     for (const pending of [...this.pendingConfirmations.values()]) this.settlePendingConfirmation(pending, "cancelled");
     this.activeRuns.clear();
-    for (const client of this.mcpClients.values()) client.close();
-    this.mcpClients.clear();
-    this.mcpServerToolNames.clear();
-    this.mcpFingerprints.clear();
+    this.mcpManager.dispose();
     await this.rag.stop();
   }
 
@@ -877,176 +857,27 @@ export class AgentService {
   }
 
   mcpServerList(): AgentMcpServerList {
-    return { items: this.mcpServers.list() };
+    return this.mcpManager.list();
   }
 
   createMcpServer(input: AgentMcpServerInput): AgentMcpServerSummary {
-    try {
-      return this.mcpServers.save(input);
-    } catch (error) {
-      throw this.mapMcpStoreError(error);
-    }
+    return this.mcpManager.create(input);
   }
 
   updateMcpServer(id: string, input: AgentMcpServerInput): AgentMcpServerSummary {
-    try {
-      if (!this.mcpServers.get(id)) throw new AgentMcpServerStoreError("NOT_FOUND", "MCP 服务器配置不存在。", 404);
-      const updated = this.mcpServers.save(input, id);
-      // The configuration changed; drop any live process so the next run reconnects.
-      this.disconnectMcpServer(id);
-      return updated;
-    } catch (error) {
-      throw this.mapMcpStoreError(error);
-    }
+    return this.mcpManager.update(id, input);
   }
 
   async checkMcpServer(id: string, signal?: AbortSignal): Promise<AgentMcpServerSummary> {
-    let configuration: AgentMcpServerConfiguration;
-    try {
-      const stored = this.mcpServers.get(id);
-      if (!stored) throw new AgentMcpServerStoreError("NOT_FOUND", "MCP 服务器配置不存在。", 404);
-      configuration = stored;
-    } catch (error) {
-      throw this.mapMcpStoreError(error);
-    }
-    const fingerprint = configurationFingerprint(configuration);
-    const probe = await probeMcpServer({
-      command: configuration.command,
-      args: configuration.args,
-      env: configuration.env,
-      ...(configuration.cwd ? { cwd: configuration.cwd } : {}),
-      connectTimeoutMs: Math.min(configuration.timeoutMs, 15_000),
-      requestTimeoutMs: configuration.timeoutMs,
-    }, { signal });
-    if (signal?.aborted) throw new AgentServiceError("CANCELLED", "MCP 服务器连接检查已取消。", 499, true);
-    const checkedAt = new Date().toISOString();
-    const check: AgentMcpServerCheck = probe.ok
-      ? {
-        ok: true,
-        toolCount: probe.toolCount,
-        toolNames: probe.toolNames,
-        ...(probe.capabilities ? { serverInfo: probe.capabilities.serverInfo } : {}),
-        checkedAt,
-      }
-      : { ok: false, toolNames: [], error: probe.error, checkedAt };
-    try {
-      return this.mcpServers.saveCheck(id, fingerprint, check);
-    } catch (error) {
-      throw this.mapMcpStoreError(error);
-    }
+    return this.mcpManager.check(id, signal);
   }
 
   deleteMcpServer(id: string): void {
-    try {
-      if (!this.mcpServers.remove(id)) throw new AgentMcpServerStoreError("NOT_FOUND", "MCP 服务器配置不存在。", 404);
-    } catch (error) {
-      throw this.mapMcpStoreError(error);
-    }
-    this.disconnectMcpServer(id);
+    this.mcpManager.delete(id);
   }
 
-  /**
-   * Connects enabled MCP servers and registers their tools into the shared
-   * Tool Registry. Runs are serialized through mcpSyncPromise so concurrent
-   * Agent turns share one synchronization pass.
-   */
   async syncMcpServers(signal?: AbortSignal): Promise<AgentMcpSyncReport> {
-    if (this.mcpSyncPromise) return this.mcpSyncPromise;
-    this.mcpSyncPromise = this.performMcpSync(signal);
-    try {
-      return await this.mcpSyncPromise;
-    } finally {
-      this.mcpSyncPromise = null;
-    }
-  }
-
-  private async performMcpSync(signal?: AbortSignal): Promise<AgentMcpSyncReport> {
-    const configured = this.mcpServers.listAll();
-    const enabledIds = new Set(configured.filter((entry) => entry.enabled).map((entry) => entry.id));
-    for (const id of [...this.mcpClients.keys()]) {
-      if (!enabledIds.has(id)) this.disconnectMcpServer(id);
-    }
-    const connected: string[] = [];
-    const failed: AgentMcpSyncReport["failed"] = [];
-    for (const configuration of configured) {
-      if (!configuration.enabled) continue;
-      if (signal?.aborted) break;
-      try {
-        await this.connectMcpServer(configuration, signal);
-        connected.push(configuration.id);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "MCP 服务器连接失败。";
-        failed.push({ id: configuration.id, label: configuration.label, error: message });
-      }
-    }
-    return { connected, failed };
-  }
-
-  private async connectMcpServer(configuration: AgentMcpServerConfiguration, signal?: AbortSignal): Promise<void> {
-    const fingerprint = configurationFingerprint(configuration);
-    const existing = this.mcpClients.get(configuration.id);
-    if (existing && existing.isConnected && this.mcpFingerprints.get(configuration.id) === fingerprint) return;
-    if (existing) this.disconnectMcpServer(configuration.id);
-    const client = new McpStdioClient({
-      command: configuration.command,
-      args: configuration.args,
-      env: configuration.env,
-      ...(configuration.cwd ? { cwd: configuration.cwd } : {}),
-      connectTimeoutMs: Math.min(configuration.timeoutMs, 15_000),
-      requestTimeoutMs: configuration.timeoutMs,
-    });
-    let capabilities: McpServerCapabilities;
-    try {
-      capabilities = await client.connect({ signal });
-    } catch (error) {
-      client.close();
-      throw error;
-    }
-    this.mcpClients.set(configuration.id, client);
-    this.mcpFingerprints.set(configuration.id, fingerprint);
-    this.registerMcpTools(configuration.id, configuration.label, capabilities.tools);
-  }
-
-  private registerMcpTools(serverId: string, serverLabel: string, tools: McpServerCapabilities["tools"]): void {
-    this.unregisterMcpTools(serverId);
-    const client = this.mcpClients.get(serverId);
-    if (!client) return;
-    const registered: string[] = [];
-    for (const tool of createMcpAgentTools({ client, serverId, serverLabel, tools })) {
-      const result = this.tools.register(tool);
-      if (result.ok) registered.push(tool.descriptor.name);
-    }
-    this.mcpServerToolNames.set(serverId, registered);
-  }
-
-  private unregisterMcpTools(serverId: string): void {
-    for (const name of this.mcpServerToolNames.get(serverId) ?? []) {
-      this.tools.unregister(name);
-    }
-    this.mcpServerToolNames.delete(serverId);
-  }
-
-  /** Names of every tool currently registered from an external MCP server. */
-  private externalMcpToolNames(): ReadonlySet<string> {
-    const names = new Set<string>();
-    for (const registered of this.mcpServerToolNames.values()) {
-      for (const name of registered) names.add(name);
-    }
-    return names;
-  }
-
-  private disconnectMcpServer(serverId: string): void {
-    this.unregisterMcpTools(serverId);
-    this.mcpClients.get(serverId)?.close();
-    this.mcpClients.delete(serverId);
-    this.mcpFingerprints.delete(serverId);
-  }
-
-  private mapMcpStoreError(error: unknown): unknown {
-    if (error instanceof AgentMcpServerStoreError) {
-      return new AgentServiceError(error.code, error.message, error.statusCode, error.retryable);
-    }
-    return error;
+    return this.mcpManager.sync(signal);
   }
 
   bootstrap(): AgentBootstrap {
@@ -1913,7 +1744,7 @@ export class AgentService {
       // When cloud mail-content is not authorized, mail-scoped tools and any
       // external MCP tools are hidden: an external tool can return mail or
       // private content that would otherwise flow to the cloud provider.
-      const externalMcpToolNames = this.externalMcpToolNames();
+      const externalMcpToolNames = this.mcpManager.externalToolNames();
       const availableTools = input.mode !== "agent" ? [] : canUseMailContext
         ? [...this.tools.list()]
         : [...this.tools.list()].filter((tool) =>

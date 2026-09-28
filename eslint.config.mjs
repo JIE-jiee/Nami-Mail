@@ -141,7 +141,7 @@ export default tseslint.config(
   },
   {
     files: ["apps/server/src/agent-service.ts"],
-    rules: { "max-lines": ["error", { max: 3060, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 2890, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["apps/desktop/src/main.mts"],
