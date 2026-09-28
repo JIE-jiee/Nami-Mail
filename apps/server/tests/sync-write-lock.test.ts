@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { acquireAccountWriteSlots, withAccountWriteLocks, withHeldWriteSlots } from "../src/sync.js";
+import { acquireAccountWriteSlots, withAccountWriteLocks, withHeldWriteSlots } from "../src/sync-locks.js";
 
 describe("account write locks", () => {
   it("nested acquisition of the same account is a reentrant no-op (no self-deadlock)", async () => {

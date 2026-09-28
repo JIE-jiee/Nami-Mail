@@ -114,4 +114,44 @@ export default tseslint.config(
       "no-control-regex": "off",
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 分层卡口（防回弹）：路由层不得直接执行 SQL。
+  //
+  // 存量 39 处（messages 17 / accounts 15 / avatars 5 / filter-rules 2）已全部
+  // 迁入领域模块，因此规则现在是 error：任何新的路由内 SQL 都会让 lint 失败。
+  // ---------------------------------------------------------------------------
+  {
+    files: ["apps/server/src/routes/**/*.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "CallExpression[callee.property.name=/^(prepare|transaction|exec|run)$/]",
+          message: "路由层不得直接执行 SQL；请把查询搬进领域函数后调用。",
+        },
+      ],
+    },
+  },
+
+  // 巨型文件冻结：只允许瘦身，不允许继续增长（阈值为当前行数 + 少量余量）。
+  {
+    files: ["apps/web/src/App.tsx"],
+    rules: { "max-lines": ["error", { max: 4450, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    files: ["apps/server/src/agent-service.ts"],
+    rules: { "max-lines": ["error", { max: 3060, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    files: ["apps/desktop/src/main.mts"],
+    rules: { "max-lines": ["error", { max: 2120, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    // 反思轮发现：把代码搬进未冻结的文件即可绕过上述棘轮（App.tsx 的反弹路径）。
+    // 补齐剩余巨型 TS 文件。styles.css 无法由 eslint 解析，其棘轮见
+    // apps/web/src/styles-size.test.ts（与 designTokens.test.ts 同一读取模式）。
+    files: ["apps/web/src/AgentWorkspace.tsx"],
+    rules: { "max-lines": ["error", { max: 2460, skipBlankLines: false, skipComments: false }] },
+  },
 );

@@ -14,8 +14,7 @@ import { useDialogFocus } from "./hooks/useDialogFocus";
 import { useDismissTransition } from "./hooks/useDismissTransition";
 import { useStablePagedListHeight } from "./hooks/useStablePagedListHeight";
 import { copyTextToClipboard } from "./settings/settings-utils";
-
-type Notice = { kind: "success" | "error"; message: string } | null;
+import { FormNotice, type Notice } from "./FormNotice";
 
 /** Accounts past this count unlock the search / pagination / bulk toolbar. */
 const ACCOUNTS_PER_PAGE = 5;
@@ -372,12 +371,7 @@ export default function AccountsDialog({
       >
         <section className="settings-section settings-accounts">
           <span className="visually-hidden" role="status" aria-live="polite">{copyAnnouncement}</span>
-          {notice && (
-            <div className={`form-status ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>
-              {notice.kind === "success" ? <Check size={17} /> : <X size={17} />}
-              {notice.message}
-            </div>
-          )}
+          <FormNotice notice={notice} />
           {accounts.length === 0 ? (
             <div className="settings-empty-card accounts-empty-card">
               <Mail className="empty-icon" size={32} strokeWidth={1.5} />

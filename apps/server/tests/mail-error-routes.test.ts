@@ -19,7 +19,17 @@ vi.mock("../src/mail.js", async (importOriginal) => {
 
 vi.mock("../src/sync.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/sync.js")>();
-  return { ...actual, syncAccount, updateMessageFlags, moveMessage };
+  return { ...actual, syncAccount };
+});
+
+vi.mock("../src/sync-flags.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sync-flags.js")>();
+  return { ...actual, updateMessageFlags };
+});
+
+vi.mock("../src/sync-moves.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sync-moves.js")>();
+  return { ...actual, moveMessage };
 });
 
 vi.mock("../src/drafts.js", async (importOriginal) => {

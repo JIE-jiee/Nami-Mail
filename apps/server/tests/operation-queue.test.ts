@@ -7,8 +7,8 @@ const { moveMessage, batchMoveMessages } = vi.hoisted(() => ({
 
 // The operation queue serializes through the real sync write locks, so only
 // the executor entry points are replaced.
-vi.mock("../src/sync.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/sync.js")>();
+vi.mock("../src/sync-moves.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sync-moves.js")>();
   return { ...actual, moveMessage, batchMoveMessages };
 });
 

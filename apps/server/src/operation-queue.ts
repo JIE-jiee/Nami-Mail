@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseHandle } from "./db.js";
-import { acquireAccountWriteSlots, withHeldWriteSlots, withTimeout } from "./sync.js";
+import { acquireAccountWriteSlots, withHeldWriteSlots, withTimeout } from "./sync-locks.js";
 import { serverLog } from "./logging.js";
 
 /**

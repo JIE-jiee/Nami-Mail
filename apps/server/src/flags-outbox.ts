@@ -27,17 +27,10 @@ import type { OperationQueue } from "./operation-queue.js";
 import type { AgentMailEventSink } from "./agent/mail-state-events.js";
 import { imapClientForAccount, type AccountAccessTokenProvider } from "./mail.js";
 import { moveActionBlockedError } from "./message-storage.js";
-import { accountById } from "./sync.js";
+import { messageFlagNames, type MessageFlagsPatch } from "./message-flags.js";
+export type { MessageFlagsPatch };
+import { accountById } from "./sync-locks.js";
 
-export type MessageFlagsPatch = {
-  seen?: boolean;
-  flagged?: boolean;
-};
-
-const messageFlagNames = {
-  seen: "\\Seen",
-  flagged: "\\Flagged",
-} as const;
 
 export type LocalFlagsCommit = {
   updated: number;

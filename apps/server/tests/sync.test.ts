@@ -21,20 +21,17 @@ import {
   type MessageStorageRow,
 } from "../src/message-storage.js";
 import { markSubmissionSubmitted, prepareSubmission, submissionForId } from "../src/outbox.js";
+import { syncAccount } from "../src/sync.js";
+import { scheduleSentSubmissionVerification, verifySubmissionInSentMailbox } from "../src/sync-sent-verify.js";
+import { batchMoveMessages, moveMessage } from "../src/sync-moves.js";
+import { updateMessageFlags, updateMessageFlagsBatch } from "../src/sync-flags.js";
 import {
   ACCOUNT_SYNC_WAIT_MS,
-  scheduleSentSubmissionVerification,
-  batchMoveMessages,
   markAccountMoving,
-  moveMessage,
-  syncAccount,
   unmarkAccountMoving,
-  updateMessageFlags,
-  updateMessageFlagsBatch,
-  verifySubmissionInSentMailbox,
   waitForAccountSyncIdle,
   waitUntil,
-} from "../src/sync.js";
+} from "../src/sync-locks.js";
 
 describe("IMAP message flag updates", () => {
   let db: DatabaseHandle;

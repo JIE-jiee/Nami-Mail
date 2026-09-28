@@ -52,6 +52,7 @@ import type {
   NotificationSound,
 } from "./types";
 import { defaultAppSettings } from "./types";
+import { FormNotice, type Notice } from "./FormNotice";
 import {
   soundOptions,
   closeBehaviorOptions,
@@ -100,7 +101,6 @@ export function expandedThemedSelectOwnsEscape(
   return Boolean(selectControl?.querySelector('[role="combobox"][aria-expanded="true"]'));
 }
 
-type Notice = { kind: "success" | "error"; message: string } | null;
 type PendingSettingsConfirmation =
   | "clear-background"
   | "restore-defaults"
@@ -943,7 +943,7 @@ export default function SettingsModal({
             ))}
           </nav>
           <div className="settings-body" ref={settingsBody}>
-            {notice && <div className={`form-status ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "success" ? <Check size={17} /> : <X size={17} />}{notice.message}</div>}
+            <FormNotice notice={notice} />
 
             <section className="settings-section" data-settings-nav="language" aria-labelledby="language-settings">
               <div className="settings-section-title">

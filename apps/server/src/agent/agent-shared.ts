@@ -3,6 +3,8 @@
  * knowledge and of imports, so every extracted module can use them without
  * creating cycles.
  */
+
+import { createHash } from "node:crypto";
 export class AgentServiceError extends Error {
   constructor(
     readonly code: string,
@@ -16,6 +18,11 @@ export class AgentServiceError extends Error {
   }
 }
 
+
+/** Content-addressed id prefix: stable across runs and machines. */
+export function sha256Digest(value: string): string {
+  return `sha256.${createHash("sha256").update(value, "utf8").digest("base64url")}`;
+}
 
 export function now(): string {
   return new Date().toISOString();

@@ -20,6 +20,7 @@ import {
   PENDING_MOVE_RECONCILIATION_ERROR,
   moveActionBlockedError,
 } from "./message-storage.js";
+import { pendingPushRowById } from "./message-queries.js";
 import type { AccountRecord } from "./types.js";
 import {
   accountById,
@@ -29,7 +30,7 @@ import {
   unmarkAccountMoving,
   waitForAccountSyncIdle,
   withAccountWriteLocks,
-} from "./sync.js";
+} from "./sync-locks.js";
 
 // ---------------------------------------------------------------------------
 // Move-target definitions
@@ -181,17 +182,7 @@ export async function moveMessageToFolder(
   accessTokenProvider?: AccountAccessTokenProvider,
   agentEvents?: AgentMailEventSink,
 ): Promise<MessageMoveResult> {
-  const message = db
-    .prepare("SELECT account_id, mailbox, uid, flags_json, remote_id_lookup, pending_move_destination, pending_move_state FROM messages WHERE id = ?")
-    .get(messageId) as {
-      account_id: string;
-      mailbox: string;
-      uid: number;
-      flags_json: string;
-      remote_id_lookup: string | null;
-      pending_move_destination: string | null;
-      pending_move_state: string | null;
-    } | undefined;
+  const message = pendingPushRowById(db, messageId);
   if (!message) throw new Error("Message not found.");
   const moveBlockedError = moveActionBlockedError(message);
   if (moveBlockedError && !isRecoverableStaleMove(message)) throw new Error(moveBlockedError);
@@ -272,17 +263,7 @@ export async function moveMessage(
   agentEvents?: AgentMailEventSink,
   options?: MoveMessageOptions,
 ): Promise<MessageMoveResult> {
-  const message = db
-    .prepare("SELECT account_id, mailbox, uid, flags_json, remote_id_lookup, pending_move_destination, pending_move_state FROM messages WHERE id = ?")
-    .get(messageId) as {
-      account_id: string;
-      mailbox: string;
-      uid: number;
-      flags_json: string;
-      remote_id_lookup: string | null;
-      pending_move_destination: string | null;
-      pending_move_state: string | null;
-    } | undefined;
+  const message = pendingPushRowById(db, messageId);
   if (!message) throw new Error("Message not found.");
   // A move already being reconciled must block before the target folder is
   // resolved: the provider folder may not exist (e.g. no Trash on the account)
@@ -599,17 +580,7 @@ async function moveMessageCore(
   agentEvents?: AgentMailEventSink,
   options?: MoveMessageOptions,
 ): Promise<MessageMoveResult> {
-  const message = db
-    .prepare("SELECT account_id, mailbox, uid, flags_json, remote_id_lookup, pending_move_destination, pending_move_state FROM messages WHERE id = ?")
-    .get(messageId) as {
-      account_id: string;
-      mailbox: string;
-      uid: number;
-      flags_json: string;
-      remote_id_lookup: string | null;
-      pending_move_destination: string | null;
-      pending_move_state: string | null;
-  } | undefined;
+  const message = pendingPushRowById(db, messageId);
   if (!message) throw new Error("Message not found.");
   const account = accountById(db, message.account_id);
   if (!account) throw new Error("Account not found.");

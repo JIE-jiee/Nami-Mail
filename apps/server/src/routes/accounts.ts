@@ -13,6 +13,14 @@ import {
   validationMessage,
 } from "../helpers.js";
 import {
+  accountById,
+  accountExists,
+  accountIdByEmail,
+  insertPasswordAccountRow,
+  listAccountRows,
+  listFolderRows,
+  updateAccountSignature,
+} from "../account-store.js";import {
   accountDiscoverySchema,
   accountSignaturePatchSchema,
   credentialsSchema,
@@ -97,9 +105,7 @@ export function registerAccountRoutes(
           code: "invalid_request",
           message: validationMessage(parsed.error),
         });
-    const existing = context.db
-      .prepare("SELECT id FROM accounts WHERE email = ? COLLATE NOCASE")
-      .get(parsed.data.email);
+    const existing = accountIdByEmail(context.db, parsed.data.email);
     if (existing)
       return reply
         .code(409)
@@ -143,37 +149,26 @@ export function registerAccountRoutes(
       provider,
       { imap: imapUsername, smtp: smtpUsername },
     );
-    context.db
-      .prepare(
-        `
-        INSERT INTO accounts (
-          id, email, provider, provider_name, encrypted_password, credential_crypto_version, auth_method,
-          imap_host, imap_port, imap_secure, imap_transport, imap_username,
-          smtp_host, smtp_port, smtp_secure, smtp_transport, smtp_username,
-          username_mode, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'password', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?)
-      `,
-      )
-      .run(
-        id,
-        parsed.data.email,
-        provider.id,
-        provider.name,
-        encryptAccountPassword(credentialIdentity, parsed.data.password, context.masterKey),
-        ACCOUNT_CREDENTIAL_CRYPTO_VERSION,
-        provider.imap.host,
-        provider.imap.port,
-        provider.imap.secure ? 1 : 0,
-        provider.imap.transport,
-        imapUsername,
-        provider.smtp.host,
-        provider.smtp.port,
-        provider.smtp.secure ? 1 : 0,
-        provider.smtp.transport,
-        smtpUsername,
-        provider.usernameMode ?? "email",
-        now,
-      );
+    insertPasswordAccountRow(context.db, {
+      id,
+      email: parsed.data.email,
+      providerId: provider.id,
+      providerName: provider.name,
+      encryptedPassword: encryptAccountPassword(credentialIdentity, parsed.data.password, context.masterKey),
+      credentialCryptoVersion: ACCOUNT_CREDENTIAL_CRYPTO_VERSION,
+      imapHost: provider.imap.host,
+      imapPort: provider.imap.port,
+      imapSecure: provider.imap.secure,
+      imapTransport: provider.imap.transport,
+      imapUsername,
+      smtpHost: provider.smtp.host,
+      smtpPort: provider.smtp.port,
+      smtpSecure: provider.smtp.secure,
+      smtpTransport: provider.smtp.transport,
+      smtpUsername,
+      usernameMode: provider.usernameMode ?? "email",
+      createdAt: now,
+    });
 
     void syncAccount(
       context.db,
@@ -193,9 +188,7 @@ export function registerAccountRoutes(
           "Initial manually configured mailbox sync failed",
         );
       });
-    const row = context.db
-      .prepare("SELECT * FROM accounts WHERE id = ?")
-      .get(id) as AccountRecord;
+    const row = accountById(context.db, id) as AccountRecord;
     return reply
       .code(201)
       .send({
@@ -241,12 +234,8 @@ export function registerAccountRoutes(
   });
 
   app.get("/api/accounts", async () => {
-    const rows = context.db
-      .prepare("SELECT * FROM accounts ORDER BY created_at ASC")
-      .all() as AccountRecord[];
-    const folderRows = context.db
-      .prepare("SELECT * FROM folders ORDER BY account_id, name")
-      .all() as Array<Record<string, unknown>>;
+    const rows = listAccountRows(context.db);
+    const folderRows = listFolderRows(context.db);
     return rows.map((row) => ({
       ...publicAccount(row),
       folders: folderRows
@@ -272,9 +261,7 @@ export function registerAccountRoutes(
       return reply
         .code(400)
         .send({ ok: false, message: validationMessage(parsed.error) });
-    const existing = context.db
-      .prepare("SELECT id FROM accounts WHERE email = ? COLLATE NOCASE")
-      .get(parsed.data.email);
+    const existing = accountIdByEmail(context.db, parsed.data.email);
     if (existing)
       return reply
         .code(409)
@@ -305,37 +292,26 @@ export function registerAccountRoutes(
       provider,
       { imap: imapUsername, smtp: smtpUsername },
     );
-    context.db
-      .prepare(
-        `
-        INSERT INTO accounts (
-          id, email, provider, provider_name, encrypted_password, credential_crypto_version, auth_method,
-          imap_host, imap_port, imap_secure, imap_transport, imap_username,
-          smtp_host, smtp_port, smtp_secure, smtp_transport, smtp_username,
-          username_mode, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'password', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?)
-      `,
-      )
-      .run(
-        id,
-        parsed.data.email,
-        provider.id,
-        provider.name,
-        encryptAccountPassword(credentialIdentity, parsed.data.password, context.masterKey),
-        ACCOUNT_CREDENTIAL_CRYPTO_VERSION,
-        provider.imap.host,
-        provider.imap.port,
-        provider.imap.secure ? 1 : 0,
-        provider.imap.transport,
-        imapUsername,
-        provider.smtp.host,
-        provider.smtp.port,
-        provider.smtp.secure ? 1 : 0,
-        provider.smtp.transport,
-        smtpUsername,
-        provider.usernameMode ?? "email",
-        now,
-      );
+    insertPasswordAccountRow(context.db, {
+      id,
+      email: parsed.data.email,
+      providerId: provider.id,
+      providerName: provider.name,
+      encryptedPassword: encryptAccountPassword(credentialIdentity, parsed.data.password, context.masterKey),
+      credentialCryptoVersion: ACCOUNT_CREDENTIAL_CRYPTO_VERSION,
+      imapHost: provider.imap.host,
+      imapPort: provider.imap.port,
+      imapSecure: provider.imap.secure,
+      imapTransport: provider.imap.transport,
+      imapUsername,
+      smtpHost: provider.smtp.host,
+      smtpPort: provider.smtp.port,
+      smtpSecure: provider.smtp.secure,
+      smtpTransport: provider.smtp.transport,
+      smtpUsername,
+      usernameMode: provider.usernameMode ?? "email",
+      createdAt: now,
+    });
 
     void syncAccount(
       context.db,
@@ -355,9 +331,7 @@ export function registerAccountRoutes(
           "Initial mailbox sync failed",
         );
       });
-    const row = context.db
-      .prepare("SELECT * FROM accounts WHERE id = ?")
-      .get(id) as AccountRecord;
+    const row = accountById(context.db, id) as AccountRecord;
     return reply
       .code(201)
       .send({
@@ -371,9 +345,7 @@ export function registerAccountRoutes(
   app.delete<{ Params: { id: string } }>(
     "/api/accounts/:id",
     async (request, reply) => {
-      const account = context.db
-        .prepare("SELECT id FROM accounts WHERE id = ?")
-        .get(request.params.id);
+      const account = accountExists(context.db, request.params.id);
       if (!account)
         return reply
           .code(404)
@@ -445,10 +417,8 @@ export function registerAccountRoutes(
         return reply
           .code(400)
           .send({ ok: false, message: validationMessage(parsed.error) });
-      const result = context.db
-        .prepare("UPDATE accounts SET signature = ? WHERE id = ?")
-        .run(parsed.data.signature, request.params.id);
-      if (!result.changes)
+      const changes = updateAccountSignature(context.db, request.params.id, parsed.data.signature);
+      if (!changes)
         return reply
           .code(404)
           .send({ ok: false, message: "邮箱不存在。" });
@@ -464,9 +434,7 @@ export function registerAccountRoutes(
       return reply
         .code(400)
         .send({ ok: false, message: validationMessage(parsed.error) });
-    const account = context.db
-      .prepare("SELECT 1 FROM accounts WHERE id = ?")
-      .get(parsed.data.accountId);
+    const account = accountExists(context.db, parsed.data.accountId);
     if (!account)
       return reply
         .code(404)
@@ -536,9 +504,7 @@ export function registerAccountRoutes(
               message: "同步已取消或超时。",
             });
         }
-        const account = context.db
-          .prepare("SELECT * FROM accounts WHERE id = ?")
-          .get(accountId) as AccountRecord | undefined;
+        const account = accountById(context.db, accountId);
         const failure = mailFailure(
           error,
           account ? detectProvider(account.email).credentialHint : undefined,

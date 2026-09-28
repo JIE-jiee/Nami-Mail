@@ -10,7 +10,7 @@ import type { AgentMailEventSink } from "./agent/mail-state-events.js";
 import type { DatabaseHandle } from "./db.js";
 import { imapClientForAccount, type AccountAccessTokenProvider } from "./mail.js";
 import { markSubmissionConfirmed, submissionForId } from "./outbox.js";
-import { accountById } from "./sync.js";
+import { accountById } from "./sync-locks.js";
 
 const scheduledSentVerifications = new Map<string, Promise<void>>();
 const sentVerificationRetryDelaysMs = [0, 2_000, 10_000] as const;

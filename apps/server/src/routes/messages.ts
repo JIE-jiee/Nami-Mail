@@ -35,12 +35,7 @@ import {
   PENDING_MOVE_RECONCILIATION_ERROR,
   type MessageStorageRow,
 } from "../message-storage.js";
-import {
-  archivedMessageFilter,
-  effectiveMailboxExpression,
-  inboxMessageFilter,
-} from "../message-filters.js";
-import { ftsLikeEscape } from "../message-search.js";
+import { buildMessageListSql } from "../message-filters.js";
 import { ATTACHMENT_KINDS, type AttachmentKind } from "../attachment-kind.js";
 import {
   MAX_OUTBOUND_ATTACHMENT_COUNT,
@@ -78,16 +73,26 @@ import {
   submissionRequestForId,
 } from "../outbox.js";
 import { clearMessageSnooze, setMessageSnoozed } from "../snooze.js";
-import {
-  scheduleSentSubmissionVerification,
-  syncAccount,
-  type BatchMessageMoveOutcome,
-  type MessageMoveResult,
-} from "../sync.js";
+import { syncAccount } from "../sync.js";
+import { scheduleSentSubmissionVerification } from "../sync-sent-verify.js";
+import type { BatchMessageMoveOutcome, MessageMoveResult } from "../sync-moves.js";
 import { getSyncMessageLimit } from "../settings.js";
 import { emitAccountSynced } from "../events.js";
 import type { createOperationQueue } from "../operation-queue.js";
 import { commitLocalFlags } from "../flags-outbox.js";
+import { accountById } from "../account-store.js";
+import {
+  accountRowForMessage,
+  messageAccountAndFolder,
+  messageAccountId,
+  messageAccountIds,
+  messageExists,
+  messageFolderSpecialUse,
+  messageRowById,
+  threadRowsForAccount,
+  countMessageRows,
+  listMessageRows,
+} from "../message-queries.js";
 
 export type MessageRouteDeps = {
   context: RuntimeContext;
@@ -320,108 +325,28 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       if (afterBound === null || beforeBound === null) {
         return reply.code(400).send({ ok: false, message: "无效的日期范围。" });
       }
-      const filters: string[] = [];
-      const params: unknown[] = [];
-      if (!globalSearch && request.query.accountId) {
-        filters.push("m.account_id = ?");
-        params.push(request.query.accountId);
-      }
-      if (!globalSearch && request.query.folder) {
-        filters.push(`${effectiveMailboxExpression} = ?`);
-        params.push(request.query.folder);
-      } else if (!globalSearch && request.query.archived === "1") {
-        filters.push(archivedMessageFilter);
-      } else if (!globalSearch && request.query.starred === "1") {
-        // Starred is a cross-folder view, unlike the normal unified inbox.
-        filters.push("m.flags_json LIKE '%\\\\Flagged%'");
-      } else if (!globalSearch && request.query.snoozed === "1") {
-        // The Snoozed view lists messages whose snooze has not fired yet.
-        const nowIso = new Date().toISOString();
-        filters.push("m.snoozed_until IS NOT NULL AND m.snoozed_until > ?");
-        params.push(nowIso);
-      } else if (!globalSearch && request.query.hasAttachments === "1") {
-        // The Attachments view replaces the inbox fallback: every folder of
-        // the bound account (all accounts when none is bound) participates.
-        filters.push("m.has_attachments = 1");
-      } else if (!globalSearch) {
-        filters.push(inboxMessageFilter);
-        // Snoozed messages are hidden from the unified inbox until due.
-        filters.push("(m.snoozed_until IS NULL OR m.snoozed_until <= ?)");
-        params.push(new Date().toISOString());
-      }
-      if (!globalSearch && request.query.unread === "1") {
-        filters.push("m.flags_json NOT LIKE '%\\\\Seen%'");
-      }
-      if (request.query.attachmentKind) {
-        // The kind column is JSON text; the quoted token prevents one kind
-        // from matching another kind's substring.
-        filters.push("m.attachment_kinds_json LIKE ?");
-        params.push(`%"${request.query.attachmentKind}"%`);
-      }
-      if (afterBound) {
-        filters.push("COALESCE(m.sent_at, m.created_at) >= ?");
-        params.push(afterBound);
-      }
-      if (beforeBound) {
-        filters.push("COALESCE(m.sent_at, m.created_at) < ?");
-        params.push(beforeBound);
-      }
-      const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
-      if (query) {
-        // FTS5 substring/token search over the decrypted-payload index. The
-        // trigram tokenizer accelerates LIKE patterns of three or more
-        // characters and still answers shorter patterns (including two-character
-        // CJK terms) by scanning plaintext index terms, so matching never needs
-        // to decrypt the whole candidate set and the old candidate-count cap
-        // (search_scope_too_large) no longer applies at any data scale.
-        const pattern = `%${ftsLikeEscape(query)}%`;
-        const ftsMatch = `(fts.subject LIKE ? ESCAPE '\\'
-          OR fts.from_name LIKE ? ESCAPE '\\'
-          OR fts.from_address LIKE ? ESCAPE '\\'
-          OR fts.body LIKE ? ESCAPE '\\')`;
-        const ftsParams = [pattern, pattern, pattern, pattern];
-        const join = `
-          FROM messages_fts fts
-          JOIN messages m ON m.id = fts.message_id
-          JOIN accounts a ON a.id = m.account_id`;
-        const ftsWhere = filters.length ? `${ftsMatch} AND (${filters.join(" AND ")})` : ftsMatch;
-        const total = Number(
-          (context.db.prepare(`SELECT COUNT(*) AS count ${join} WHERE ${ftsWhere}`).get(...ftsParams, ...params) as { count: number }).count,
-        );
-        const rows = context.db
-          .prepare(`
-            SELECT m.*, a.email AS account_email, a.provider_name
-            ${join}
-            WHERE ${ftsWhere}
-            ORDER BY COALESCE(m.sent_at, m.created_at) DESC
-            LIMIT ? OFFSET ?
-          `)
-          .all(...ftsParams, ...params, pageSize, (page - 1) * pageSize) as MessageStorageRow[];
-        return { items: rows.map((row) => messageRow(row, context.masterKey)), total, page, pageSize };
-      }
-      const total = Number(
-        (context.db.prepare(`SELECT COUNT(*) AS count FROM messages m ${where}`).get(...params) as { count: number }).count,
-      );
-      const rows = context.db
-        .prepare(`
-          SELECT m.*, a.email AS account_email, a.provider_name
-          FROM messages m JOIN accounts a ON a.id = m.account_id
-          ${where}
-          ORDER BY COALESCE(m.sent_at, m.created_at) DESC
-          LIMIT ? OFFSET ?
-        `)
-        .all(...params, pageSize, (page - 1) * pageSize) as MessageStorageRow[];
+      const selection = buildMessageListSql({
+        accountId: request.query.accountId,
+        folder: request.query.folder,
+        q: query,
+        starred: request.query.starred === "1",
+        unread: request.query.unread === "1",
+        archived: request.query.archived === "1",
+        snoozed: request.query.snoozed === "1",
+        hasAttachments: request.query.hasAttachments === "1",
+        attachmentKind: request.query.attachmentKind as AttachmentKind | undefined,
+        after: afterBound ?? undefined,
+        before: beforeBound ?? undefined,
+        scope: request.query.scope === "all" ? "all" : undefined,
+      });
+      const total = countMessageRows(context.db, selection);
+      const rows = listMessageRows(context.db, selection, page, pageSize);
       return { items: rows.map((row) => messageRow(row, context.masterKey)), total, page, pageSize };
     },
   );
 
   app.get<{ Params: { id: string } }>("/api/messages/:id", async (request, reply) => {
-    const row = context.db
-      .prepare(`
-        SELECT m.*, a.email AS account_email, a.provider_name
-        FROM messages m JOIN accounts a ON a.id = m.account_id WHERE m.id = ?
-      `)
-      .get(request.params.id) as MessageStorageRow | undefined;
+    const row = messageRowById(context.db, request.params.id);
     if (!row) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     return messageRow(row, context.masterKey);
   });
@@ -435,12 +360,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
   // directions within the anchor's account; drafts are excluded because an
   // unsent reply is not part of the conversation yet.
   app.get<{ Params: { id: string } }>("/api/messages/:id/thread", async (request, reply) => {
-    const anchor = context.db
-      .prepare(`
-        SELECT m.*, a.email AS account_email, a.provider_name
-        FROM messages m JOIN accounts a ON a.id = m.account_id WHERE m.id = ?
-      `)
-      .get(request.params.id) as MessageStorageRow | undefined;
+    const anchor = messageRowById(context.db, request.params.id);
     if (!anchor) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     const anchorPayload = messagePayloadForRow(anchor, context.masterKey);
     const knownIds = new Set<string>();
@@ -454,16 +374,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
     // process — yield to the event loop periodically, mirroring the agent's
     // thread reader, so the window stays responsive on large mailboxes.
     const entries: Array<{ row: MessageStorageRow; messageId: string | null; parentIds: string[] }> = [];
-    const rows = context.db
-      .prepare(`
-        SELECT m.*, a.email AS account_email, a.provider_name
-        FROM messages m
-        JOIN accounts a ON a.id = m.account_id
-        LEFT JOIN folders f ON f.account_id = m.account_id AND f.path = m.mailbox
-        WHERE m.account_id = ? AND (f.special_use IS NULL OR f.special_use != '\\Drafts')
-        ORDER BY COALESCE(m.sent_at, m.created_at), m.id
-      `)
-      .all(anchor.account_id) as MessageStorageRow[];
+    const rows = threadRowsForAccount(context.db, anchor.account_id);
     let processed = 0;
     for (const row of rows) {
       const payload = messagePayloadForRow(row, context.masterKey);
@@ -507,12 +418,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
 
   app.get<{ Params: { id: string } }>("/api/messages/:id/outbound-attachments", async (request, reply) => {
     const stored = messagePayloadById(context.db, context.masterKey, request.params.id);
-    const row = context.db.prepare(`
-      SELECT f.special_use
-      FROM messages m
-      LEFT JOIN folders f ON f.account_id = m.account_id AND f.path = m.mailbox
-      WHERE m.id = ?
-    `).get(request.params.id) as { special_use: string | null } | undefined;
+    const row = messageFolderSpecialUse(context.db, request.params.id);
     if (!stored) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     if (!row) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     if (row.special_use !== "\\Drafts") return reply.code(400).send({ ok: false, message: "这不是草稿邮件。" });
@@ -529,15 +435,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
 
   app.post<{ Params: { id: string } }>("/api/messages/:id/outbound-attachments/import", async (request, reply) => {
     const storedMessage = messagePayloadById(context.db, context.masterKey, request.params.id);
-    const row = context.db.prepare(`
-      SELECT m.account_id, f.special_use
-      FROM messages m
-      LEFT JOIN folders f ON f.account_id = m.account_id AND f.path = m.mailbox
-      WHERE m.id = ?
-    `).get(request.params.id) as {
-      account_id: string;
-      special_use: string | null;
-    } | undefined;
+    const row = messageAccountAndFolder(context.db, request.params.id);
     if (!storedMessage) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     if (!row) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     if (row.special_use !== "\\Drafts") return reply.code(400).send({ ok: false, message: "这不是草稿邮件。" });
@@ -665,11 +563,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
   });
 
   app.delete<{ Params: { id: string } }>("/api/messages/:id/draft", async (request, reply) => {
-    const stored = context.db.prepare(`
-      SELECT a.*
-      FROM messages m JOIN accounts a ON a.id = m.account_id
-      WHERE m.id = ?
-    `).get(request.params.id) as AccountRecord | undefined;
+    const stored = accountRowForMessage(context.db, request.params.id);
     if (!stored) return reply.code(404).send({ ok: false, message: "草稿不存在。" });
     try {
       const draftMessageId = storedDraftMessageId(context, stored.id, request.params.id);
@@ -712,9 +606,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       // Enqueue one durable operation per affected account. Each row waits
       // for that account's write slot, so a batch issued while another move
       // is in flight queues instead of failing the whole request.
-      const rows = context.db
-        .prepare(`SELECT id, account_id FROM messages WHERE id IN (${parsed.data.ids.map(() => "?").join(", ")})`)
-        .all(...parsed.data.ids) as Array<{ id: string; account_id: string }>;
+      const rows = messageAccountIds(context.db, parsed.data.ids);
       const idsByAccount = new Map<string, string[]>();
       for (const row of rows) {
         const list = idsByAccount.get(row.account_id);
@@ -770,8 +662,8 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       // Write-behind: the local cache commits in milliseconds and the IMAP
       // STORE is pushed by the durable background queue (flags-outbox), so a
       // toggle never queues behind a move, a batch, or a running sync.
-      const messageAccount = context.db.prepare("SELECT account_id FROM messages WHERE id = ?").get(request.params.id) as { account_id: string } | undefined;
-      if (!messageAccount) throw new Error("Message not found.");
+      const flagsAccountId = messageAccountId(context.db, request.params.id);
+      if (!flagsAccountId) throw new Error("Message not found.");
       commitLocalFlags(context.db, [request.params.id], parsed.data, operationQueue, context.agentMailEvents);
       return { ok: true };
     } catch (error) {
@@ -788,9 +680,9 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       // write slot: a second delete issued while the first is still in flight
       // queues behind it instead of failing, and survives a shutdown while
       // queued (resumePending re-enqueues it on the next start).
-      const messageAccount = context.db.prepare("SELECT account_id FROM messages WHERE id = ?").get(request.params.id) as { account_id: string } | undefined;
+      const moveAccountId = messageAccountId(context.db, request.params.id);
       const { accountId, ...result } = await operationQueue.enqueueAndRun<MessageMoveResult>(
-        messageAccount ? [messageAccount.account_id] : [],
+        moveAccountId ? [moveAccountId] : [],
         "move",
         { messageId: request.params.id, target: parsed.data.target },
       );
@@ -824,7 +716,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       }),
     }).strict().safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
-    const existing = context.db.prepare("SELECT 1 FROM messages WHERE id = ?").get(request.params.id);
+    const existing = messageExists(context.db, request.params.id);
     if (!existing) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     try {
       setMessageSnoozed(context.db, request.params.id, parsed.data.until);
@@ -836,7 +728,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
   });
 
   app.delete<{ Params: { id: string } }>("/api/messages/:id/snooze", async (request, reply) => {
-    const existing = context.db.prepare("SELECT 1 FROM messages WHERE id = ?").get(request.params.id);
+    const existing = messageExists(context.db, request.params.id);
     if (!existing) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
     try {
       clearMessageSnooze(context.db, request.params.id);
@@ -850,7 +742,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
   app.post("/api/messages/send", async (request, reply) => {
     const parsed = sendSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
-    const account = context.db.prepare("SELECT * FROM accounts WHERE id = ?").get(parsed.data.accountId) as AccountRecord | undefined;
+    const account = accountById(context.db, parsed.data.accountId);
     if (!account) return reply.code(404).send({ ok: false, message: "发件邮箱不存在。" });
 
     const {
@@ -1037,7 +929,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
   app.post("/api/messages/drafts", async (request, reply) => {
     const parsed = draftSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
-    const account = context.db.prepare("SELECT * FROM accounts WHERE id = ?").get(parsed.data.accountId) as AccountRecord | undefined;
+    const account = accountById(context.db, parsed.data.accountId);
     if (!account) return reply.code(404).send({ ok: false, message: "发件邮箱不存在。" });
     try {
       const { replaceDraftId, attachmentTokens, ...draft } = parsed.data;

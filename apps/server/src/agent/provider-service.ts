@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isIP } from "node:net";
+import { isLoopbackHostname } from "../endpoint-guard.js";
 import {
   agentAccessLevelSchema,
   providerHealthSchema,
@@ -85,12 +85,6 @@ export type DefaultProviderConfiguration = {
   defaultProviderId: string | null;
 };
 
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host === "::1") return true;
-  if (isIP(host) !== 4) return false;
-  return Number(host.split(".", 1)[0]) === 127;
-}
 
 function normalizeEndpoint(value: string): { endpoint: string; cloud: boolean } {
   let url: URL;
@@ -99,14 +93,14 @@ function normalizeEndpoint(value: string): { endpoint: string; cloud: boolean } 
   } catch {
     throw new AgentServiceError("INVALID_ARGUMENT", "模型服务地址不是有效 URL。", 400, false);
   }
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHost(url.hostname))) {
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHostname(url.hostname))) {
     throw new AgentServiceError("INVALID_ARGUMENT", "模型服务地址必须使用 HTTPS，或指向本机回环 HTTP 服务。", 400, false);
   }
   if (url.username || url.password || url.search || url.hash) {
     throw new AgentServiceError("INVALID_ARGUMENT", "模型服务地址不能包含账号、查询参数或片段。", 400, false);
   }
   if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
-  return { endpoint: url.toString(), cloud: !isLoopbackHost(url.hostname) };
+  return { endpoint: url.toString(), cloud: !isLoopbackHostname(url.hostname) };
 }
 
 function providerConfigRecordId(id: string): string {

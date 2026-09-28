@@ -48,14 +48,12 @@ import {
 import { providerPresets } from "./providers.js";
 import { TranslationConfigurationStore } from "./translation-configuration.js";
 import { buildTranslationService } from "./routes/translation.js";
+import { batchMoveMessages, moveMessage, type MessageMoveTarget } from "./sync-moves.js";
 import {
-  batchMoveMessages,
-  moveMessage,
   updateMessageFlags,
   updateMessageFlagsBatch,
   type MessageFlagsPatch,
-  type MessageMoveTarget,
-} from "./sync.js";
+} from "./sync-flags.js";
 import { seedBuiltinTemplates } from "./templates.js";
 import {
   getSyncMessageLimit,

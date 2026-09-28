@@ -94,6 +94,7 @@ import {
   truncateForContext,
   applyConfirmationDecision,
   expireConfirmation,
+  OLLAMA_DEFAULT_ENDPOINT,
 } from "./agent/agent-utils";
 import { useMountedVisible } from "./hooks/useMountedVisible";
 import { createDemoConversation } from "./agent/agent-demo-data";
@@ -503,7 +504,7 @@ export default function AgentWorkspace({ accounts, currentMessage, onClose, onOp
         id: "demo-ollama",
         label: "Ollama",
         kind: "ollama",
-        endpoint: "http://127.0.0.1:11434/v1",
+        endpoint: OLLAMA_DEFAULT_ENDPOINT,
         model: "llama3.2",
         timeoutMs: 120000,
         apiKeyConfigured: true,

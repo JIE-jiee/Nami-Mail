@@ -10,17 +10,11 @@ import type { AgentMailEventSink } from "./agent/mail-state-events.js";
 import type { DatabaseHandle } from "./db.js";
 import { imapClientForAccount, type AccountAccessTokenProvider } from "./mail.js";
 import { moveActionBlockedError } from "./message-storage.js";
-import { accountById, withAccountWriteLocks } from "./sync.js";
+import { messageFlagNames, type MessageFlagsPatch } from "./message-flags.js";
+export type { MessageFlagsPatch };
+import { pendingPushRowById } from "./message-queries.js";
+import { accountById, withAccountWriteLocks } from "./sync-locks.js";
 
-export type MessageFlagsPatch = {
-  seen?: boolean;
-  flagged?: boolean;
-};
-
-const messageFlagNames = {
-  seen: "\\Seen",
-  flagged: "\\Flagged",
-} as const;
 
 export async function updateMessageFlags(
   db: DatabaseHandle,
@@ -30,17 +24,7 @@ export async function updateMessageFlags(
   accessTokenProvider?: AccountAccessTokenProvider,
   agentEvents?: AgentMailEventSink,
 ): Promise<void> {
-  const message = db
-    .prepare("SELECT account_id, mailbox, uid, flags_json, remote_id_lookup, pending_move_destination, pending_move_state FROM messages WHERE id = ?")
-    .get(messageId) as {
-      account_id: string;
-      mailbox: string;
-      uid: number;
-      flags_json: string;
-      remote_id_lookup: string | null;
-      pending_move_destination: string | null;
-      pending_move_state: string | null;
-    } | undefined;
+  const message = pendingPushRowById(db, messageId);
   if (!message) throw new Error("Message not found.");
   const moveBlockedError = moveActionBlockedError(message);
   if (moveBlockedError) throw new Error(moveBlockedError);

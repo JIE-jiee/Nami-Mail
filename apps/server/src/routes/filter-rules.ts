@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { RuntimeContext } from "../types.js";
 import { validationMessage } from "../helpers.js";
+import { accountExists } from "../account-store.js";
 import {
   createFilterRule,
   deleteFilterRule,
@@ -29,8 +30,8 @@ export function registerFilterRuleRoutes(app: FastifyInstance, deps: FilterRuleR
     const parsed = filterRuleCreateSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
     if (parsed.data.accountId) {
-      const account = context.db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(parsed.data.accountId);
-      if (!account) return reply.code(404).send({ ok: false, message: "规则绑定的邮箱不存在。" });
+      const exists = accountExists(context.db, parsed.data.accountId);
+      if (!exists) return reply.code(404).send({ ok: false, message: "规则绑定的邮箱不存在。" });
     }
     return { ok: true, rule: createFilterRule(context.db, parsed.data) };
   });
@@ -39,8 +40,8 @@ export function registerFilterRuleRoutes(app: FastifyInstance, deps: FilterRuleR
     const parsed = filterRuleUpdateSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
     if (parsed.data.accountId) {
-      const account = context.db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(parsed.data.accountId);
-      if (!account) return reply.code(404).send({ ok: false, message: "规则绑定的邮箱不存在。" });
+      const exists = accountExists(context.db, parsed.data.accountId);
+      if (!exists) return reply.code(404).send({ ok: false, message: "规则绑定的邮箱不存在。" });
     }
     const rule = updateFilterRule(context.db, request.params.id, parsed.data);
     if (!rule) return reply.code(404).send({ ok: false, message: "规则不存在。" });

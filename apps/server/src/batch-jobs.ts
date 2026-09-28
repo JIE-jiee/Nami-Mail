@@ -2,14 +2,13 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseHandle } from "./db.js";
 import { buildMessageListSql, type MessageListFilterQuery } from "./message-filters.js";
 import { serverLog } from "./logging.js";
+import { syncAccount } from "./sync.js";
 import {
   batchMoveMessages,
   moveMessageToFolder,
   resolveMoveDestination,
-  syncAccount,
-  updateMessageFlagsBatch,
-  type MessageFlagsPatch,
-} from "./sync.js";
+} from "./sync-moves.js";
+import { updateMessageFlagsBatch, type MessageFlagsPatch } from "./sync-flags.js";
 import { AgentMailStateEvents } from "./agent/mail-state-events.js";
 import { OAuthService } from "./oauth.js";
 import { getSyncMessageLimit } from "./settings.js";
