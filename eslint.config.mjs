@@ -137,7 +137,7 @@ export default tseslint.config(
   // 巨型文件冻结：只允许瘦身，不允许继续增长（阈值为当前行数 + 少量余量）。
   {
     files: ["apps/web/src/App.tsx"],
-    rules: { "max-lines": ["error", { max: 4450, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 4380, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["apps/server/src/agent-service.ts"],

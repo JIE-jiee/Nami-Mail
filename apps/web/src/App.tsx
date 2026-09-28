@@ -57,6 +57,7 @@ import { AgentMark } from "./AgentMark";
 import { CustomAvatar, SenderAvatar } from "./SenderAvatar";
 import { WindowBar } from "./WindowBar";
 import { ApiError, api, type BatchJobCreatePayload, type BatchJobQuery, type BatchJobSnapshot, type MoveTarget } from "./api";
+import { createBatchJobRunner, type BatchJobRunOptions } from "./batchJobRunner";
 import { calendarCache, contactsCache, templatesCache } from "./dialogPrefetch";
 import DatePicker from "./DatePicker";
 import { canPreviewAttachment } from "./attachmentPreview";
@@ -538,7 +539,6 @@ export default function App() {
   // how far into that row the viewport top sits. Applied after the merged list
   // lands (or dropped when nothing is pinned).
   const scrollAnchorRef = useRef<{ id: string; offset: number; topCaptured: number } | null>(null);
-  const batchJobStartedAtRef = useRef(0);
   // The smoke runner's OS theme preference is whatever the CI image happens
   // to have; force dark so probes observe one deterministic palette.
   const theme = isDesktopSmoke ? "dark" : resolveTheme(settings.theme, systemTheme);
@@ -2614,90 +2614,20 @@ const emptyMessageList = useMemo(() => (query.trim()
     };
   }, [attachmentKindFilter, dateBounds, debouncedQuery, searchScope, selectAllPaged, selectedAccount, selectedFolder, view]);
 
-  // Polls a server-side batch job until it settles, then shows the real
-  // outcome with an undo action. The toolbar stays interactive throughout;
-  // only the poll loop and the final reconciliation reload run in the
-  // background. Guards against a vanished job (server restart) and runaway
-  // polling.
-  const pollBatchJob = useCallback((jobId: string, opts: {
-    successKey: string;
-    exitOnSuccess: boolean;
-    /** Runs after the job's reconciling reload has landed — pins must be
-     * cleared only here, or a refresh racing the job would still clobber. */
-    onSettled?: () => void;
-  }) => {
-    const startedAt = batchJobStartedAtRef.current;
-    const next = async (): Promise<void> => {
-      if (Date.now() - startedAt > 10 * 60_000) {
-        setBatchJob(null);
-        showToast(t("mail.selection.jobError"), "error");
-        opts.onSettled?.();
-        return;
-      }
-      try {
-        const { job } = await api.batchJobStatus(jobId);
-        if (job.status === "running") {
-          setBatchJob(job);
-          window.setTimeout(() => void next(), 600);
-          return;
-        }
-        if (job.status === "failed") {
-          setBatchJob(null);
-          showToast(job.error ?? t("mail.selection.jobError"), "error");
-          await loadRef.current({ silent: true });
-          opts.onSettled?.();
-          return;
-        }
-        setBatchJob(null);
-        const undoAction: ToastAction = {
-          label: t("mail.selection.undo"),
-          run: () => {
-            showToast(t("mail.selection.undoStarted"), "info");
-            void api.batchJobUndo(jobId).then(() => void loadRef.current({ silent: true })).catch(() => {
-              showToast(t("mail.selection.jobError"), "error");
-            });
-          },
-        };
-        if (job.updated > 0 && opts.exitOnSuccess) exitSelectionMode();
-        if (job.failed) {
-          showToast(
-            t("mail.selection.partialFailure", { done: job.updated, failed: job.failed }),
-            "error",
-            job.updated > 0 ? undoAction : undefined,
-          );
-        } else {
-          showToast(t(opts.successKey, { count: job.total }), "success", job.total > 0 ? undoAction : undefined);
-        }
-        await loadRef.current({ silent: true });
-        opts.onSettled?.();
-      } catch {
-        setBatchJob(null);
-        showToast(t("mail.selection.jobError"), "error");
-        opts.onSettled?.();
-      }
-    };
-    void next();
-  }, [exitSelectionMode, showToast, t]);
+  // Batch job state machine lives in batchJobRunner.ts (unit-tested there);
+  // App wires the React-side callbacks: snapshot/busy state, toasts, reload.
+  const batchJobRunner = useMemo(() => createBatchJobRunner({
+    showToast,
+    t,
+    reload: (opts) => loadRef.current(opts),
+    exitSelectionMode,
+    onSnapshot: setBatchJob,
+    onBusy: setBatchBusy,
+  }), [exitSelectionMode, showToast, t]);
 
-  const startBatchJob = useCallback((payload: BatchJobCreatePayload, opts: {
-    successKey: string;
-    exitOnSuccess: boolean;
-    onSettled?: () => void;
-  }) => {
-    setBatchBusy(true);
-    void api.batchJobCreate(payload).then(({ jobId }) => {
-      batchJobStartedAtRef.current = Date.now();
-      setBatchJob({ id: jobId, kind: payload.kind, status: "running", total: 0, done: 0, updated: 0, failed: 0, createdAt: Date.now() });
-      // The job runs server-side; release the toolbar (progress comes from
-      // the poll loop) so the list stays interactive.
-      setBatchBusy(false);
-      pollBatchJob(jobId, opts);
-    }).catch((error: unknown) => {
-      setBatchBusy(false);
-      opts.onSettled?.();
-      showToast(mailErrorToastMessage(error, t(payload.kind === "flags" ? "mail.error.batchUpdate" : "mail.error.move"), t), "error");
-    });
-  }, [pollBatchJob, showToast, t]);
+  const startBatchJob = useCallback((payload: BatchJobCreatePayload, opts: BatchJobRunOptions) => {
+    batchJobRunner.start(payload, opts);
+  }, [batchJobRunner]);
 
   const batchUpdateFlags = async (patch: { seen?: boolean; flagged?: boolean }, successKey: string) => {
     const ids = [...selectedMessageIds];
