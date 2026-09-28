@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isIP } from "node:net";
 import {
   callerContextSchema,
   createAgentError,

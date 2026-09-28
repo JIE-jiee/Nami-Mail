@@ -322,10 +322,8 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       const page = Math.max(1, Number.parseInt(request.query.page ?? "1", 10) || 1);
       const pageSize = Math.min(100, Math.max(10, Number.parseInt(request.query.pageSize ?? "40", 10) || 40));
       const query = request.query.q?.trim();
-      // scope=all searches every account and mailbox regardless of the current
-      // view. It is search-only: without q every restriction below applies as
-      // usual, so the parameter can never widen a normal list request.
-      const globalSearch = request.query.scope === "all" && Boolean(query);
+      // scope=all is resolved inside buildMessageListSql: it is search-only
+      // (needs q) and drops every view/account/folder restriction.
       if (request.query.attachmentKind !== undefined && !isValidAttachmentKind(request.query.attachmentKind)) {
         return reply.code(400).send({ ok: false, message: "无效的附件类型。" });
       }

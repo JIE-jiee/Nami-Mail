@@ -1,5 +1,4 @@
 import { createHash, createHmac } from "node:crypto";
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { ListResponse } from "imapflow";
 import { simpleParser, type AddressObject } from "mailparser";
 import { attachmentMetadataFromParsedMail } from "./attachments.js";
@@ -19,7 +18,6 @@ import { serverLog } from "./logging.js";
 import {
   confirmSubmissionsInSent,
 } from "./outbox.js";
-import type { AccountRecord } from "./types.js";
 import { getAppSettings } from "./settings.js";
 import { getAutoReplyEngine } from "./agent/auto-reply.js";
 import {
