@@ -11,9 +11,13 @@
 - 已取消：图标专属动画（用户拍板成本 > 价值，含 back-arrow hover 动画，勿再提议）。
 - 源码零 TODO/FIXME/HACK 残留；零 console.log（测试文件内两处无害）；styles.css 内 53 处 `!important`、22 处组件内联样式。
 
-## 0.1 现状快照（2026-09-06，开发辅助勘误，未走交付流程）
+## 0.1 现状快照（2026-09-28，架构治理批次后实测，取代 2026-09-06 口径）
 
-- 单体规模实测：`apps/web/src/App.tsx` 3651 行、`AgentWorkspace.tsx` 2209 行、`apps/server/src/app.ts` 371 行（路由已拆分到 `routes/`，候选 5 描述过时）、`apps/desktop/src/main.mts` 2177 行（比记录的 1976 更厚）、`styles.css` 16821 行 + 53 处 `!important`。
+- 单体规模实测：`apps/web/src/App.tsx` **4360 行**（72 useState / 45 useEffect，零单测，仅 e2e 兜底；本批抽取批量作业状态机后 -70）、`AgentWorkspace.tsx` 2445 行、`apps/server/src/agent-service.ts` **2876 行**（MCP 域已抽出）、`agent-rag-worker.ts` 1460 行、`apps/desktop/src/main.mts` 2103 行、`styles.css` **18416 行** + 53 处 `!important`（vitest 棘轮冻结）。
+- **新防线（2026-09-28 批次）**：路由层 SQL 39→0 且 eslint `no-restricted-syntax` error 级锁死；sync 家族 5 节点运行时环消除（`agent/sync-locks.ts`）；max-lines 棘轮覆盖 App.tsx≤4380 / agent-service.ts≤2890 / main.mts≤2120 / AgentWorkspace.tsx≤2460；依赖同步守卫 `scripts/tests/dependency-sync.test.mjs`（根清单与 apps/server 必须逐字段一致——electron-builder 从根清单收集生产依赖，重复声明是有意为之）。
+- 新增深模块：`server/account-store.ts`（账户行访问）、`server/message-queries.ts`（消息读查询）、`server/message-flags.ts`（flag 词汇表）、`server/endpoint-guard.ts`（回环判定，注意与 `config.ts` 的 bind 校验语义不同、不得合并）、`server/agent/mcp-server-manager.ts`（MCP 域）、`server/agent/sync-locks.ts`、`web/batchJobRunner.ts`、`web/FormNotice.tsx`。
+- 已收口的历史重复：mail wire DTO 单一权威 `packages/agent-contracts/src/mail-dto.ts`（web/types.ts 与 server `publicAccount`/`messageRow` 均消费契约，`Account.authMethod` 是契约化时暴露的既有漂移）；`MessageFlagsPatch`/`messageFlagNames`/SHA-256 helper/前端 Notice ×6/Ollama 端点 ×2 各归其一。
+- 保持不变（反思轮裁定）：`RuntimeContext`（标准 composition-root）、`config.ts` 模块加载期 throw（安全设计）、`account-credentials.ts` icloud/yandex 迁移护栏（刻意自包含）、main.mts 不拆（候选 7）。
 - 组件内联 `style={` 36 处（含子目录口径；原记 22 为顶层口径，有反弹）。
 - `console.log` 8 处：`App.tsx` 4 + `main.tsx` 2 为有意 `[nami-startup]` 埋点（桌面 host 转发进 startup-log，见 `main.tsx:8-11` 注释），`AgentWorkspace.poll.test.tsx` 2 为调试输出——原“零残留”口径过时。
 - help 按钮 `tabIndex={-1}` 已清零（12 处，`AgentProviderSettings.tsx` 8 + `AgentMcpServerPane.tsx` 4，2026-09-06 去掉后恢复可聚焦，web typecheck 全绿）。
@@ -93,6 +97,13 @@
 
 ## 5. 交付记录
 
+- Batch W（2026-09-28，架构治理，6 commits：`860a1c5`/`e2dba7d`/`10f1c0d`/`c69ea3c`/`1b749b1`/`7aa466c`）：
+  - 候选 4 完成：mail wire DTO 单一权威 `packages/agent-contracts/src/mail-dto.ts`（zod schema，编译期消费），`publicAccount`/`messageRow` 注解契约类型；暴露并修复 `Account.authMethod` 既有漂移（14 处夹具补齐）。
+  - 候选 5 部分推进：app.ts 组合根瘦身为装配；MCP 域从 AgentService 抽出（`agent/mcp-server-manager.ts`，3045→2876 行，agent-mcp-servers 38 例锚定）；批量作业状态机从 App.tsx 抽出（`web/batchJobRunner.ts` + 7 例新单测，4430→4360 行）——首次为 App.tsx 建立直接单测锚点。
+  - 结构防线：路由层 SQL 39→0（error 级卡口）、sync 家族 5 节点环消除、6 组重复合并（回环判定 ×4、flag 词汇表 ×2、SHA-256 ×2、Notice ×6、Ollama 端点 ×2、待推送行查询 ×4）、max-lines 棘轮 ×4 + styles.css vitest 棘轮、依赖同步守卫测试。
+  - 清理：`scripts/attic/` 48 个一次性脚本与 2 个 .err 残留日志（历史可找回，删除前已验证零引用）。
+  - 评估过程：3 次独立评估 + 3 次校验 + 2 次反思共 8 轮 SubAgent；反思轮推翻 3 条夸大结论（RuntimeContext 非上帝对象、i18n 非三套并行、回环判定非 5 份等价），并实测 App.tsx 零单测、抽取回弹等硬事实。
+  - 验证：四 workspace typecheck + tests 全绿（server 845 / web 764 / desktop 196 / contracts 32 / core 17）、lint 0 error、运行时环 0。
 - Batch A–K：功能批次（mailto 闭环、搜索深化、批量导出、右键菜单、提升批次、自动更新按钮、main.mts smoke 拆分、docs→Wiki 同步、图标一图一义、文件夹图标各归其位、撤回/重复修复、/@ 引用 + scope 两档化）。
 - Batch L：同步消息上限警告链（commit b70b0d5）。
 - Batch M：流事件词汇契约化（commit 13f205d，候选 1 完成）。
