@@ -1,5 +1,9 @@
 import type { FastifyInstance } from "fastify";
+import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Generated per run so the fixture carries no credential literal.
+const desktopSessionToken = `desktop-session-${randomUUID()}`;
 
 // Fastify's inject stamps a synthetic default of "Host: localhost:80" on
 // every request that does not carry an explicit host header, and the token-less
@@ -101,7 +105,7 @@ describe("unhandled local API errors", () => {
     // response, not a throw), so the net above them must not have moved them.
     const protectedApp = await buildApp(
       { db, masterKey: Buffer.alloc(32, 3) },
-      { localApiAccessToken: "desktop-session-token" },
+      { localApiAccessToken: desktopSessionToken },
     );
     try {
       const unauthorized = await protectedApp.inject({ method: "GET", url: "/api/accounts" });
