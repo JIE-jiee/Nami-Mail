@@ -1,6 +1,7 @@
 # 架构与优化路线图（ARCHITECTURE ROADMAP）
 
 > 本文件是 Nami Mail 的持续推进计划，供新的 ZCode 会话续接工作。
+> **2026-09-30 交付**：Batch AF–AY（16 轮质量循环全部成果）已随 commit `cf55c0f` 提交并推送至 `origin/backup/backgrounds-baseline`（Mimosa seal sha256:c8d3d32f…，69 findings 全 inconclusive）。
 > 最后更新：2026-09-06。每项完成一个批次后同步更新本文件与下方「交付记录」。
 > 交付分支固定为 `backup/backgrounds-baseline`，**绝不 push main**。
 
