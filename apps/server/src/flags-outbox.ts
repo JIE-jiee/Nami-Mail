@@ -9,7 +9,8 @@
  *
  * 1. `commitLocalFlags` applies the patch to the local cache inside one
  *    transaction (single-digit milliseconds — no network, no write slot) and
- *    records a durable `flags-push` operation per account.
+ *    records a durable `flags-push` operation per account **in that same
+ *    transaction**, so a marker and its push can never be committed apart.
  * 2. The operation queue drives `flags-push` in the background (FIFO per
  *    account, bounded retries), pushing the flag delta to the provider.
  *
@@ -21,6 +22,10 @@
  *   flags_json from the stale remote (guarded at the sync write sites).
  * - Rows are durable: a crash mid-push is resumed on the next start, and the
  *   push is idempotent (STORE on an already-applied flag is a no-op).
+ * - A marker left behind with no push behind it (only ever possible on a build
+ *   that wrote the two in separate transactions) would block that message's
+ *   flags from syncing for good, so startup reconciles them — see
+ *   {@link clearOrphanedPendingFlagsMarkers}.
  */
 import type { DatabaseHandle } from "./db.js";
 import type { OperationQueue } from "./operation-queue.js";
@@ -29,7 +34,7 @@ import { imapClientForAccount, type AccountAccessTokenProvider } from "./mail.js
 import { moveActionBlockedError } from "./message-storage.js";
 import { messageFlagNames, type MessageFlagsPatch } from "./message-flags.js";
 export type { MessageFlagsPatch };
-import { accountById } from "./sync-locks.js";
+import { accountById } from "./account-store.js";
 
 
 export type LocalFlagsCommit = {
@@ -100,11 +105,26 @@ export function commitLocalFlags(
     prepared.push({ message, nextFlags: [...nextFlags], add, remove, seenChanged: currentFlags.has("\\Seen") !== nextFlags.has("\\Seen") });
   }
 
-  const now = new Date().toISOString();
   const changedIds: string[] = [];
+  // One durable push row per account. Entries carry the delta against the
+  // remote-confirmed flags (the pre-patch local cache), so ordered execution
+  // composes consecutive user toggles to the latest local state.
+  const entriesByAccount = new Map<string, Array<{ id: string; mailbox: string; uid: number; add: string[]; remove: string[] }>>();
+  for (const item of prepared) {
+    if (!item.add.length && !item.remove.length) continue;
+    const entries = entriesByAccount.get(item.message.account_id) ?? [];
+    entries.push({ id: item.message.id, mailbox: item.message.mailbox, uid: item.message.uid, add: item.add, remove: item.remove });
+    entriesByAccount.set(item.message.account_id, entries);
+  }
   // The lease is acquired inside the transaction so agent listeners observe
   // the committed local state immediately, mirroring the synchronous path.
   const leases = new Map<string, ReturnType<NonNullable<AgentMailEventSink>["acquireLease"]>>();
+  // The push rows are recorded inside the same transaction as the markers they
+  // belong to: a marker without a queued push is a permanent orphan that makes
+  // sync skip this message's flags forever, so the two must commit or roll
+  // back as one unit. The FIFO chain is only joined after the commit, because
+  // the row is not readable before it.
+  const startPushes: Array<() => void> = [];
   db.transaction(() => {
     for (const item of prepared) {
       const { message } = item;
@@ -137,21 +157,11 @@ export function commitLocalFlags(
         }
       }
     }
+    for (const [accountId, entries] of entriesByAccount) {
+      startPushes.push(operationQueue.stageBackgroundInTransaction([accountId], "flags-push", { accountId, entries }));
+    }
   })();
-
-  // One durable push row per account. Entries carry the delta against the
-  // remote-confirmed flags (the pre-patch local cache), so ordered execution
-  // composes consecutive user toggles to the latest local state.
-  const entriesByAccount = new Map<string, Array<{ id: string; mailbox: string; uid: number; add: string[]; remove: string[] }>>();
-  for (const item of prepared) {
-    if (!item.add.length && !item.remove.length) continue;
-    const entries = entriesByAccount.get(item.message.account_id) ?? [];
-    entries.push({ id: item.message.id, mailbox: item.message.mailbox, uid: item.message.uid, add: item.add, remove: item.remove });
-    entriesByAccount.set(item.message.account_id, entries);
-  }
-  for (const [accountId, entries] of entriesByAccount) {
-    operationQueue.enqueueBackground([accountId], "flags-push", { accountId, entries });
-  }
+  for (const startPush of startPushes) startPush();
 
   const failed = blocked.length + (messageIds.length - rows.length);
   const changedSet = new Set(changedIds);
@@ -166,6 +176,44 @@ export function commitLocalFlags(
 export function clearPendingFlagsMarkers(db: DatabaseHandle, messageIds: readonly string[]): void {
   const update = db.prepare("UPDATE messages SET pending_flags_push = 0 WHERE id = ? AND pending_flags_push = 1");
   for (const id of messageIds) update.run(id);
+}
+
+/**
+ * Startup reconciliation for markers with no push behind them. Builds that
+ * recorded the `pending_flags_push` marker and the `flags-push` queue row in
+ * two separate transactions could leave the first committed and the second
+ * lost; such a row makes sync skip this message's flags for good (the marker
+ * is only ever cleared by the queue's settlement hooks), so local and remote
+ * state diverge silently until the user happens to toggle that flag again.
+ * `commitLocalFlags` now records both in one transaction, so this only has to
+ * repair rows a crash already left behind.
+ *
+ * The match is per message, not per account: a message is only cleared when
+ * *no* pending or running `flags-push` row names it in its entries, so a push
+ * that is still queued or retrying for the same account is never disturbed.
+ * The queue rows are read as they stand on disk at this point (before
+ * `resumePending` changes any status), so a row that is pending now and
+ * running later is still seen as pending. Returns how many markers were
+ * cleared.
+ */
+export function clearOrphanedPendingFlagsMarkers(db: DatabaseHandle): number {
+  const cleared = db.prepare(`
+    UPDATE messages SET pending_flags_push = 0
+    WHERE pending_flags_push = 1
+      AND NOT EXISTS (
+        SELECT 1
+        FROM operation_queue
+        WHERE operation_queue.kind = 'flags-push'
+          AND operation_queue.status IN ('pending', 'running')
+          AND json_valid(operation_queue.payload_json)
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(operation_queue.payload_json, '$.entries') AS entry
+            WHERE json_extract(entry.value, '$.id') = messages.id
+          )
+      )
+  `).run();
+  return cleared.changes;
 }
 
 export type FlagsPushDeps = {

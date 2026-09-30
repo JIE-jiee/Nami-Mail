@@ -10,12 +10,56 @@
 import type { DatabaseHandle } from "./db.js";
 import type { AccountRecord } from "./types.js";
 
+const ACCOUNT_BY_ID_SQL = "SELECT * FROM accounts WHERE id = ?";
+const ACCOUNT_EXISTS_SQL = "SELECT 1 FROM accounts WHERE id = ?";
+type AccountStatement = ReturnType<DatabaseHandle["prepare"]>;
+
+/**
+ * One lazily-filled statement cache per connection, per statement.
+ *
+ * `accountById` is the account read every move, flag, attachment and send path
+ * performs, and on the batch-move path it runs once per (account, mailbox)
+ * group: a 2500-row selection compiled 25 byte-identical copies of the same SQL
+ * (measured on the raw handle). Both SQL strings above are constant — the id is
+ * always bound — so each is compiled once per connection and replayed.
+ *
+ * * Scope: the `DatabaseHandle` is the `WeakMap` key, so a statement can only
+ *   ever be handed back to the connection it was compiled against, and the entry
+ *   dies with that handle. A caller that wraps the handle in a proxy (the
+ *   test-side `memoizingDb`) gets its own entry, which is the safe direction: a
+ *   miss costs one compile, never a mismatch.
+ * * Layering: the cache lives here rather than in the move-statement bundle
+ *   because this module is a leaf — routes, the agent and sync all read
+ *   accounts through these two functions, and reaching a cache through
+ *   `sync-move-statements.ts` would give the HTTP layer the move graph.
+ * * Laziness is per statement, not per handle: a deployment that only ever calls
+ *   `accountById` never compiles the existence probe.
+ * * Reads are untouched. `.get()` re-executes on every call, so each caller still
+ *   sees the row as it is at that moment, and `undefined` still means "no such
+ *   account" — only *when* the SQL is compiled changed, never *what it returns*.
+ * * Nothing is interpolated: the id is a bound parameter.
+ */
+const statementCaches = new Map<string, WeakMap<DatabaseHandle, AccountStatement>>();
+
+function accountStatement(db: DatabaseHandle, name: string, sql: string): AccountStatement {
+  let perHandle = statementCaches.get(name);
+  if (!perHandle) {
+    perHandle = new WeakMap();
+    statementCaches.set(name, perHandle);
+  }
+  const cached = perHandle.get(db);
+  if (cached) return cached;
+  const statement = db.prepare(sql);
+  perHandle.set(db, statement);
+  return statement;
+}
+
 export function accountById(db: DatabaseHandle, id: string): AccountRecord | undefined {
-  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRecord | undefined;
+  return accountStatement(db, "byId", ACCOUNT_BY_ID_SQL).get(id) as AccountRecord | undefined;
 }
 
 export function accountExists(db: DatabaseHandle, id: string): boolean {
-  return db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(id) !== undefined;
+  return accountStatement(db, "exists", ACCOUNT_EXISTS_SQL).get(id) !== undefined;
 }
 
 /** Case-insensitive lookup used to reject a duplicate mailbox before adding it. */

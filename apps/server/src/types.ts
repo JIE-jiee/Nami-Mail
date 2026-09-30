@@ -94,6 +94,13 @@ export type RuntimeContext = {
   // Server-originated mail events fanned out to connected clients over the
   // `GET /api/events` SSE endpoint by the route layer.
   serverEvents?: ServerEventBus;
+  // The owning runtime aborts this signal while the process is shutting down.
+  // Route-triggered fire-and-forget syncs (account creation, OAuth first
+  // sync, move reconciliation) hand it to `syncAccount` so their IMAP work
+  // unwinds on shutdown. It is deliberately NOT a request signal: the client
+  // navigating away after the response must not cancel these process-scoped
+  // passes — only the process going down does.
+  syncShutdownSignal?: AbortSignal;
   // The owning runtime (re)starts or stops the live IMAP IDLE watcher after
   // the user toggles the realtime push setting.
   onRealtimePushChanged?: (enabled: boolean) => void;

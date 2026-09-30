@@ -5,6 +5,8 @@ import {
   providerHealthSchema,
   autoReplyConfigPatchSchema,
   autoReplyConfigSchema,
+  type AgentProviderKind,
+  type AgentProviderSummary,
   type LlmProvider,
   type ProviderHealth,
 } from "@nami/agent-contracts";
@@ -19,7 +21,10 @@ import { AgentServiceError, now, requiredText } from "./agent-shared.js";
 export const providerConfigurationVersion = 1;
 const defaultProviderRecordId = "agent-provider-default";
 
-export type AgentProviderKind = "openai-compatible" | "ollama" | "anthropic" | "gemini" | "openai-responses";
+// The provider summary shape is single-sourced in @nami/agent-contracts
+// (the web consumes the same type); these re-exports keep the historical
+// local names for the rest of the server.
+export type { AgentProviderKind, AgentProviderSummary };
 
 export type AgentProviderInput = {
   label: string;
@@ -32,24 +37,6 @@ export type AgentProviderInput = {
   timeoutMs: number;
   allowCloudMailContent: boolean;
   makeDefault?: boolean;
-};
-
-export type AgentProviderSummary = {
-  id: string;
-  label: string;
-  kind: AgentProviderKind;
-  endpoint: string;
-  model: string;
-  embeddingModel?: string;
-  timeoutMs: number;
-  apiKeyConfigured: boolean;
-  configured: boolean;
-  cloud: boolean;
-  cloudContentConsent: boolean;
-  streaming: boolean;
-  /** Whether the configured model accepts image inputs; gates image attachments. */
-  vision: boolean;
-  health?: ProviderHealth;
 };
 
 export type AgentProviderList = {

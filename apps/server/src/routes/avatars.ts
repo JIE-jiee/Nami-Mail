@@ -4,6 +4,7 @@ import type { RuntimeContext } from "../types.js";
 import { validationMessage } from "../helpers.js";
 import { resolveBimiLogo } from "../avatars/bimi.js";
 import { buildBimiPersistence, pruneBimiLogoCache } from "../avatars/bimi-cache-store.js";
+import { ROUTE_ERROR_CODES } from "./error-codes.js";
 
 export type AvatarRouteDeps = {
   context: RuntimeContext;
@@ -26,7 +27,7 @@ export function registerAvatarRoutes(app: FastifyInstance, deps: AvatarRouteDeps
 
   app.get("/api/avatars/bimi/:domain", async (request, reply) => {
     const parsed = z.object({ domain: z.string().trim().min(4).max(253) }).strict().safeParse(request.params);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     const resolution = await resolveBimiLogo(parsed.data.domain, persistence);
     if (!resolution.ok) return { ok: false };
     return { ok: true, logo: resolution.logo };

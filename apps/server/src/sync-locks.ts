@@ -9,8 +9,6 @@
  * children and produced an import cycle.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { DatabaseHandle } from "./db.js";
-import type { AccountRecord } from "./types.js";
 
 
 const running = new Set<string>();
@@ -70,19 +68,102 @@ const heldWriteSlots = new AsyncLocalStorage<Set<string>>();
  * behind. A predecessor whose provider command hangs (and whose executor is
  * later abandoned) must not block this operation forever; on timeout the
  * operation fails and its place in the chain is released so operations behind
- * it still proceed. Generous relative to a normal operation (seconds) but far
- * shorter than the queue's executor run timeout. */
-const ACCOUNT_WRITE_SLOT_TIMEOUT_MS = 30_000;
+ * it still proceed.
+ *
+ * Tiered *below* the renderer's 30s request budget (`REQUEST_TIMEOUT_MS` in
+ * apps/web/src/api.ts) on purpose. The wait is only the first leg of a request:
+ * the slot still has to be followed by the IMAP work and the response. When
+ * this equalled the client budget, server and client gave up in the same
+ * instant and the real reason ("Timed out waiting for the account X write
+ * slot") never reached the UI — every user saw a bare network failure. At 12s
+ * the server abandons the wait with ~18s of budget left to get the real error
+ * home, and a write that has not been served by then is not going to be served
+ * before the client hangs up anyway. Still far shorter than the queue's
+ * executor run timeout, and well above the seconds a normal operation needs. */
+export const ACCOUNT_WRITE_SLOT_TIMEOUT_MS = 12_000;
+
+/** Slack, as a fraction of {@link ACCOUNT_WRITE_SLOT_TIMEOUT_MS}, spread over
+ * the waiters of one account. Every waiter used to arm the *same* deadline as
+ * everyone already queued, so a burst of writes behind one wedged account
+ * rejected in the same millisecond (measured: 60 failures inside a 1ms window).
+ * Per-waiter deadlines turn that single spike into a short stagger, so the
+ * rejections — and whatever retries the client sends after them — are spread
+ * instead of arriving as one burst. Small enough (±1.2s) that no waiter's
+ * outcome can hinge on it. */
+const ACCOUNT_WRITE_SLOT_SPREAD_RATIO = 0.1;
+
+/** Monotonic index feeding the per-waiter deadline spread below. Module
+ * private and never read, so it only has to make consecutive waiters differ. */
+let slotWaitIndex = 0;
+
+/**
+ * This waiter's own slot-wait budget: the base timeout with a bounded
+ * pseudo-random offset.
+ *
+ * The offset is derived from a counter through a 32-bit avalanche rather than
+ * `Math.random()`: the deadlines stay reproducible (a test can assert the exact
+ * spread instead of sampling it), allocation-free, and a plain `counter %
+ * window` would hand the first waiters of a burst adjacent deadlines — the
+ * very clustering the spread exists to remove.
+ */
+function slotWaitTimeoutMs(): number {
+  const slack = Math.round(ACCOUNT_WRITE_SLOT_TIMEOUT_MS * ACCOUNT_WRITE_SLOT_SPREAD_RATIO);
+  slotWaitIndex = (slotWaitIndex + 1) >>> 0;
+  let mixed = Math.imul(slotWaitIndex, 0x9e3779b1);
+  mixed = Math.imul(mixed ^ (mixed >>> 16), 0x85ebca6b);
+  mixed = (mixed ^ (mixed >>> 13)) >>> 0;
+  return ACCOUNT_WRITE_SLOT_TIMEOUT_MS - slack + (mixed % (slack * 2 + 1));
+}
+
+/** Stable marker so a write-slot timeout stays recognizable after it has
+ * crossed a module boundary (the operation queue decides on it). */
+export const ACCOUNT_WRITE_SLOT_TIMEOUT_CODE = "account_write_slot_timeout";
+
+/**
+ * Raised when the wait for an account write slot runs out. A distinct type
+ * (rather than a bare Error) so callers can tell "this account is saturated"
+ * apart from "this operation failed" — the first must not be retried into the
+ * same saturation. The message is unchanged, so anything surfacing it to the
+ * user is unaffected.
+ */
+export class AccountWriteSlotTimeoutError extends Error {
+  readonly code = ACCOUNT_WRITE_SLOT_TIMEOUT_CODE;
+
+  constructor(readonly accountId: string) {
+    super(`Timed out waiting for the account ${accountId} write slot.`);
+    this.name = "AccountWriteSlotTimeoutError";
+  }
+}
+
+/** True for a {@link AccountWriteSlotTimeoutError}, including one that crossed
+ * a module-instance boundary (the `code` check). */
+export function isAccountWriteSlotTimeoutError(error: unknown): boolean {
+  if (error instanceof AccountWriteSlotTimeoutError) return true;
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === ACCOUNT_WRITE_SLOT_TIMEOUT_CODE
+  );
+}
 
 /** Rejects with `message` after `milliseconds`, without keeping the process
- * alive for a run that may never settle on its own during shutdown. */
-export function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
+ * alive for a run that may never settle on its own during shutdown.
+ *
+ * `error` lets a caller reject with a typed error (see
+ * {@link AccountWriteSlotTimeoutError}) instead of an anonymous `Error` with
+ * the same message, so the rejection keeps its type on the far side. */
+export function withTimeout<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  message: string,
+  error?: Error,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), milliseconds);
+    const timer = setTimeout(() => reject(error ?? new Error(message)), milliseconds);
     timer.unref?.();
     promise.then(
       (value) => { clearTimeout(timer); resolve(value); },
-      (error) => { clearTimeout(timer); reject(error); },
+      (rejection) => { clearTimeout(timer); reject(rejection); },
     );
   });
 }
@@ -136,8 +217,9 @@ export async function acquireAccountWriteSlots(accountIds: readonly string[]): P
         release = resolve;
       });
       accountWriteChains.set(accountId, prev.then(() => gate));
+      const slotTimeout = new AccountWriteSlotTimeoutError(accountId);
       try {
-        await withTimeout(prev, ACCOUNT_WRITE_SLOT_TIMEOUT_MS, `Timed out waiting for the account ${accountId} write slot.`);
+        await withTimeout(prev, slotWaitTimeoutMs(), slotTimeout.message, slotTimeout);
       } catch (error) {
         // Give up our place instead of leaving an unresolved gate that would
         // block every operation queued behind us.
@@ -159,7 +241,10 @@ export async function acquireAccountWriteSlots(accountIds: readonly string[]): P
 
 /** Runs `fn` while holding write slots for every named account. */
 export async function withAccountWriteLocks<T>(accountIds: readonly string[], fn: () => Promise<T>): Promise<T> {
-  return heldWriteSlots.run(heldWriteSlots.getStore() ?? new Set<string>(), async () => {
+  // Copy the parent set: acquire/release inside `fn` must not leak into the
+  // outer context, mirroring withHeldWriteSlots (the shared-reference variant
+  // let an outer context transiently observe ids it does not hold).
+  return heldWriteSlots.run(new Set(heldWriteSlots.getStore() ?? []), async () => {
     const releases = await acquireAccountWriteSlots(accountIds);
     try {
       return await fn();
@@ -183,6 +268,3 @@ export function withHeldWriteSlots<T>(accountIds: readonly string[], fn: () => P
   return heldWriteSlots.run(held, fn);
 }
 
-export function accountById(db: DatabaseHandle, id: string): AccountRecord | undefined {
-  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRecord | undefined;
-}

@@ -2,6 +2,41 @@ import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 import reactHooks from "eslint-plugin-react-hooks";
 
+// ---------------------------------------------------------------------------
+// 巨型文件冻结（第二批）：覆盖 ≥700 行且尚未冻结的存量文件，阈值为当前行数 +10。
+// 与下方四个手写棘轮同口径（skipBlankLines/skipComments=false，计入空行与注释），
+// 堵住"把代码搬进未冻结文件即可绕过棘轮"的反弹路径；新抽取模块放新文件不受限。
+// 逐批瘦身时同步下调对应数值。
+// ---------------------------------------------------------------------------
+const monolithRatchets = [
+  ["apps/server/src/agent/run-engine.ts", 1801],
+  ["apps/server/src/agent-rag-worker.ts", 1486],
+  ["apps/server/src/sync.ts", 1250],
+  ["apps/server/src/agent/mail-tools.ts", 1101],
+  ["apps/server/src/sync-moves.ts", 793],
+  ["apps/server/src/routes/messages.ts", 982],
+  ["apps/server/src/agent/auto-reply.ts", 856],
+  ["apps/server/src/db.ts", 846],
+  ["apps/server/src/agent/schema.ts", 807],
+  ["apps/server/src/agent/sqlite-mail-application-service.ts", 768],
+  ["apps/server/src/outbox.ts", 780],
+  ["apps/server/src/agent/openai-compatible-provider.ts", 749],
+  ["apps/web/src/AddAccountModal.tsx", 1927],
+  ["apps/web/src/SettingsModal.tsx", 1318],
+  ["apps/web/src/demoProviderCatalog.ts", 1113],
+  ["apps/web/src/agent/useAgentSession.ts", 1041],
+  ["apps/web/src/CalendarDialog.tsx", 959],
+  ["apps/web/src/api.ts", 824],
+  ["apps/web/src/ComposeModal.tsx", 767],
+  ["apps/desktop/src/desktop-smoke.mts", 1346],
+  ["apps/desktop/src/agent/cli.mts", 910],
+  ["apps/desktop/src/agent/desktop-broker.mts", 902],
+];
+const monolithRatchetConfigs = monolithRatchets.map(([file, max]) => ({
+  files: [file],
+  rules: { "max-lines": ["error", { max, skipBlankLines: false, skipComments: false }] },
+}));
+
 export default tseslint.config(
   {
     ignores: [
@@ -141,11 +176,11 @@ export default tseslint.config(
   },
   {
     files: ["apps/server/src/agent-service.ts"],
-    rules: { "max-lines": ["error", { max: 2890, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1167, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["apps/desktop/src/main.mts"],
-    rules: { "max-lines": ["error", { max: 2120, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 2112, skipBlankLines: false, skipComments: false }] },
   },
   {
     // 反思轮发现：把代码搬进未冻结的文件即可绕过上述棘轮（App.tsx 的反弹路径）。
@@ -154,4 +189,6 @@ export default tseslint.config(
     files: ["apps/web/src/AgentWorkspace.tsx"],
     rules: { "max-lines": ["error", { max: 2460, skipBlankLines: false, skipComments: false }] },
   },
+
+  ...monolithRatchetConfigs,
 );

@@ -2,34 +2,23 @@ import type { FastifyInstance } from "fastify";
 import fs from "node:fs";
 import type { Readable } from "node:stream";
 import { z } from "zod";
-import type { Message } from "@nami/agent-contracts";
-import type { RuntimeContext, AccountRecord } from "../types.js";
+import type { RuntimeContext } from "../types.js";
 import {
   validationMessage,
   mailFailure,
   mailFailureBody,
-  oauthProviderFor,
-  providerInfo,
 } from "../helpers.js";
 import {
   batchMessageFlagsPatchSchema,
-  batchMessageIdsSchema,
   batchMessageMoveSchema,
-  messageIdHeaderSchema,
-  messageReferencesSchema,
   messageMoveSchema,
   messageFlagsPatchSchema,
-  outboundAttachmentDiscardSchema,
-  outboundAttachmentUploadQuerySchema,
   sendSchema,
   draftSchema,
 } from "../schemas.js";
 import {
   messagePayloadById,
   messagePayloadForRow,
-  hasPendingMove,
-  hasUnverifiedMoveLocation,
-  pendingMoveDestination,
   MAILBOX_SYNCING_ERROR,
   MAIL_MOVE_IN_FLIGHT_ERROR,
   MOVE_LOCATION_UNVERIFIED_ERROR,
@@ -43,7 +32,6 @@ import {
   MAX_OUTBOUND_ATTACHMENT_BYTES,
   MAX_OUTBOUND_ATTACHMENTS_BYTES,
   OutboundAttachmentError,
-  cleanupExpiredOutboundAttachments,
   createOutboundAttachment,
   discardDraftOutboundAttachments,
   discardPendingOutboundAttachments,
@@ -92,76 +80,21 @@ import {
   messageRowById,
   threadRowsForAccount,
   countMessageRows,
-  listMessageRows,
+  listMessagePage,
 } from "../message-queries.js";
+import {
+  InvalidMessageCursorError,
+  decodeMessageCursor,
+  type MessageListCursor,
+} from "../message-cursor.js";
+import { messageRow } from "../message-wire.js";
+import { ROUTE_ERROR_CODES, routeErrorCodeForStatus, withErrorCode } from "./error-codes.js";
 
 export type MessageRouteDeps = {
   context: RuntimeContext;
   log: FastifyInstance["log"];
   operationQueue: ReturnType<typeof createOperationQueue>;
 };
-
-/** Rewrite cid:xxx references in HTML to the inline serving endpoint. */
-function rewriteCidReferences(html: string, messageId: string, attachments: { partId: string; contentId?: string }[] | null): string {
-  if (!attachments || !html) return html;
-  const cidMap = new Map<string, string>();
-  for (const att of attachments) {
-    if (att.contentId) cidMap.set(att.contentId.toLowerCase(), att.partId);
-  }
-  if (cidMap.size === 0) return html;
-  return html.replace(/src\s*=\s*["']?\s*cid:([^"'\s>]+)/gi, (_match, cid: string) => {
-    const partId = cidMap.get(cid.toLowerCase());
-    return partId ? `src="/api/messages/${messageId}/inline/${partId}"` : _match;
-  });
-}
-
-/** Serializes a message row for the wire. Shape authority: `Message` in @nami/agent-contracts. */
-function messageRow(row: MessageStorageRow, masterKey: Buffer): Message {
-  const flags = JSON.parse(String(row.flags_json ?? "[]")) as string[];
-  const payload = messagePayloadForRow(row, masterKey);
-  const pendingDestination = pendingMoveDestination(row);
-  const movePending = hasPendingMove(row);
-  const moveLocationUnverified = hasUnverifiedMoveLocation(row);
-  const pendingArchive = pendingDestination !== null
-    && (row.pending_move_special_use === "\\Archive"
-      || (row.pending_move_special_use === "\\All" && row.all_mail_archived === 1));
-  // Join-derived columns are typed by the list/detail queries, not by
-  // MessageStorageRow itself; assert here once instead of at every call site.
-  const accountEmail = row.account_email as string;
-  const providerName = row.provider_name as string;
-  const sentAt = row.sent_at as string;
-  const size = row.size as number;
-  const snoozedUntil = (row.snoozed_until ?? null) as string | null;
-  return {
-    id: row.id,
-    accountId: row.account_id,
-    accountEmail,
-    providerName,
-    mailbox: pendingDestination ?? row.mailbox,
-    uid: row.uid,
-    movePending,
-    moveLocationUnverified,
-    archived: row.all_mail_archived === 1 || pendingArchive,
-    subject: payload.subject,
-    from: { name: payload.fromName, address: payload.fromAddress },
-    to: payload.to,
-    cc: payload.cc ?? [],
-    messageId: payload.messageId,
-    inReplyTo: payload.inReplyTo,
-    references: payload.references ?? [],
-    sentAt,
-    snippet: payload.snippet,
-    textBody: payload.textBody,
-    htmlBody: rewriteCidReferences(payload.htmlBody, row.id, payload.attachments),
-    flags,
-    seen: flags.includes("\\Seen"),
-    flagged: flags.includes("\\Flagged"),
-    hasAttachments: Boolean(row.has_attachments),
-    attachments: payload.attachments ?? [],
-    size,
-    snoozedUntil,
-  };
-}
 
 function completedThreadingHeaders(message: { inReplyTo?: string; references?: string[] }) {
   const references = [...new Set([
@@ -172,6 +105,34 @@ function completedThreadingHeaders(message: { inReplyTo?: string; references?: s
     ...(message.inReplyTo ? { inReplyTo: message.inReplyTo } : {}),
     ...(references.length ? { references } : {}),
   };
+}
+
+/** A message's place in the reply graph: its own Message-ID and the ids it answers. */
+type ThreadHeaders = { messageId: string | null; parentIds: string[] };
+// Threading headers live only inside the encrypted payload (the storage layer
+// blanks the plaintext columns), so resolving one conversation decrypts every
+// row of the account and paging through a folder repeats that per selection. A
+// written payload does not change, so the triple is kept in a bounded LRU whose
+// key carries what a rewrite moves — payload_metadata_ready when a hydration
+// pass completes References, ciphertext length on re-encryption — so an edited
+// row is re-read instead of served stale. The bound has to cover a whole
+// account: eviction in scan order drops exactly the row needed next, so a
+// smaller cache scores no hits at all. Entries are hundreds of bytes rather
+// than the 48KB payload, which is what makes 20 000 of them (~10MB, against
+// message-storage's own 64MB) affordable.
+const THREAD_HEADER_CACHE_MAX = 20_000;
+const threadHeaderCache = new Map<string, ThreadHeaders>();
+
+function threadHeadersFor(row: MessageStorageRow, masterKey: Buffer): ThreadHeaders {
+  const key = `${row.id}\0${row.payload_metadata_ready}\0${row.encrypted_payload?.length ?? 0}`;
+  const cached = threadHeaderCache.get(key);
+  if (cached) { threadHeaderCache.delete(key); threadHeaderCache.set(key, cached); return cached; }
+  const payload = messagePayloadForRow(row, masterKey);
+  const parentIds = [payload.inReplyTo, ...(payload.references ?? [])].filter((value): value is string => Boolean(value));
+  const headers: ThreadHeaders = { messageId: payload.messageId ?? null, parentIds };
+  if (threadHeaderCache.size >= THREAD_HEADER_CACHE_MAX) threadHeaderCache.delete(threadHeaderCache.keys().next().value as string);
+  threadHeaderCache.set(key, headers);
+  return headers;
 }
 
 function parseListDateBound(value: string | undefined): string | undefined | null {
@@ -316,21 +277,35 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
     );
   }
 
-  app.get<{ Querystring: { accountId?: string; folder?: string; q?: string; page?: string; pageSize?: string; starred?: string; unread?: string; archived?: string; snoozed?: string; hasAttachments?: string; attachmentKind?: string; after?: string; before?: string; scope?: string } }>(
+  // Paging is keyset: `cursor` names a position in the list's total order and
+  // `nextCursor` continues it. A `page` parameter is still accepted and ignored
+  // — it is not in the type, so nothing here reads it, and a stale link that
+  // still carries one gets the first page rather than a 400.
+  app.get<{ Querystring: { accountId?: string; folder?: string; q?: string; cursor?: string; pageSize?: string; starred?: string; unread?: string; archived?: string; snoozed?: string; hasAttachments?: string; attachmentKind?: string; after?: string; before?: string; scope?: string } }>(
     "/api/messages",
     async (request, reply) => {
-      const page = Math.max(1, Number.parseInt(request.query.page ?? "1", 10) || 1);
       const pageSize = Math.min(100, Math.max(10, Number.parseInt(request.query.pageSize ?? "40", 10) || 40));
       const query = request.query.q?.trim();
       // scope=all is resolved inside buildMessageListSql: it is search-only
       // (needs q) and drops every view/account/folder restriction.
       if (request.query.attachmentKind !== undefined && !isValidAttachmentKind(request.query.attachmentKind)) {
-        return reply.code(400).send({ ok: false, message: "无效的附件类型。" });
+        return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "无效的附件类型。" });
+      }
+      // A cursor is only ever a string this route issued, so anything else is a
+      // client bug and is refused rather than silently answered with page 1 —
+      // which would look like the list had stalled.
+      let cursor: MessageListCursor | undefined;
+      try {
+        cursor = request.query.cursor === undefined ? undefined : decodeMessageCursor(request.query.cursor);
+      } catch (error) {
+        if (!(error instanceof InvalidMessageCursorError)) throw error;
+        log.warn({ reason: error.message }, "Rejected a malformed message list cursor");
+        return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "无效的分页游标。" });
       }
       const afterBound = parseListDateBound(request.query.after);
       const beforeBound = parseListDateBound(request.query.before);
       if (afterBound === null || beforeBound === null) {
-        return reply.code(400).send({ ok: false, message: "无效的日期范围。" });
+        return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "无效的日期范围。" });
       }
       const selection = buildMessageListSql({
         accountId: request.query.accountId,
@@ -347,51 +322,52 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
         scope: request.query.scope === "all" ? "all" : undefined,
       });
       const total = countMessageRows(context.db, selection);
-      const rows = listMessageRows(context.db, selection, page, pageSize);
-      return { items: rows.map((row) => messageRow(row, context.masterKey)), total, page, pageSize };
+      const page = listMessagePage(context.db, selection, { limit: pageSize, cursor });
+      // The list answers with body-less rows: the reader loads one message at
+      // a time, and a page that carried every stored body is what turns a
+      // handful of oversized messages into a frozen inbox refresh.
+      // `nextCursor: null` is the only "this is the last page" signal: `total`
+      // moves every time mail arrives, so a client that compared it against the
+      // rows it had loaded would never stop, or would stop early.
+      return {
+        items: page.rows.map((row) => messageRow(row, context.masterKey, { body: false })),
+        total,
+        pageSize,
+        nextCursor: page.nextCursor,
+      };
     },
   );
 
   app.get<{ Params: { id: string } }>("/api/messages/:id", async (request, reply) => {
     const row = messageRowById(context.db, request.params.id);
-    if (!row) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
+    if (!row) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
     return messageRow(row, context.masterKey);
   });
 
   // Gmail-style conversation: the web reader shows every message of the
   // thread, including members stored outside the currently loaded view (e.g.
-  // the user's own replies in the Sent folder). The web only loads one
-  // folder at a time and groups threads client-side, so it asks the server
-  // for the complete membership instead. Resolution walks the RFC reply
-  // graph (Message-ID / In-Reply-To / References) transitively in both
-  // directions within the anchor's account; drafts are excluded because an
-  // unsent reply is not part of the conversation yet.
+  // the user's own replies in Sent). The web loads one folder at a time and
+  // groups threads client-side, so it asks the server for the whole membership.
+  // Resolution walks the RFC reply graph (Message-ID / In-Reply-To /
+  // References) transitively in both directions within the anchor's account;
+  // drafts are excluded because an unsent reply is not a conversation member.
   app.get<{ Params: { id: string } }>("/api/messages/:id/thread", async (request, reply) => {
     const anchor = messageRowById(context.db, request.params.id);
-    if (!anchor) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
+    if (!anchor) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
     const anchorPayload = messagePayloadForRow(anchor, context.masterKey);
-    const knownIds = new Set<string>();
-    if (anchorPayload.messageId) knownIds.add(anchorPayload.messageId);
-    if (anchorPayload.inReplyTo) knownIds.add(anchorPayload.inReplyTo);
-    for (const reference of anchorPayload.references ?? []) knownIds.add(reference);
+    const knownIds = new Set<string>([anchorPayload.messageId, anchorPayload.inReplyTo, ...(anchorPayload.references ?? [])].filter((value): value is string => Boolean(value)));
     // A headerless anchor forms a single-message conversation on its own.
     if (knownIds.size === 0) return { items: [messageRow(anchor, context.masterKey)] };
-    // Header values are encrypted, so membership needs one decrypting pass
-    // over the account. That is synchronous AES work in the Electron main
-    // process — yield to the event loop periodically, mirroring the agent's
-    // thread reader, so the window stays responsive on large mailboxes.
-    const entries: Array<{ row: MessageStorageRow; messageId: string | null; parentIds: string[] }> = [];
+    // Reply headers are encrypted, so membership needs one decrypting pass over
+    // the account: synchronous AES work in the Electron main process. Yield
+    // periodically (mirroring the agent's thread reader), and abandon the scan
+    // once the client is gone — holding ↓ fires a request per message read.
+    const entries: Array<{ row: MessageStorageRow } & ThreadHeaders> = [];
     const rows = threadRowsForAccount(context.db, anchor.account_id);
-    let processed = 0;
-    for (const row of rows) {
-      const payload = messagePayloadForRow(row, context.masterKey);
-      entries.push({
-        row,
-        messageId: payload.messageId ?? null,
-        parentIds: [payload.inReplyTo, ...(payload.references ?? [])].filter((value): value is string => Boolean(value)),
-      });
-      processed += 1;
-      if (processed % 64 === 0) await new Promise<void>((resolve) => setImmediate(() => resolve()));
+    for (const [index, row] of rows.entries()) {
+      if (request.raw.destroyed) return { items: [] };
+      entries.push({ row, ...threadHeadersFor(row, context.masterKey) });
+      if ((index + 1) % 64 === 0) await new Promise<void>((resolve) => setImmediate(() => resolve()));
     }
     // Breadth-first closure: a message joins when it links to a known
     // Message-ID (as a reply) or is itself a known Message-ID (as a parent);
@@ -426,9 +402,9 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
   app.get<{ Params: { id: string } }>("/api/messages/:id/outbound-attachments", async (request, reply) => {
     const stored = messagePayloadById(context.db, context.masterKey, request.params.id);
     const row = messageFolderSpecialUse(context.db, request.params.id);
-    if (!stored) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
-    if (!row) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
-    if (row.special_use !== "\\Drafts") return reply.code(400).send({ ok: false, message: "这不是草稿邮件。" });
+    if (!stored) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
+    if (!row) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
+    if (row.special_use !== "\\Drafts") return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "这不是草稿邮件。" });
     return {
       items: listDraftOutboundAttachments(
         context.db,
@@ -443,9 +419,9 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
   app.post<{ Params: { id: string } }>("/api/messages/:id/outbound-attachments/import", async (request, reply) => {
     const storedMessage = messagePayloadById(context.db, context.masterKey, request.params.id);
     const row = messageAccountAndFolder(context.db, request.params.id);
-    if (!storedMessage) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
-    if (!row) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
-    if (row.special_use !== "\\Drafts") return reply.code(400).send({ ok: false, message: "这不是草稿邮件。" });
+    if (!storedMessage) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
+    if (!row) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
+    if (row.special_use !== "\\Drafts") return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "这不是草稿邮件。" });
 
     const directory = outboundAttachmentDirectory(context);
     const existing = listDraftOutboundAttachments(context.db, directory, context.masterKey, row.account_id, storedMessage.payload.messageId);
@@ -453,14 +429,14 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
     const sourceAttachments = (storedMessage.payload.attachments ?? []).filter((attachment) => !attachment.related);
     if (!sourceAttachments.length) return { items: [] };
     if (sourceAttachments.length > MAX_OUTBOUND_ATTACHMENT_COUNT) {
-      return reply.code(413).send({ ok: false, message: `每封邮件最多添加 ${MAX_OUTBOUND_ATTACHMENT_COUNT} 个附件。` });
+      return reply.code(413).send({ ok: false, code: ROUTE_ERROR_CODES.payload_too_large, message: `每封邮件最多添加 ${MAX_OUTBOUND_ATTACHMENT_COUNT} 个附件。` });
     }
     const declaredSize = sourceAttachments.reduce((sum, attachment) => sum + attachment.size, 0);
     if (sourceAttachments.some((attachment) => attachment.size > MAX_OUTBOUND_ATTACHMENT_BYTES)) {
-      return reply.code(413).send({ ok: false, message: "单个附件不能超过 10 MB。" });
+      return reply.code(413).send({ ok: false, code: ROUTE_ERROR_CODES.payload_too_large, message: "单个附件不能超过 10 MB。" });
     }
     if (declaredSize > MAX_OUTBOUND_ATTACHMENTS_BYTES) {
-      return reply.code(413).send({ ok: false, message: "所有附件合计不能超过 25 MB。" });
+      return reply.code(413).send({ ok: false, code: ROUTE_ERROR_CODES.payload_too_large, message: "所有附件合计不能超过 25 MB。" });
     }
 
     const importedTokens: string[] = [];
@@ -490,11 +466,11 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
         log.warn({ cleanupError, messageId: request.params.id }, "Could not clean failed draft attachment import");
       }
       if (error instanceof OutboundAttachmentError) {
-        return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, message: outboundAttachmentActionErrorMessage(error) });
+        return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, code: routeErrorCodeForStatus(outboundAttachmentErrorStatus(error)), message: outboundAttachmentActionErrorMessage(error) });
       }
       const failure = mailFailure(error);
       const statusCode = failure.body.code === "unknown" ? attachmentErrorStatus(error) : failure.statusCode;
-      return reply.code(statusCode).send(mailFailureBody(failure, attachmentActionErrorMessage(error)));
+      return reply.code(statusCode).send(withErrorCode(mailFailureBody(failure, attachmentActionErrorMessage(error)), statusCode));
     }
   });
 
@@ -510,7 +486,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
     } catch (error) {
       const failure = mailFailure(error);
       const statusCode = failure.body.code === "unknown" ? attachmentErrorStatus(error) : failure.statusCode;
-      return reply.code(statusCode).send(mailFailureBody(failure, attachmentActionErrorMessage(error)));
+      return reply.code(statusCode).send(withErrorCode(mailFailureBody(failure, attachmentActionErrorMessage(error)), statusCode));
     }
   });
 
@@ -518,7 +494,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
 
   app.get<{ Params: { id: string; partId: string } }>("/api/messages/:id/inline/:partId", async (request, reply) => {
     const messageId = z.string().uuid().safeParse(request.params.id);
-    if (!messageId.success) return reply.code(400).send({ ok: false, message: "邮件标识无效。" });
+    if (!messageId.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "邮件标识无效。" });
     try {
       const download = await downloadMessageAttachment(context.db, context.masterKey, messageId.data, request.params.partId, context.oauthService);
       reply
@@ -530,7 +506,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
     } catch (error) {
       const failure = mailFailure(error);
       const statusCode = failure.body.code === "unknown" ? attachmentErrorStatus(error) : failure.statusCode;
-      return reply.code(statusCode).send(mailFailureBody(failure, attachmentActionErrorMessage(error)));
+      return reply.code(statusCode).send(withErrorCode(mailFailureBody(failure, attachmentActionErrorMessage(error)), statusCode));
     }
   });
 
@@ -538,9 +514,9 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
 
   app.get<{ Querystring: { url: string } }>("/api/images/proxy", async (request, reply) => {
     const url = typeof request.query.url === "string" ? request.query.url.trim() : "";
-    if (!url) return reply.code(400).send({ ok: false, message: "缺少图片地址。" });
+    if (!url) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "缺少图片地址。" });
     const result = await proxyImage(url);
-    if (!result) return reply.code(404).send({ ok: false, message: "无法获取图片。" });
+    if (!result) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "无法获取图片。" });
     reply
       .type(result.contentType)
       .header("Content-Disposition", "inline")
@@ -551,7 +527,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
 
   app.get<{ Params: { id: string } }>("/api/messages/:id/eml", async (request, reply) => {
     const messageId = z.string().uuid().safeParse(request.params.id);
-    if (!messageId.success) return reply.code(400).send({ ok: false, message: "邮件标识无效。" });
+    if (!messageId.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "邮件标识无效。" });
     try {
       const download = await downloadMessageSource(context.db, context.masterKey, messageId.data, context.oauthService);
       const subject = download.subject.replace(/[\r\n]+/g, " ").trim().slice(0, 80);
@@ -565,13 +541,13 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
     } catch (error) {
       const failure = mailFailure(error);
       const statusCode = failure.body.code === "unknown" ? attachmentErrorStatus(error) : failure.statusCode;
-      return reply.code(statusCode).send(mailFailureBody(failure, attachmentActionErrorMessage(error)));
+      return reply.code(statusCode).send(withErrorCode(mailFailureBody(failure, attachmentActionErrorMessage(error)), statusCode));
     }
   });
 
   app.delete<{ Params: { id: string } }>("/api/messages/:id/draft", async (request, reply) => {
     const stored = accountRowForMessage(context.db, request.params.id);
-    if (!stored) return reply.code(404).send({ ok: false, message: "草稿不存在。" });
+    if (!stored) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "草稿不存在。" });
     try {
       const draftMessageId = storedDraftMessageId(context, stored.id, request.params.id);
       await discardDraft(context.db, context.masterKey, stored, request.params.id, context.oauthService, context.agentMailEvents);
@@ -587,28 +563,36 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
     } catch (error) {
       const failure = mailFailure(error, detectProvider(stored.email).credentialHint);
       const statusCode = failure.body.code === "unknown" ? draftDiscardErrorStatus(error) : failure.statusCode;
-      return reply.code(statusCode).send(mailFailureBody(failure, draftActionErrorMessage(error)));
+      return reply.code(statusCode).send(withErrorCode(mailFailureBody(failure, draftActionErrorMessage(error)), statusCode));
     }
   });
 
   app.patch("/api/messages/batch/flags", async (request, reply) => {
     const parsed = batchMessageFlagsPatchSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     try {
       // Write-behind: one local transaction commits the whole selection in
       // milliseconds; the IMAP STORE is pushed per account by the durable
       // background queue, so the response never queues behind a running sync.
+      //
+      // Counts only, never `changedIds`. The commit's changed-id list is
+      // server-side: a 5000-id selection serialized ~200 KB of ids the client
+      // never read (the renderer's only reads are `failed` and `failures` —
+      // `BatchMessageOperationResult` has no such field). Undo does not need
+      // it either; the batch-job path keeps its own scope in memory, exactly
+      // as `toSnapshot()` dropped it from the progress payload. Keep the
+      // response flat in the selection size.
       const outcome = commitLocalFlags(context.db, parsed.data.ids, parsed.data.patch, operationQueue, context.agentMailEvents);
-      return { ok: true, updated: outcome.updated, failed: outcome.failed, changedIds: outcome.changedIds };
+      return { ok: true, updated: outcome.updated, failed: outcome.failed };
     } catch (error) {
       request.log.error({ error }, "Batch flag update failed");
-      return reply.code(500).send({ ok: false, message: "批量更新标志失败。" });
+      return reply.code(500).send({ ok: false, code: ROUTE_ERROR_CODES.internal_error, message: "批量更新标志失败。" });
     }
   });
 
   app.post("/api/messages/batch/move", async (request, reply) => {
     const parsed = batchMessageMoveSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     try {
       // Enqueue one durable operation per affected account. Each row waits
       // for that account's write slot, so a batch issued while another move
@@ -651,20 +635,27 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
           getSyncMessageLimit(context.db),
           context.oauthService,
           context.agentMailEvents,
+          // Process shutdown stops this reconciliation; the client that issued
+          // the move navigating away must not.
+          context.syncShutdownSignal,
         )
           .then(() => emitAccountSynced(context.db, context.serverEvents, accountId))
           .catch(() => request.log.warn({ accountId }, "Batch move cache refresh is pending"));
       }
+      // Same counts-only contract as the flag batch above: `failures` carries
+      // one entry per *refused* message, so it stays bounded by the failure
+      // count rather than by the selection. A move that succeeded needs no
+      // per-id echo — the reconciled sync above refreshes the folder anyway.
       return { ok: true, updated, failed: failures.length, failures };
     } catch (error) {
       request.log.error({ error }, "Batch move failed");
-      return reply.code(500).send({ ok: false, message: "批量移动失败。" });
+      return reply.code(500).send({ ok: false, code: ROUTE_ERROR_CODES.internal_error, message: "批量移动失败。" });
     }
   });
 
   app.patch<{ Params: { id: string } }>("/api/messages/:id", async (request, reply) => {
     const parsed = messageFlagsPatchSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     try {
       // Write-behind: the local cache commits in milliseconds and the IMAP
       // STORE is pushed by the durable background queue (flags-outbox), so a
@@ -675,13 +666,13 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       return { ok: true };
     } catch (error) {
       const failure = mailFailure(error);
-      return reply.code(failure.statusCode).send(mailFailureBody(failure, messageFlagActionErrorMessage(error)));
+      return reply.code(failure.statusCode).send(withErrorCode(mailFailureBody(failure, messageFlagActionErrorMessage(error)), failure.statusCode));
     }
   });
 
   app.post<{ Params: { id: string } }>("/api/messages/:id/move", async (request, reply) => {
     const parsed = messageMoveSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     try {
       // The operation is recorded durably before it waits for the account's
       // write slot: a second delete issued while the first is still in flight
@@ -705,6 +696,9 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
           getSyncMessageLimit(context.db),
           context.oauthService,
           context.agentMailEvents,
+          // Process shutdown stops this reconciliation; the client that issued
+          // the move navigating away must not.
+          context.syncShutdownSignal,
         )
           .then(() => emitAccountSynced(context.db, context.serverEvents, accountId))
           .catch(() => request.log.warn({ messageId: request.params.id }, "Message move cache refresh is pending"));
@@ -712,7 +706,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       return { ok: true, ...result };
     } catch (error) {
       const failure = mailFailure(error);
-      return reply.code(failure.statusCode).send(mailFailureBody(failure, moveActionErrorMessage(error)));
+      return reply.code(failure.statusCode).send(withErrorCode(mailFailureBody(failure, moveActionErrorMessage(error)), failure.statusCode));
     }
   });
 
@@ -722,35 +716,35 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
         message: "稍后处理时间必须在未来。",
       }),
     }).strict().safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     const existing = messageExists(context.db, request.params.id);
-    if (!existing) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
+    if (!existing) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
     try {
       setMessageSnoozed(context.db, request.params.id, parsed.data.until);
       return { ok: true, snoozedUntil: parsed.data.until };
     } catch (error) {
       const failure = mailFailure(error);
-      return reply.code(failure.statusCode).send(mailFailureBody(failure, error instanceof Error ? error.message : "无法稍后处理这封邮件。"));
+      return reply.code(failure.statusCode).send(withErrorCode(mailFailureBody(failure, error instanceof Error ? error.message : "无法稍后处理这封邮件。"), failure.statusCode));
     }
   });
 
   app.delete<{ Params: { id: string } }>("/api/messages/:id/snooze", async (request, reply) => {
     const existing = messageExists(context.db, request.params.id);
-    if (!existing) return reply.code(404).send({ ok: false, message: "邮件不存在。" });
+    if (!existing) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "邮件不存在。" });
     try {
       clearMessageSnooze(context.db, request.params.id);
       return { ok: true };
     } catch (error) {
       const failure = mailFailure(error);
-      return reply.code(failure.statusCode).send(mailFailureBody(failure, error instanceof Error ? error.message : "无法取消稍后处理。"));
+      return reply.code(failure.statusCode).send(withErrorCode(mailFailureBody(failure, error instanceof Error ? error.message : "无法取消稍后处理。"), failure.statusCode));
     }
   });
 
   app.post("/api/messages/send", async (request, reply) => {
     const parsed = sendSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     const account = accountById(context.db, parsed.data.accountId);
-    if (!account) return reply.code(404).send({ ok: false, message: "发件邮箱不存在。" });
+    if (!account) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "发件邮箱不存在。" });
 
     const {
       accountId: _accountId,
@@ -873,7 +867,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       if (error instanceof SubmissionConflictError) {
         return reply.code(409).send({
           ok: false,
-          code: "idempotency_conflict",
+          code: ROUTE_ERROR_CODES.idempotency_conflict,
           message: "同一个发送请求已关联到不同内容。请关闭当前邮件后重新编辑，再创建新的发送请求。",
         });
       }
@@ -881,7 +875,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
         if (submissionId) {
           markSubmissionFailed(context.db, context.masterKey, submissionId, "attachment_unavailable", outboundAttachmentActionErrorMessage(error));
         }
-        return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, message: outboundAttachmentActionErrorMessage(error) });
+        return reply.code(outboundAttachmentErrorStatus(error)).send(withErrorCode({ ok: false, message: outboundAttachmentActionErrorMessage(error) }, outboundAttachmentErrorStatus(error)));
       }
       const failure = mailFailure(error, detectProvider(account.email).credentialHint);
       if (!submissionId) return reply.code(failure.statusCode).send(failure.body);
@@ -910,11 +904,11 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
 
   app.post<{ Params: { id: string } }>("/api/messages/send/:id/cancel", async (request, reply) => {
     const submission = submissionForId(context.db, context.masterKey, request.params.id);
-    if (!submission) return reply.code(404).send({ ok: false, message: "发送任务不存在。" });
+    if (!submission) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "发送任务不存在。" });
     const requestPayload = submissionRequestForId(context.db, context.masterKey, request.params.id);
     const cancelled = deletePendingScheduledSubmission(context.db, request.params.id);
     if (!cancelled) {
-      return reply.code(409).send({ ok: false, message: "该邮件已到发送时间或正在发送，无法取消。" });
+      return reply.code(409).send({ ok: false, code: ROUTE_ERROR_CODES.conflict, message: "该邮件已到发送时间或正在发送，无法取消。" });
     }
     if (requestPayload?.attachmentTokens.length) {
       try {
@@ -935,9 +929,9 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
 
   app.post("/api/messages/drafts", async (request, reply) => {
     const parsed = draftSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     const account = accountById(context.db, parsed.data.accountId);
-    if (!account) return reply.code(404).send({ ok: false, message: "发件邮箱不存在。" });
+    if (!account) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "发件邮箱不存在。" });
     try {
       const { replaceDraftId, attachmentTokens, ...draft } = parsed.data;
       const directory = outboundAttachmentDirectory(context);
@@ -963,7 +957,7 @@ export function registerMessageRoutes(app: FastifyInstance, deps: MessageRouteDe
       return reply.code(201).send({ ok: true, ...result, ...(attachmentWarning ? { attachmentWarning } : {}) });
     } catch (error) {
       if (error instanceof OutboundAttachmentError) {
-        return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, message: outboundAttachmentActionErrorMessage(error) });
+        return reply.code(outboundAttachmentErrorStatus(error)).send(withErrorCode({ ok: false, message: outboundAttachmentActionErrorMessage(error) }, outboundAttachmentErrorStatus(error)));
       }
       const failure = mailFailure(error);
       return reply.code(failure.statusCode).send({ ...failure.body, message: draftActionErrorMessage(error) });

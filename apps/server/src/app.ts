@@ -1,7 +1,7 @@
 import fs, { appendFileSync } from "node:fs";
 import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
-import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import Fastify, { type FastifyError, type FastifyInstance, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import { AgentService } from "./agent-service.js";
@@ -22,12 +22,13 @@ import { registerBackupRoutes } from "./routes/backup.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerOutboundAttachmentRoutes } from "./routes/outbound-attachments.js";
 import { registerBatchJobRoutes } from "./routes/batch-jobs.js";
-import { clearPendingFlagsMarkers, pushFlagsRemote, type FlagsPushEntry } from "./flags-outbox.js";
+import { clearOrphanedPendingFlagsMarkers, clearPendingFlagsMarkers, pushFlagsRemote, type FlagsPushEntry } from "./flags-outbox.js";
 import {
   oauthProviderFor,
   providerInfo,
 } from "./helpers.js";
 import { emitSettingsChanged } from "./events.js";
+import { serverLog } from "./logging.js";
 import { config, isLoopbackRemoteAddress } from "./config.js";
 import {
   migrateMessageStorage,
@@ -145,6 +146,41 @@ function hasMatchingLocalApiAccessToken(value: string | string[] | undefined, ex
   return received.length === token.length && timingSafeEqual(received, token);
 }
 
+// Token-less requests previously trusted any loopback socket peer on the
+// strength of "a loopback peer is this machine". DNS rebinding breaks that
+// assumption: a browser that resolved an attacker's domain to 127.0.0.1 sends
+// same-origin fetches whose socket peer is loopback but whose Host header
+// still names the attacker's domain, and CORS never sees those requests. The
+// Host header is the remaining signal the server can check, so token-less
+// requests must name one of this server's own loopback authorities. This
+// check deliberately guards only the token-less fallback in the onRequest
+// hook below: requests carrying the desktop API token are already
+// authenticated with a capability a rebound page cannot obtain, so desktop
+// mode is unaffected.
+function isTrustedTokenlessHost(value: string | string[] | undefined, allowedPort: number): boolean {
+  // Port 0 asks the OS for a free port, which only the desktop host does —
+  // and it always pairs that with a generated token (main.mts). A token-less
+  // dynamic port is therefore a misconfiguration: the real bound port is
+  // unknowable here, so every token-less request is refused (fail closed).
+  if (allowedPort <= 0) return false;
+  // HTTP/1.1 requires a Host header on every request, so a missing or empty
+  // one is rejected instead of trusted. Node's parser collapses duplicate
+  // Host headers to the first value, which must still match an allowed form
+  // exactly, so duplication cannot smuggle a second authority past this
+  // check.
+  if (typeof value !== "string") return false;
+  const host = value.trim().toLowerCase();
+  if (host === "") return false;
+  // Exact match against the loopback authorities this server answers on:
+  // the IPv4 loopback, the localhost name, and the bracketed IPv6 loopback
+  // form ([::1]:port) browsers send. The comparison is case-insensitive
+  // because host names are; anything else — a rebound domain, a foreign
+  // port, a missing port — is rejected.
+  return host === `127.0.0.1:${allowedPort}`
+    || host === `localhost:${allowedPort}`
+    || host === `[::1]:${allowedPort}`;
+}
+
 export async function buildApp(context: RuntimeContext, options: BuildAppOptions = {}): Promise<FastifyInstance> {
   const buildPhaseStart = performance.now();
   const notePhase = (stage: string): void => {
@@ -260,17 +296,37 @@ export async function buildApp(context: RuntimeContext, options: BuildAppOptions
     await pushFlagsRemote({ db: context.db, masterKey: context.masterKey, accessTokenProvider: context.oauthService }, push);
     clearPendingFlagsMarkers(context.db, push.entries.map((entry) => entry.id));
   });
+  // Repair `pending_flags_push` markers that no queued push is behind before
+  // the resumed queue starts: a marker only syncs ever clears again is a
+  // message whose flags stop following the server for good. Runs against the
+  // queue exactly as it sits on disk, so every still-pending row counts as its
+  // push. Best effort by design — a reconciliation problem must never stop the
+  // app from booting.
+  try {
+    const orphaned = clearOrphanedPendingFlagsMarkers(context.db);
+    if (orphaned) app.log.warn({ orphaned }, "Cleared flag push markers with no queued push");
+  } catch (reconcileError) {
+    app.log.warn({ error: reconcileError }, "Could not reconcile orphaned flag push markers");
+  }
   void operationQueue.resumePending().then((resumed) => {
     if (resumed) app.log.warn({ resumed }, "Resumed interrupted write operations");
   });
   const localApiAccessToken = options.localApiAccessToken?.trim() || undefined;
 
   // Backgrounds and mail attachments use this binary path so image data never
-  // expands into a base64 JSON payload. Each route still applies its own cap.
-  app.addContentTypeParser("application/octet-stream", {
-    parseAs: "buffer",
-    bodyLimit: MAX_BACKGROUND_UPLOAD_BYTES,
-  }, (_request, body, done) => done(null, body));
+  // expands into a base64 JSON payload.
+  //
+  // The parser deliberately carries NO bodyLimit. In Fastify a parser-level
+  // limit wins whenever a route does not declare one of its own, so the 50 MB
+  // that used to live here silently became the effective limit for *every*
+  // route in the process — DELETE /api/outbound-attachments, the agent routes
+  // and everything else buffered a 40 MB octet-stream body into the heap before
+  // the 3 MB server-wide cap could ever apply. Without the override the parser
+  // inherits the server's `bodyLimit` (3 MB), and the two routes that genuinely
+  // accept large uploads raise their own ceiling in their route options, which
+  // take precedence: POST /api/outbound-attachments (10 MB) and
+  // POST /api/settings/background (50 MB).
+  app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_request, body, done) => done(null, body));
 
   // The desktop renderer and its API share one loopback origin. This keeps
   // sanitized mail HTML from loading code or network resources outside it.
@@ -299,17 +355,54 @@ export async function buildApp(context: RuntimeContext, options: BuildAppOptions
     if (localApiAccessToken) {
       if (hasMatchingLocalApiAccessToken(request.headers[localApiAccessHeader], localApiAccessToken)) return;
     } else if (isLoopbackRemoteAddress(request.socket.remoteAddress)) {
-      // Browser development runs without a token; a loopback peer is still
-      // this machine, which is the documented trust boundary. Any other
-      // source is rejected so a non-loopback bind misconfiguration cannot
-      // silently expose mailbox data or send capability on the network.
-      return;
+      // Browser development runs without a token. A loopback peer no longer
+      // stands alone as the trust boundary — DNS rebinding can present one
+      // from an attacker-controlled origin (see isTrustedTokenlessHost) — so
+      // the Host header must also name one of this server's own loopback
+      // authorities on the configured port.
+      if (isTrustedTokenlessHost(request.headers.host, config.port)) return;
+      // 403 rather than the 401 below: a missing token is recoverable (the
+      // client can present the capability), but a foreign Host header marks
+      // the request as a rebinding/spoofing attempt that no credential would
+      // legitimize. The distinct code also keeps such attempts separable
+      // from ordinary missing-token 401s in logs.
+      return reply.code(403).send({
+        ok: false,
+        code: "local_api_forbidden_host",
+        message: "本地服务拒绝了来自未授权来源的请求。",
+      });
     }
     return reply.code(401).send({
       ok: false,
       code: "local_api_unauthorized",
       message: "本地服务请求未获授权。",
     });
+  });
+
+  // Last-resort net for handler failures that never got wrapped in a try/catch
+  // (a new route, a forgotten await, an agent call outside its guard). Every
+  // API failure the renderer sees is an `{ ok: false, code, message }` triple,
+  // so a client can never receive Fastify's default `{ statusCode, error,
+  // message }` shape — which, for a 500, also echoes the raw error message
+  // (SQL text, file paths, provider responses) straight to the client.
+  //
+  // Boundaries, so nothing that already has a deliberate answer changes:
+  // - A status the handler sent itself (401/403/404/400/422/…) never reaches
+  //   this hook: `reply.send(...)` is a plain response, not an error.
+  // - An error that already carries a 4xx status (Fastify's own content-type,
+  //   body-size and route-validation errors) keeps Fastify's client-error
+  //   semantics, including its exact body, by being handed back to the
+  //   default handler. The agent routes' `agentFailure` mapping is unaffected
+  //   for the same reason: it converts `AgentServiceError` into a `reply.send`
+  //   inside the handler before anything can throw past it.
+  // - Only 5xx and status-less failures are re-shaped here, with a fixed
+  //   message that carries no internal detail. The stack and the original
+  //   error stay in the server log.
+  app.setErrorHandler<FastifyError>((error, request, reply) => {
+    const statusCode = typeof error.statusCode === "number" && error.statusCode >= 400 ? error.statusCode : 500;
+    if (statusCode < 500) return reply.send(error);
+    serverLog.error({ method: request.method, url: request.url, statusCode }, "Unhandled local API error", error);
+    return reply.code(500).send({ ok: false, code: "internal_error", message: "本地服务处理请求时发生错误，请稍后重试。" });
   });
 
   // Startup request log: capture every request served during the first 60s

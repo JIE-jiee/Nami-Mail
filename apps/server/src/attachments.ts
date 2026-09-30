@@ -1,4 +1,5 @@
 import type { Readable } from "node:stream";
+import { accountById } from "./account-store.js";
 import type { MessageStructureObject } from "imapflow";
 import type { Attachment } from "mailparser";
 import type { DatabaseHandle } from "./db.js";
@@ -31,10 +32,6 @@ export type MessageAttachmentDownload = {
 };
 
 type MailParserAttachment = Attachment & { partId?: unknown };
-
-function accountById(db: DatabaseHandle, id: string): AccountRecord | undefined {
-  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRecord | undefined;
-}
 
 export function isValidAttachmentPartId(value: unknown): value is string {
   return typeof value === "string" && value.length <= maxAttachmentPartIdLength && attachmentPartIdPattern.test(value);

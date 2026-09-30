@@ -4,7 +4,7 @@ import { simpleParser, type AddressObject } from "mailparser";
 import { attachmentMetadataFromParsedMail } from "./attachments.js";
 import { attachmentKindsJson } from "./attachment-kind.js";
 import type { AgentMailEventSink } from "./agent/mail-state-events.js";
-import type { DatabaseHandle } from "./db.js";
+import { deleteMessagesWithBatchFtsCleanup, type DatabaseHandle } from "./db.js";
 import { deriveEncryptionKey } from "./crypto.js";
 import { friendlyMailError, imapClientForAccount, mailErrorCode, type AccountAccessTokenProvider } from "./mail.js";
 import {
@@ -21,13 +21,15 @@ import {
 import { getAppSettings } from "./settings.js";
 import { getAutoReplyEngine } from "./agent/auto-reply.js";
 import {
-  accountById,
   isAccountMoving,
   isAccountSyncing,
   markAccountSyncing,
   unmarkAccountSyncing,
 } from "./sync-locks.js";
+import { accountById } from "./account-store.js";
 import { applyFilterRulesToNewMessages } from "./sync-filter-rules.js";
+import { limitStoredHtmlBody, limitStoredTextBody } from "./message-body-limits.js";
+import { REMOTE_DELETION_PROBE_BATCH_SIZE, defaultRemoteDeletionProbeState, remoteDeletionProbeCursorKey, type RemoteDeletionProbeState } from "./sync-deletion-probe.js";
 
 /**
  * How many newly fetched messages are written (and their bodies downloaded)
@@ -50,10 +52,8 @@ class SyncAbortedError extends Error {
 }
 
 // Probe old cached UIDs in small, rotating batches. This only verifies remote
-// absence after a folder has stayed in the same UIDVALIDITY epoch.
-const remoteDeletionProbeBatchSize = 64;
-const remoteDeletionProbeCursorLimit = 1_024;
-const remoteDeletionProbeCursors = new Map<string, number>();
+// absence after a folder has stayed in the same UIDVALIDITY epoch. The rotating
+// cursor itself lives in sync-deletion-probe.ts.
 
 export type NewInboxMessage = {
   id: string;
@@ -183,20 +183,6 @@ function messageKey(accountId: string, mailbox: string, uid: number): string {
   return createHash("sha256").update(`${accountId}\0${mailbox}\0${uid}`).digest("hex").slice(0, 32);
 }
 
-function remoteDeletionProbeCursorKey(accountId: string, mailbox: string, uidValidity: string): string {
-  return `${accountId}\0${mailbox}\0${uidValidity}`;
-}
-
-function advanceRemoteDeletionProbeCursor(key: string, uid: number): void {
-  remoteDeletionProbeCursors.delete(key);
-  remoteDeletionProbeCursors.set(key, uid);
-  while (remoteDeletionProbeCursors.size > remoteDeletionProbeCursorLimit) {
-    const oldestKey = remoteDeletionProbeCursors.keys().next().value;
-    if (typeof oldestKey !== "string") return;
-    remoteDeletionProbeCursors.delete(oldestKey);
-  }
-}
-
 const remoteIdLookupKeyPurpose = "message-remote-id-lookup-v1";
 
 // The HKDF derivation dominates remoteIdLookup's cost and its output depends
@@ -268,6 +254,7 @@ export async function syncAccount(
   agentEvents?: AgentMailEventSink,
   signal?: AbortSignal,
   onProgress?: (progress: SyncProgress) => void,
+  deletionProbeState?: RemoteDeletionProbeState,
 ): Promise<{ synced: number; folders: number; failedFolders: number; limitReached: boolean; newInboxMessages: NewInboxMessage[] }> {
   if (isAccountSyncing(accountId) || isAccountMoving(accountId)) {
     return { synced: 0, folders: 0, failedFolders: 0, limitReached: false, newInboxMessages: [] };
@@ -284,6 +271,9 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
   // Gmail category labels are fetched for every folder only while this
   // account is actively participating in the auto-reply feature.
   const autoReplyActive = autoReplyActiveForAccount(db, accountId);
+  // A caller that injects nothing keeps the rotation shared across passes; one
+  // that owns a state gets an isolated sweep (see sync-deletion-probe.ts).
+  const deletionProbe = deletionProbeState ?? defaultRemoteDeletionProbeState();
 
   try {
     client = await imapClientForAccount(account, masterKey, accessTokenProvider);
@@ -377,7 +367,17 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
           accountId,
           ...activeFolderPaths,
         ) as RemovedMessage[];
-        deleteMessagesInRemovedFolders.run(accountId, ...activeFolderPaths);
+        // The removed-folder scope matches the DELETE statement below exactly:
+        // the per-row FTS trigger is pre-cleared in one batch and suspended for
+        // the bulk delete instead of full-scanning the index once per row.
+        deleteMessagesWithBatchFtsCleanup(
+          db,
+          `account_id = ?${inactiveFolderClause} AND COALESCE(pending_move_destination, '') = ''`,
+          [accountId, ...activeFolderPaths],
+          () => {
+            deleteMessagesInRemovedFolders.run(accountId, ...activeFolderPaths);
+          },
+        );
         if (agentEvents && agentLease) {
           for (const removed of removedMessages) {
             agentEvents.messageDeletedWithinTransaction(agentLease, removed.id, {
@@ -543,22 +543,22 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
     `);
     const reconcileRemoteDeletionBatch = async (folder: ListResponse, uidValidity: string): Promise<void> => {
       const cursorKey = remoteDeletionProbeCursorKey(accountId, folder.path, uidValidity);
-      const cursor = remoteDeletionProbeCursors.get(cursorKey);
+      const cursor = deletionProbe.get(cursorKey);
       let candidates = listRemoteDeletionCandidatesAfterCursor.all(
         accountId,
         folder.path,
         cursor ?? 0,
-        remoteDeletionProbeBatchSize,
+        REMOTE_DELETION_PROBE_BATCH_SIZE,
       ) as RemoteDeletionCandidate[];
       if (!candidates.length && cursor !== undefined) {
         candidates = listRemoteDeletionCandidatesFromStart.all(
           accountId,
           folder.path,
-          remoteDeletionProbeBatchSize,
+          REMOTE_DELETION_PROBE_BATCH_SIZE,
         ) as RemoteDeletionCandidate[];
       }
       if (!candidates.length) {
-        remoteDeletionProbeCursors.delete(cursorKey);
+        deletionProbe.delete(cursorKey);
         return;
       }
 
@@ -569,6 +569,7 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
       // partial iterator or mailbox error therefore cannot turn a timeout into
       // a local deletion decision.
       for await (const message of connectedClient.fetch(candidateUids, { uid: true }, { uid: true })) {
+        if (signal?.aborted) throw new SyncAbortedError();
         if (message.uid && candidateUidSet.has(message.uid)) observedUids.add(message.uid);
       }
 
@@ -592,7 +593,7 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
           });
         }
       })();
-      advanceRemoteDeletionProbeCursor(cursorKey, candidates[candidates.length - 1]!.uid);
+      deletionProbe.advance(cursorKey, candidates[candidates.length - 1]!.uid);
     };
     let synced = 0;
     let failedFolders = 0;
@@ -812,7 +813,17 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
                 flags_json: string;
                 all_mail_archived: number | null;
               }>;
-              deleteFolderMessages.run(accountId, folder.path);
+              // Same folder-reset scope as deleteFolderMessages below: the FTS
+              // mirror is batch-cleared and the per-row trigger suspended for
+              // the bulk delete instead of full-scanning the index once per row.
+              deleteMessagesWithBatchFtsCleanup(
+                db,
+                "account_id = ? AND mailbox = ? AND COALESCE(pending_move_destination, '') = ''",
+                [accountId, folder.path],
+                () => {
+                  deleteFolderMessages.run(accountId, folder.path);
+                },
+              );
               updateFolderUidValidity.run(currentUidValidity, accountId, folder.path);
               if (agentEvents && agentLease) {
                 for (const removed of [...resetRows, ...resetIntentRows]) {
@@ -1004,8 +1015,10 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
           const messageId = messageIdValues(parsed?.messageId ?? message.envelope?.messageId)[0] ?? null;
           const inReplyTo = messageIdValues(parsed?.inReplyTo)[0] ?? null;
           const references = messageIdValues(parsed?.references);
-          const text = parsed?.text ?? "";
-          const html = typeof parsed?.html === "string" ? parsed.html : "";
+          // The body is stored whole and re-decrypted on every read, so an
+          // oversized part is bounded here — with a marker, not a drop.
+          const text = limitStoredTextBody(parsed?.text ?? "");
+          const html = limitStoredHtmlBody(typeof parsed?.html === "string" ? parsed.html : "");
           const sentAtValue = parsed?.date ?? message.envelope?.date ?? message.internalDate ?? new Date();
           const sentAt = sentAtValue instanceof Date ? sentAtValue : new Date(sentAtValue);
           const id = hydratedMessageIds.get(message.uid) ?? messageKey(accountId, folder.path, message.uid);

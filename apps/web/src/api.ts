@@ -1,5 +1,16 @@
 import { agentUiStreamEventSchema } from "@nami/agent-contracts";
+import {
+  ApiError,
+  apiError,
+  binaryTimeoutMsFor,
+  binaryTransfer,
+  boundedRequest,
+  requestResponse,
+  LOCAL_SERVICE_TIMEOUT_MESSAGE,
+  type BinaryRequestOptions,
+} from "./apiTransport";
 import { recordApiTiming } from "./perfTelemetry";
+import { autoReplyConfigFromWire } from "./types";
 import type {
   AgentBootstrap,
   AgentConversation,
@@ -17,9 +28,13 @@ import type {
   AutoReplyPendingSummary,
   ExternalPairingSummary,
 } from "./agentTypes";
-import type { Account, AccountDiscoveryResult, AppSettings, AppSettingsPatch, AutoReplyDecisionRecord, CalendarEvent, CalendarEventInput, CalendarEventUpdate, Contact, ContactInput, ContactUpdate, FilterRule, FilterRuleInput, FilterRuleUpdate, MailTemplate, MailTemplateInput, MailTemplateUpdate, ManualAccountConfig, Message, OAuthAttempt, OAuthAttemptStatus, OAuthProvider, OutboundAttachment, OutboundSubmission, ProviderInfo, Stats } from "./types";
+import type { Account, AccountDiscoveryResult, AppSettings, AppSettingsPatch, AutoReplyDecisionRecord, CalendarEvent, CalendarEventInput, CalendarEventUpdate, Contact, ContactInput, ContactUpdate, FilterRule, FilterRuleInput, FilterRuleUpdate, MailTemplate, MailTemplateInput, MailTemplateUpdate, ManualAccountConfig, Message, MessageDetail, OAuthAttempt, OAuthAttemptStatus, OAuthProvider, OutboundAttachment, OutboundSubmission, ProviderInfo, Stats } from "./types";
 
-export type MessagePage = { items: Message[]; total: number; page: number; pageSize: number };
+// One page of the message list. `nextCursor` is the server's own "there is more"
+// signal and the only one a client may act on: `total` grows with every arriving
+// message, so a list that compared it against the rows loaded would either never
+// stop or stop early. Echo the cursor back as received; never build one.
+export type MessagePage = { items: Message[]; total: number; pageSize: number; nextCursor: string | null };
 export type AccountAddResult = {
   ok: boolean;
   account: Account;
@@ -56,6 +71,15 @@ export type MoveMessageResult = {
   locationUnverified?: boolean;
 };
 
+/**
+ * Result of `PATCH /api/messages/batch/flags` and `POST /api/messages/batch/move`.
+ *
+ * Counts and failure detail only — the exact key set both routes return, never
+ * widened. No per-id echo (a former `changedIds`): a 5000-id selection cost the
+ * flag response ~200 KB of ids nothing in the renderer reads, so the payload is
+ * flat in the selection size. `BatchJobSnapshot` below splits the same way:
+ * progress on the wire, undo scope in the server's memory.
+ */
 export type BatchMessageOperationResult = {
   ok: boolean;
   updated: number;
@@ -87,6 +111,16 @@ export type BatchJobCreatePayload =
   | { kind: "flags"; patch: { seen?: boolean; flagged?: boolean }; query: BatchJobQuery }
   | { kind: "move"; target: MoveTarget; query: BatchJobQuery };
 
+/**
+ * Progress view of a batch job — the exact shape of `GET /api/batch-jobs/:id`.
+ *
+ * Progress numbers only. The server deliberately keeps a job's changed-message
+ * ids out of this response: a 30 000-id selection made every poll carry 1.3 MB,
+ * and the poll loop runs every 600ms for up to 10 minutes. `batchJobUndo` needs
+ * no id list either — the server undoes from its own record of what changed.
+ * `undoWindowMs` stays optional because `start` fabricates a local "just
+ * started" snapshot before the first poll lands.
+ */
 export type BatchJobSnapshot = {
   id: string;
   kind: "flags" | "move" | "undo";
@@ -150,27 +184,15 @@ export type TranslationConfigurationPatch = {
   clearEndpoint?: boolean;
 };
 
-export class ApiError extends Error {
-  readonly llmAvailable?: boolean;
-  constructor(message: string, readonly code?: string, readonly status?: number, llmAvailable?: boolean) {
-    super(message);
-    this.name = "ApiError";
-    if (llmAvailable) this.llmAvailable = llmAvailable;
-  }
-}
-
-type ErrorResponse = {
-  message?: string;
-  code?: string;
-  llmAvailable?: boolean;
-};
+export { ApiError, type BinaryRequestOptions } from "./apiTransport";
 
 /** Longest a JSON request may wait for the local service before it is treated
  * as a failure. A wedged local service (e.g. a hung account write slot behind
  * the operation queue) must not leave the renderer's optimistic state —
  * seen/move ids and the list poll — pending forever: rejecting here lets the
  * callers' `.finally()` clear those ids so a later poll can write back the
- * server's true state. */
+ * server's true state. Binary endpoints are excluded on purpose and carry the
+ * payload-aware budget in apiTransport instead. */
 const REQUEST_TIMEOUT_MS = 30_000;
 
 /** Extracts the RFC 5987 UTF-8 filename from a Content-Disposition header. */
@@ -188,88 +210,44 @@ function emlFilenameFromDisposition(disposition: string | null): string {
   }
 }
 
-async function requestResponse(path: string, init?: RequestInit): Promise<Response> {
-  const headers = new Headers(init?.headers);
-  if (init?.body && !headers.has("content-type")) headers.set("content-type", "application/json");
-  // The desktop main process injects the local API token at the Electron
-  // session level (webRequest) for /api/* requests, so the renderer never
-  // reads or sends the token itself. Browser development has no token.
-  try {
-    return await fetch(path, {
-      ...init,
-      headers,
-      cache: "no-store",
-    });
-  } catch (error) {
-    // Re-throw AbortError so callers can distinguish intentional cancellation
-    // (user stopped, switched conversation, or component unmounted) from a real
-    // local-service failure. The browser console may still log net::ERR_ABORTED
-    // for aborted requests — that is expected and not actionable.
-    if (error instanceof DOMException && error.name === "AbortError") throw error;
-    // The API is always local to Nami Mail. A renderer fetch failure is not a mailbox credential failure.
-    throw new ApiError("The Nami Mail local service could not be reached.", "local_service_unavailable");
-  }
-}
-
-async function apiError(response: Response): Promise<ApiError> {
-  const body = (await response.json().catch(() => ({}))) as ErrorResponse;
-  return new ApiError(body.message || "The request failed. Please try again later.", body.code, response.status, body.llmAvailable);
-}
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // Only the JSON path is bounded here; streaming requests (agent messages,
   // translation) manage their own lifetime via an explicit signal and must not
-  // be cut at a fixed 30s. A caller-supplied signal is forwarded so an
-  // intentional abort still propagates as an AbortError, while a timeout
-  // surfaces as a distinct local_service_timeout failure (not
+  // be cut at a fixed 30s, and binary endpoints move files under the
+  // payload-aware budget in apiTransport. A caller-supplied signal is
+  // forwarded so an intentional abort still propagates as an AbortError, while
+  // a timeout surfaces as a distinct local_service_timeout failure (not
   // local_service_unavailable, so callers can tell "no response" from
   // "unreachable").
-  const controller = new AbortController();
-  const timer = setTimeout(() => {
-    controller.abort(new DOMException("The Nami Mail local service did not respond in time.", "TimeoutError"));
-  }, REQUEST_TIMEOUT_MS);
-  timer.unref?.();
-  const callerSignal = init?.signal ?? null;
-  const forwardAbort = () => controller.abort(callerSignal?.reason);
-  if (callerSignal?.aborted) {
-    // The caller already cancelled before the fetch started: honour it as an
-    // AbortError instead of silently proceeding on our own signal.
-    controller.abort(callerSignal.reason);
-  } else {
-    callerSignal?.addEventListener("abort", forwardAbort, { once: true });
-  }
+  const bounded = boundedRequest(REQUEST_TIMEOUT_MS, init?.signal);
   // Perf telemetry: the wall time covers the round trip plus body parsing, so
   // a slow read of a big page shows up next to a slow endpoint. Aborts are
   // intentionally not recorded (intentional cancellation is not jank data).
   const startedAt = performance.now();
   try {
-    const response = await requestResponse(path, { ...init, signal: controller.signal });
+    const response = await requestResponse(path, { ...init, signal: bounded.signal });
     if (!response.ok) throw await apiError(response);
     const parsed = (await response.json().catch(() => ({}))) as T;
     recordApiTiming(path, performance.now() - startedAt, { status: response.status });
     return parsed;
   } catch (error) {
-    // The timer above aborts with a TimeoutError reason, but requestResponse
-    // wraps non-abort rejections as local_service_unavailable before this
-    // catch runs — so read the signal's own reason, which survives the
-    // wrapping. A caller-driven abort keeps its original reason and falls
-    // through to requestResponse's classification untouched.
-    const reason = controller.signal.reason;
+    // The budget above aborts with a TimeoutError reason, but requestResponse
+    // wraps non-abort rejections as local_service_unavailable before this catch
+    // runs — so ask the bound whether IT was the one that fired, rather than
+    // sniffing the reason. A caller-driven abort keeps its original reason and
+    // falls through to requestResponse's classification untouched.
     const isAbort = error instanceof DOMException && error.name === "AbortError";
     // Timeouts and service outages stall every refresh path, so they are jank
     // signals too; deliberate caller cancellations are not.
     if (!isAbort) {
       recordApiTiming(path, performance.now() - startedAt, {
-        error: reason instanceof DOMException && reason.name === "TimeoutError" ? "timeout" : (error instanceof Error ? error.name : "unknown"),
+        error: bounded.timedOut() ? "timeout" : (error instanceof Error ? error.name : "unknown"),
       });
     }
-    if (reason instanceof DOMException && reason.name === "TimeoutError") {
-      throw new ApiError("The Nami Mail local service did not respond in time.", "local_service_timeout");
-    }
+    if (bounded.timedOut()) throw new ApiError(LOCAL_SERVICE_TIMEOUT_MESSAGE, "local_service_timeout");
     throw error;
   } finally {
-    clearTimeout(timer);
-    callerSignal?.removeEventListener("abort", forwardAbort);
+    bounded.dispose();
   }
 }
 
@@ -388,16 +366,24 @@ async function readSseTranslation(
   return result;
 }
 
+// Normalizes one settings response into the web model via the single
+// auto-reply wire→web seam (see autoReplyConfigFromWire in ./types).
+function autoReplyConfigFromSettings(settings: AppSettings): AppSettings {
+  return { ...settings, autoReply: autoReplyConfigFromWire(settings.autoReply) };
+}
+
 export const api = {
   accounts: () => request<Account[]>("/api/accounts"),
   providers: () => request<ProviderInfo[]>("/api/providers"),
   stats: () => request<Stats>("/api/stats"),
-  settings: () => request<AppSettings>("/api/settings"),
-  updateSettings: (patch: AppSettingsPatch) => request<AppSettings>("/api/settings", {
+  // Every settings response runs through the single auto-reply wire→web seam
+  // (see autoReplyConfigFromWire) so scope dates are always present.
+  settings: async () => autoReplyConfigFromSettings(await request<AppSettings>("/api/settings")),
+  updateSettings: async (patch: AppSettingsPatch) => autoReplyConfigFromSettings(await request<AppSettings>("/api/settings", {
     method: "PATCH",
     body: JSON.stringify(patch),
-  }),
-  uploadBackground: (file: File, contentType = file.type) => request<AppSettings>("/api/settings/background", {
+  })),
+  uploadBackground: async (file: File, contentType = file.type) => autoReplyConfigFromSettings(await request<AppSettings>("/api/settings/background", {
     method: "POST",
     body: file,
     headers: {
@@ -405,8 +391,8 @@ export const api = {
       "x-nami-file-name": encodeURIComponent(file.name),
       "x-nami-file-content-type": encodeURIComponent(contentType),
     },
-  }),
-  removeBackground: () => request<AppSettings>("/api/settings/background", { method: "DELETE" }),
+  })),
+  removeBackground: async () => autoReplyConfigFromSettings(await request<AppSettings>("/api/settings/background", { method: "DELETE" })),
   agentMemory: (params: { kind?: string; accountId?: string; query?: string; limit?: number }) => {
     const search = new URLSearchParams();
     if (params.kind) search.set("kind", params.kind);
@@ -441,10 +427,11 @@ export const api = {
     return request<{ items: AutoReplyDecisionRecord[] }>(`/api/agent/auto-reply/decisions${query ? `?${query}` : ""}`);
   },
   autoReplyDecisionDelete: (id: string) => request<{ ok: true }>(`/api/agent/auto-reply/decisions/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  messages: (query = "") =>
-    request<MessagePage>(`/api/messages${query ? `?${query}` : ""}`),
-  message: (id: string) => request<Message>(`/api/messages/${encodeURIComponent(id)}`),
-  messageThread: (id: string) => request<{ items: Message[] }>(`/api/messages/${encodeURIComponent(id)}/thread`),
+  // List rows carry no body (a bounded text preview, no HTML part); the
+  // reader, quoting, translation and drafts ask for the message itself.
+  messages: (query = "") => request<MessagePage>(`/api/messages${query ? `?${query}` : ""}`),
+  message: (id: string) => request<MessageDetail>(`/api/messages/${encodeURIComponent(id)}`),
+  messageThread: (id: string) => request<{ items: MessageDetail[] }>(`/api/messages/${encodeURIComponent(id)}/thread`),
   translationStatus: () => request<TranslationServiceStatus>("/api/translation/status"),
   translationConfiguration: () => request<TranslationConfiguration>("/api/translation/configuration"),
   updateTranslationConfiguration: (patch: TranslationConfigurationPatch) =>
@@ -536,30 +523,53 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
-  uploadOutboundAttachment: async (accountId: string, file: File): Promise<OutboundAttachment> => {
-    const body = await request<{ attachment?: OutboundAttachment }>(`/api/outbound-attachments?accountId=${encodeURIComponent(accountId)}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/octet-stream",
-        "x-nami-file-name": encodeURIComponent(file.name),
-        "x-nami-file-content-type": encodeURIComponent(file.type || "application/octet-stream"),
+  // Binary endpoints run on the payload-aware binary budget, not the 30s JSON
+  // timer: a 10 MB attachment on a slow link legitimately outlasts 30s, and the
+  // JSON timer reported that as a local_service_timeout with the bytes already
+  // delivered. They still take an optional signal so a caller that owns a real
+  // cancel affordance (the preview drawer) can stop one.
+  uploadOutboundAttachment: async (accountId: string, file: File, options?: BinaryRequestOptions): Promise<OutboundAttachment> => {
+    const body = await binaryTransfer<{ attachment?: OutboundAttachment }>(
+      `/api/outbound-attachments?accountId=${encodeURIComponent(accountId)}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-nami-file-name": encodeURIComponent(file.name),
+          "x-nami-file-content-type": encodeURIComponent(file.type || "application/octet-stream"),
+        },
+        body: file,
       },
-      body: file,
-    });
+      async (response) => {
+        if (!response.ok) throw await apiError(response);
+        return response.json() as Promise<{ attachment?: OutboundAttachment }>;
+      },
+      { ...options, timeoutMs: options?.timeoutMs ?? binaryTimeoutMsFor(file.size) },
+    );
     if (!body.attachment) throw new ApiError("Attachment upload failed. Please add it again.", "attachment_upload_failed");
     return body.attachment;
   },
-  downloadAttachment: async (messageId: string, partId: string): Promise<Blob> => {
-    const response = await requestResponse(`/api/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(partId)}`);
-    if (!response.ok) throw await apiError(response);
-    return response.blob();
-  },
-  downloadMessageEml: async (messageId: string): Promise<{ blob: Blob; filename: string }> => {
-    const response = await requestResponse(`/api/messages/${encodeURIComponent(messageId)}/eml`);
-    if (!response.ok) throw await apiError(response);
-    const filename = emlFilenameFromDisposition(response.headers.get("content-disposition"));
-    return { blob: await response.blob(), filename };
-  },
+  downloadAttachment: async (messageId: string, partId: string, options?: BinaryRequestOptions): Promise<Blob> =>
+    binaryTransfer(
+      `/api/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(partId)}`,
+      undefined,
+      async (response) => {
+        if (!response.ok) throw await apiError(response);
+        return response.blob();
+      },
+      options,
+    ),
+  downloadMessageEml: async (messageId: string, options?: BinaryRequestOptions): Promise<{ blob: Blob; filename: string }> =>
+    binaryTransfer(
+      `/api/messages/${encodeURIComponent(messageId)}/eml`,
+      undefined,
+      async (response) => {
+        if (!response.ok) throw await apiError(response);
+        const filename = emlFilenameFromDisposition(response.headers.get("content-disposition"));
+        return { blob: await response.blob(), filename };
+      },
+      options,
+    ),
   discardOutboundAttachments: (accountId: string, attachmentTokens: string[]) =>
     request<{ ok: boolean; removed: number }>("/api/outbound-attachments", {
       method: "DELETE",

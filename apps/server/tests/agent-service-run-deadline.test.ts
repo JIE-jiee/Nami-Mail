@@ -4,7 +4,6 @@ import { AgentService } from "../src/agent-service.js";
 import { AccountLifecycleStore } from "../src/agent/lifecycle.js";
 import { applyAgentStoreSchema } from "../src/agent/schema.js";
 import { AgentSourceEventOutbox } from "../src/agent/source-events.js";
-import { OpenAiCompatibleProvider } from "../src/agent/openai-compatible-provider.js";
 import { openDatabase, type DatabaseHandle } from "../src/db.js";
 
 const timestamp = "2026-08-19T12:00:00.000Z";
@@ -57,7 +56,7 @@ function internalRuntime(service: AgentService) {
       search: (...arguments_: unknown[]) => Promise<unknown[]>;
     };
     runtime: {
-      streamChat: (input: { signal?: AbortSignal; chat?: { messages: unknown[] } }) => AsyncIterable<unknown>;
+      streamChat: (input: { requestId: string; signal?: AbortSignal; chat?: { messages: unknown[] } }) => AsyncIterable<unknown>;
     };
   };
 }
@@ -127,14 +126,23 @@ describe("AgentService run watchdog", () => {
     const internals = internalRuntime(service);
     vi.spyOn(internals.rag, "drainOnce").mockResolvedValue(undefined);
     vi.spyOn(internals.rag, "search").mockResolvedValue([]);
-    const streamChat = vi.spyOn(internals.runtime, "streamChat").mockImplementation(async function* () {
+    // The first turn's best-effort tail (title generation) shares the seam, so
+    // it is counted apart: the deadline under test governs the turn's own call.
+    let turnCalls = 0;
+    vi.spyOn(internals.runtime, "streamChat").mockImplementation(async function* (input: { requestId: string }) {
+      if (input.requestId.startsWith("title-")) {
+        yield { type: "text_delta", delta: "Fast reply." };
+        yield { type: "completed", reason: "stop" };
+        return;
+      }
+      turnCalls += 1;
       yield { type: "text_delta", delta: "Fast reply." };
       yield { type: "completed", reason: "stop" };
     });
 
     const events = await drain(service, conversation, provider.id);
 
-    expect(streamChat).toHaveBeenCalledTimes(1);
+    expect(turnCalls).toBe(1);
     expect(events).not.toContainEqual(expect.objectContaining({ type: "error" }));
     expect(events).toContainEqual({ type: "text_delta", delta: "Fast reply." });
     expect(events).toContainEqual({ type: "completed", reason: "stop" });
@@ -170,15 +178,19 @@ describe("AgentService run watchdog", () => {
     const internals = internalRuntime(service);
     vi.spyOn(internals.rag, "drainOnce").mockResolvedValue(undefined);
     vi.spyOn(internals.rag, "search").mockResolvedValue([]);
-    vi.spyOn(internals.runtime, "streamChat").mockImplementation(async function* () {
-      yield { type: "text_delta", delta: "Partial reply." };
-      yield { type: "completed", reason: "stop" };
-    });
-    // The first-turn title generation rides a separate provider call. Gate it:
-    // on a slow provider it can outrun the provider request timeout, and while
-    // it hangs the conversation must already accept new sends.
+    // The first-turn title generation rides a separate call on the same seam as
+    // the turn itself, told apart by its request id. Gate it: on a slow
+    // provider it can outrun the provider request timeout, and while it hangs
+    // the conversation must already accept new sends.
     const { gate, release } = gatedStream();
-    const titleStream = vi.spyOn(OpenAiCompatibleProvider.prototype, "streamChat").mockImplementation(async function* () {
+    let titleCalls = 0;
+    const streamChat = vi.spyOn(internals.runtime, "streamChat").mockImplementation(async function* (input: { requestId: string }) {
+      if (!input.requestId.startsWith("title-")) {
+        yield { type: "text_delta", delta: "Partial reply." };
+        yield { type: "completed", reason: "stop" };
+        return;
+      }
+      titleCalls += 1;
       await gate;
       yield { type: "text_delta", delta: "Conversation title" };
       yield { type: "completed", reason: "stop" };
@@ -187,7 +199,7 @@ describe("AgentService run watchdog", () => {
     const runPromise = drain(service, conversation, provider.id);
     // The terminal events were consumed and the run persists its turn; the
     // title generation (call 2) is now hanging on the gate.
-    await vi.waitFor(() => expect(titleStream).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(titleCalls).toBe(1));
 
     // A resend issued while the title generation is still hanging must NOT be
     // refused with CONFLICT: the slot was released right after the turn was
@@ -205,8 +217,8 @@ describe("AgentService run watchdog", () => {
 
     release();
     await runPromise;
-    expect(titleStream).toHaveBeenCalledTimes(1);
-    titleStream.mockRestore();
+    expect(titleCalls).toBe(1);
+    expect(streamChat).toHaveBeenCalled();
     await service.close();
   });
 });

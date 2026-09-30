@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { autoReplyDecisionReasons, type AutoReplyDecisionReason } from "@nami/agent-contracts";
 import type { DatabaseHandle } from "../db.js";
 import { assertAgentStoreReadable } from "./schema.js";
 import {
@@ -18,20 +19,11 @@ import {
 const DECISION_RECORD_TYPE = "auto-reply-decision";
 const DECISION_MAX_RECORDS = 2_000;
 
-export const autoReplyDecisionReasons = [
-  "screening",
-  "scope",
-  "low-value",
-  "sensitive",
-  "user-rejected",
-  "daily-cap",
-  "llm-failed",
-  "send-failed",
-  "no-template",
-  "expired",
-] as const;
-
-export type AutoReplyDecisionReason = (typeof autoReplyDecisionReasons)[number];
+// The decline-reason vocabulary is single-sourced in @nami/agent-contracts
+// (also mirrored by the auto_reply_decisions CHECK constraint); these
+// re-exports keep the historical local names for the rest of the server.
+export { autoReplyDecisionReasons };
+export type { AutoReplyDecisionReason };
 
 export type AutoReplyDecisionRecord = {
   id: string;

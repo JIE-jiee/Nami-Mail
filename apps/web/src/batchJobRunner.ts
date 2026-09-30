@@ -65,6 +65,10 @@ export function createBatchJobRunner(deps: BatchJobRunnerDeps) {
           return;
         }
         onSnapshot(null);
+        // Undo is jobId-only: the server holds the changed ids of the job it
+        // recorded, so the toast action must not grow a dependency on the
+        // progress payload (which is progress numbers only — see
+        // BatchJobSnapshot).
         const undoAction: BatchJobToastAction = {
           label: t("mail.selection.undo"),
           run: () => {

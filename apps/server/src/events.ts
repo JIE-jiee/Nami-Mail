@@ -43,7 +43,7 @@ export type ServerEvent =
   | { type: "settings.changed"; payload: SettingsChangedEvent }
   | { type: "sync.progress"; payload: SyncProgressEvent };
 
-export type ServerEventListener = (event: ServerEvent) => void;
+export type ServerEventListener = (event: ServerEvent, serialized: string | null) => void;
 
 /**
  * A tiny synchronous fan-out. Producers (sync runtime) emit; the SSE route
@@ -65,10 +65,29 @@ export class ServerEventBus {
     };
   }
 
+  /**
+   * The bus hands every listener the *same* event object within one emit — it
+   * never copies — so the wire bytes a subscriber derives from an event are
+   * identical for all of them. Serializing here, once per emit, rather than in
+   * each subscriber turns "N renderers x one JSON.stringify of the whole
+   * mail.received frame" into a single stringify plus N cheap string writes.
+   *
+   * `JSON.stringify` can throw (cycles, BigInt). That is a producer bug, and
+   * the safe response is to skip the frame for everyone rather than let one
+   * subscriber's failure — or an exception out of the emit call itself — stop
+   * delivery for the rest.
+   */
   emit(event: ServerEvent): void {
+    if (this.listeners.size === 0) return;
+    let serialized: string | null;
+    try {
+      serialized = JSON.stringify(event);
+    } catch {
+      serialized = null;
+    }
     for (const listener of [...this.listeners]) {
       try {
-        listener(event);
+        listener(event, serialized);
       } catch {
         // Delivery to one client must not interrupt the others.
       }

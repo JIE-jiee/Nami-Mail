@@ -135,6 +135,72 @@ describe("createBatchJobRunner", () => {
     }
   });
 
+  it("keeps undo working from a progress-only snapshot (no changed ids on the wire)", async () => {
+    vi.useFakeTimers();
+    try {
+      const showToast = vi.fn();
+      const deps = makeDeps({ showToast });
+      const runner = createBatchJobRunner(deps);
+      apiMocks.batchJobCreate.mockResolvedValue({ jobId: "j7" });
+      apiMocks.batchJobUndo.mockResolvedValue(undefined);
+      // Exactly the server's progress contract. `changedIds` is a landmine
+      // here: reading it means someone reintroduced the job's undo scope into
+      // the payload the 600ms poll loop re-reads for minutes.
+      const settled = { ...job({ id: "j7", status: "completed", total: 4, done: 4, updated: 4 }), undoWindowMs: 300_000 } as Record<string, unknown>;
+      Object.defineProperty(settled, "changedIds", {
+        enumerable: true,
+        get() {
+          throw new Error("the progress snapshot must not carry changedIds");
+        },
+      });
+      apiMocks.batchJobStatus.mockResolvedValue({ job: settled });
+
+      runner.start(MOVE_PAYLOAD, RUN_OPTS);
+      await vi.advanceTimersByTimeAsync(600);
+
+      const successCall = showToast.mock.calls.find(([, kind]) => kind === "success");
+      expect(successCall?.[2]).toEqual(expect.objectContaining({ label: "mail.selection.undo" }));
+      successCall?.[2]?.run();
+      await flush();
+
+      // Undo is addressed by job id alone — the server already recorded what
+      // the job changed — so it costs no extra round trip and reads no scope.
+      expect(apiMocks.batchJobUndo).toHaveBeenCalledWith("j7");
+      expect(apiMocks.batchJobStatus).toHaveBeenCalledTimes(1);
+      expect(deps.reload).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still undoes a partially failed job from the id alone", async () => {
+    vi.useFakeTimers();
+    try {
+      const showToast = vi.fn();
+      const deps = makeDeps({ showToast });
+      const runner = createBatchJobRunner(deps);
+      apiMocks.batchJobCreate.mockResolvedValue({ jobId: "j8" });
+      apiMocks.batchJobUndo.mockResolvedValue(undefined);
+      apiMocks.batchJobStatus.mockResolvedValue({ job: job({ id: "j8", status: "completed", total: 5, done: 5, updated: 3, failed: 2 }) });
+
+      runner.start(MOVE_PAYLOAD, { ...RUN_OPTS, exitOnSuccess: false });
+      await vi.advanceTimersByTimeAsync(600);
+
+      const partialCall = showToast.mock.calls.find(([, kind]) => kind === "error");
+      expect(partialCall?.[2]).toEqual(expect.objectContaining({ label: "mail.selection.undo" }));
+      partialCall?.[2]?.run();
+      await flush();
+
+      // A job that updated some and failed some is still undoable in full: the
+      // toast action is the same jobId-only call a clean success makes.
+      expect(apiMocks.batchJobUndo).toHaveBeenCalledWith("j8");
+      expect(deps.showToast).toHaveBeenCalledWith("mail.selection.undoStarted", "info");
+      expect(deps.reload).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("surfaces the server-side failure reason and reloads", async () => {
     vi.useFakeTimers();
     try {

@@ -180,7 +180,10 @@ vi.mock("./api", () => ({
       const params = new URLSearchParams(query);
       const term = (params.get("q") ?? "").toLowerCase();
       const items = term ? h.mentionMail.filter((m) => m.subject.toLowerCase().includes(term)) : h.mentionMail;
-      return { items, total: items.length, page: Number(params.get("page") ?? "1"), pageSize: Number(params.get("pageSize") ?? "10") };
+      // The list is cursor-paged: a request carrying a cursor resumes below the
+      // position it names, and every fixture here is one page, so the answer is
+      // always "this was the last page".
+      return { items, total: items.length, pageSize: Number(params.get("pageSize") ?? "10"), nextCursor: null };
     }),
   },
 }));

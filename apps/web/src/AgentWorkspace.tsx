@@ -161,6 +161,13 @@ export default function AgentWorkspace({ accounts, currentMessage, onClose, onOp
   const mentionTermRef = useRef<string | null>(null);
   const mentionLoadingRef = useRef(false);
   const mentionPageRef = useRef(1);
+  /**
+   * Where the mention list resumes, echoed from the page before it. null means
+   * the server served the last page, which is the only "no more" signal worth
+   * having: the mailbox grows while the menu is open, so a page count or a
+   * total would keep inviting fetches that repeat rows the menu already shows.
+   */
+  const mentionCursorRef = useRef<string | null>(null);
   /** Memory summaries the agent suggested saving; each needs a save or dismiss. */
   const [pendingMemorySuggestions, setPendingMemorySuggestions] = useState<string[]>([]);
   const [mode, setMode] = useState<AgentMode>("agent");
@@ -1525,6 +1532,7 @@ export default function AgentWorkspace({ accounts, currentMessage, onClose, onOp
           setMentionItems(page.items.map(mentionItemFor));
           setMentionIndex(0);
           mentionPageRef.current = 1;
+          mentionCursorRef.current = page.nextCursor;
         } catch {
           if (!cancelled) setMentionItems([]);
         } finally {
@@ -1546,18 +1554,22 @@ export default function AgentWorkspace({ accounts, currentMessage, onClose, onOp
       setMentionLoading(false);
       setMentionIndex(0);
       mentionPageRef.current = 1;
+      mentionCursorRef.current = null;
     }
   }, [mentionOpen]);
   const loadMoreMentions = useCallback(async () => {
-    if (mentionLoadingRef.current || !mentionOpen) return;
+    // The cursor is the gate: a null one is the server saying this was the
+    // last page, so scrolling the menu to its end stops asking.
+    const cursor = mentionCursorRef.current;
+    if (mentionLoadingRef.current || !mentionOpen || cursor === null) return;
     const term = (mentionTermRef.current ?? "").trim();
     const nextPage = mentionPageRef.current + 1;
     mentionLoadingRef.current = true;
     setMentionLoading(true);
     try {
       const query = term
-        ? `q=${encodeURIComponent(term)}&scope=all&pageSize=${MENTION_PAGE_SIZE}&page=${nextPage}`
-        : `pageSize=${MENTION_PAGE_SIZE}&page=${nextPage}`;
+        ? `q=${encodeURIComponent(term)}&scope=all&pageSize=${MENTION_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`
+        : `pageSize=${MENTION_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`;
       const page = await api.messages(query);
       const fresh = page.items.map(mentionItemFor);
       setMentionItems((current) => {
@@ -1565,8 +1577,10 @@ export default function AgentWorkspace({ accounts, currentMessage, onClose, onOp
         return [...current, ...fresh.filter((item) => !seen.has(item.id))];
       });
       mentionPageRef.current = nextPage;
+      mentionCursorRef.current = page.nextCursor;
     } catch {
-      // A failed page keeps the current results; scrolling again retries.
+      // A failed page keeps the current results; scrolling again retries from
+      // the same cursor, so the retry cannot skip the rows it missed.
     } finally {
       mentionLoadingRef.current = false;
       setMentionLoading(false);

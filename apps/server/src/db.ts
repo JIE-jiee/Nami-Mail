@@ -3,6 +3,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { loadDatabaseConstructor } from "./native-sqlite.js";
 import { MESSAGE_FTS_SCHEMA_SQL } from "./message-search.js";
+import { MESSAGE_LIST_ACCOUNT_INDEX_SQL, MESSAGE_LIST_GLOBAL_INDEX_SQL } from "./message-list-indexes.js";
 
 export type DatabaseHandle = Database.Database;
 
@@ -14,6 +15,13 @@ AFTER DELETE ON messages BEGIN
   DELETE FROM messages_fts WHERE message_id = old.id;
 END;
 `;
+
+// The one definition of the two VIRTUAL generated `messages` columns: SQLite
+// recomputes them from the current row on read, so no write point and no
+// startup pass has to keep them in step.
+export const SORT_KEY_SQL = "COALESCE(sent_at, created_at)";
+export const EFFECTIVE_MAILBOX_SQL = "CASE WHEN pending_move_state = 'intent' THEN mailbox ELSE COALESCE(NULLIF(pending_move_destination, ''), mailbox) END";
+const GENERATED_LIST_COLUMNS: Record<string, string> = { sort_key: `sort_key TEXT GENERATED ALWAYS AS (${SORT_KEY_SQL}) VIRTUAL`, effective_mailbox: `effective_mailbox TEXT GENERATED ALWAYS AS (${EFFECTIVE_MAILBOX_SQL}) VIRTUAL` };
 
 const schema = `
 CREATE TABLE IF NOT EXISTS accounts (
@@ -124,6 +132,9 @@ CREATE TABLE IF NOT EXISTS messages (
   -- background pass releases them when due so they return to the Inbox.
   snoozed_until TEXT,
   created_at TEXT NOT NULL,
+  -- Generated, never stored: see GENERATED_LIST_COLUMNS above. Reading them
+  -- as bare, indexable columns is what the list ORDER BY and folder filter need.
+  ${GENERATED_LIST_COLUMNS.sort_key}, ${GENERATED_LIST_COLUMNS.effective_mailbox},
   UNIQUE (account_id, mailbox, uid),
   FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
@@ -407,28 +418,55 @@ ${MESSAGES_FTS_AFTER_DELETE_TRIGGER_SQL}
 `;
 
 /**
- * Deletes an account row and cleanly handles cascading message deletion.
+ * Runs a batch message deletion inside `deleteRows` with the per-row
+ * messages_fts AFTER DELETE trigger temporarily disabled, after clearing the
+ * affected FTS rows in a single batch statement.
  *
  * In SQLite, messages_fts has an AFTER DELETE trigger on messages:
  *   DELETE FROM messages_fts WHERE message_id = old.id;
  * Because message_id is an UNINDEXED column in the FTS5 virtual table, deleting N
- * cascading messages causes SQLite to perform N full table scans of messages_fts (O(N^2)).
- * When an account has thousands of messages, this freezes the Node.js event loop for
- * multiple minutes.
+ * rows through that trigger causes SQLite to perform N full table scans of
+ * messages_fts (O(N^2)). When a batch delete removes thousands of messages, this
+ * freezes the Node.js event loop for multiple minutes.
  *
- * By pre-clearing FTS rows for the account in a single-pass batch query and temporarily
- * dropping the per-row trigger during the cascade, execution time drops from minutes to
- * <100ms, while keeping the search index and relational state completely consistent.
+ * By pre-clearing FTS rows for the id set selected by `messageScopeSql` (a WHERE
+ * fragment over `messages` that must match exactly the rows `deleteRows` is about
+ * to delete) and temporarily dropping the per-row trigger during the batch,
+ * execution time drops from minutes to <100ms, while keeping the search index and
+ * relational state completely consistent.
+ *
+ * better-sqlite3 is synchronous and single-threaded, so no other statement can
+ * observe the trigger-less window; the finally block always recreates the trigger.
+ * Callers running inside a transaction additionally get full rollback safety,
+ * since SQLite DDL is transactional: a failed batch can never leave the trigger
+ * missing or the index half-cleared.
  */
-export function deleteAccountRowWithOptimizedCascade(db: DatabaseHandle, accountId: string): boolean {
-  db.prepare("DELETE FROM messages_fts WHERE message_id IN (SELECT id FROM messages WHERE account_id = ?)").run(accountId);
+export function deleteMessagesWithBatchFtsCleanup<T>(
+  db: DatabaseHandle,
+  messageScopeSql: string,
+  scopeParams: unknown[],
+  deleteRows: () => T,
+): T {
+  db.prepare(`DELETE FROM messages_fts WHERE message_id IN (SELECT id FROM messages WHERE ${messageScopeSql})`).run(...scopeParams);
   db.exec("DROP TRIGGER IF EXISTS messages_fts_after_delete");
   try {
-    const result = db.prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
-    return Boolean(result.changes);
+    return deleteRows();
   } finally {
     db.exec(MESSAGES_FTS_AFTER_DELETE_TRIGGER_SQL);
   }
+}
+
+/**
+ * Deletes an account row and cleanly handles cascading message deletion.
+ * The cascade removes every message of the account, so the batch FTS cleanup
+ * (see {@link deleteMessagesWithBatchFtsCleanup}) runs over that exact id set
+ * instead of paying the per-row trigger's full scans.
+ */
+export function deleteAccountRowWithOptimizedCascade(db: DatabaseHandle, accountId: string): boolean {
+  return deleteMessagesWithBatchFtsCleanup(db, "account_id = ?", [accountId], () => {
+    const result = db.prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
+    return Boolean(result.changes);
+  });
 }
 
 // Schema version understood by this build. Raised whenever migrateDatabase
@@ -514,75 +552,68 @@ function migrateDatabase(db: DatabaseHandle): void {
     db.exec("ALTER TABLE account_credentials ADD COLUMN crypto_version INTEGER NOT NULL DEFAULT 0");
   }
 
-  const messageColumns = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
-  if (!messageColumns.some((column) => column.name === "attachments_json")) {
-    // SQLite only supports additive migrations here. Keeping legacy rows NULL
-    // lets the next sync refresh them once instead of pretending metadata exists.
-    db.exec("ALTER TABLE messages ADD COLUMN attachments_json TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "attachment_kinds_json")) {
-    // Deduplicated attachment-kind set as JSON text, kept in sync with the
-    // stored metadata (see ensureAttachmentKinds). Default '[]' keeps the
-    // column indexable for every row, including drafts and legacy rows.
-    db.exec("ALTER TABLE messages ADD COLUMN attachment_kinds_json TEXT NOT NULL DEFAULT '[]'");
-  }
-  if (!messageColumns.some((column) => column.name === "payload_metadata_ready")) {
-    // Legacy rows keep NULL so the next sync hydrates their missing metadata
-    // exactly once, matching the pre-column decrypt-and-check behavior.
-    db.exec("ALTER TABLE messages ADD COLUMN payload_metadata_ready INTEGER");
-  }
-  if (!messageColumns.some((column) => column.name === "pending_flags_push")) {
-    // Write-behind flags: 1 while a locally-committed flag change still waits
-    // for its background IMAP STORE. The sync path must not overwrite
-    // flags_json from the (stale) remote while the marker is set.
-    db.exec("ALTER TABLE messages ADD COLUMN pending_flags_push INTEGER");
-  }
-  if (!messageColumns.some((column) => column.name === "cc_json")) {
-    // Keep legacy rows NULL so the next normal sync can hydrate their Cc
-    // recipients instead of silently treating the missing field as empty.
-    db.exec("ALTER TABLE messages ADD COLUMN cc_json TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "in_reply_to")) {
-    db.exec("ALTER TABLE messages ADD COLUMN in_reply_to TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "references_json")) {
-    // A NULL value distinguishes legacy rows from a message that genuinely
-    // has no References header, so the normal sync window can hydrate it once.
-    db.exec("ALTER TABLE messages ADD COLUMN references_json TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "encrypted_payload")) {
-    db.exec("ALTER TABLE messages ADD COLUMN encrypted_payload TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "payload_version")) {
-    db.exec("ALTER TABLE messages ADD COLUMN payload_version INTEGER NOT NULL DEFAULT 0");
-  }
-  if (!messageColumns.some((column) => column.name === "remote_id_lookup")) {
-    db.exec("ALTER TABLE messages ADD COLUMN remote_id_lookup TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "all_mail_archived")) {
-    db.exec("ALTER TABLE messages ADD COLUMN all_mail_archived INTEGER");
-  }
-  if (!messageColumns.some((column) => column.name === "pending_move_destination")) {
-    db.exec("ALTER TABLE messages ADD COLUMN pending_move_destination TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "pending_move_state")) {
-    db.exec("ALTER TABLE messages ADD COLUMN pending_move_state TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "pending_move_candidate_uid")) {
-    db.exec("ALTER TABLE messages ADD COLUMN pending_move_candidate_uid INTEGER");
-  }
-  if (!messageColumns.some((column) => column.name === "pending_move_special_use")) {
-    db.exec("ALTER TABLE messages ADD COLUMN pending_move_special_use TEXT");
-  }
-  if (!messageColumns.some((column) => column.name === "snoozed_until")) {
-    db.exec("ALTER TABLE messages ADD COLUMN snoozed_until TEXT");
-  }
+  // A generated column is invisible to PRAGMA table_info, so this reads
+  // table_xinfo: a plain column there is one an unreleased build stored, and its
+  // values cannot be reached without a full table rebuild.
+  const messageColumns = db.prepare("PRAGMA table_xinfo(messages)").all() as Array<{ name: string; hidden: number }>;
+  const addMessageColumn = (name: string, definition: string) => {
+    if (!messageColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE messages ADD COLUMN ${definition}`);
+  };
+  // SQLite only supports additive migrations here. Keeping legacy rows NULL
+  // lets the next sync refresh them once instead of pretending metadata exists.
+  addMessageColumn("attachments_json", "attachments_json TEXT");
+  // Deduplicated attachment-kind set as JSON text, kept in sync with the
+  // stored metadata (see ensureAttachmentKinds). Default '[]' keeps the
+  // column indexable for every row, including drafts and legacy rows.
+  addMessageColumn("attachment_kinds_json", "attachment_kinds_json TEXT NOT NULL DEFAULT '[]'");
+  // Legacy rows keep NULL so the next sync hydrates their missing metadata
+  // exactly once, matching the pre-column decrypt-and-check behavior.
+  addMessageColumn("payload_metadata_ready", "payload_metadata_ready INTEGER");
+  // Write-behind flags: 1 while a locally-committed flag change still waits
+  // for its background IMAP STORE. The sync path must not overwrite
+  // flags_json from the (stale) remote while the marker is set.
+  addMessageColumn("pending_flags_push", "pending_flags_push INTEGER");
+  // Keep legacy rows NULL so the next normal sync can hydrate their Cc
+  // recipients instead of silently treating the missing field as empty.
+  addMessageColumn("cc_json", "cc_json TEXT");
+  addMessageColumn("in_reply_to", "in_reply_to TEXT");
+  // A NULL value distinguishes legacy rows from a message that genuinely
+  // has no References header, so the normal sync window can hydrate it once.
+  addMessageColumn("references_json", "references_json TEXT");
+  addMessageColumn("encrypted_payload", "encrypted_payload TEXT");
+  addMessageColumn("payload_version", "payload_version INTEGER NOT NULL DEFAULT 0");
+  addMessageColumn("remote_id_lookup", "remote_id_lookup TEXT");
+  addMessageColumn("all_mail_archived", "all_mail_archived INTEGER");
+  addMessageColumn("pending_move_destination", "pending_move_destination TEXT");
+  addMessageColumn("pending_move_state", "pending_move_state TEXT");
+  addMessageColumn("pending_move_candidate_uid", "pending_move_candidate_uid INTEGER");
+  addMessageColumn("pending_move_special_use", "pending_move_special_use TEXT");
+  addMessageColumn("snoozed_until", "snoozed_until TEXT");
+  const storedListColumn = Object.keys(GENERATED_LIST_COLUMNS)
+    .find((name) => messageColumns.some((column) => column.name === name && column.hidden !== 2));
+  if (storedListColumn) throw new Error(`Nami Mail cannot open this database: messages.${storedListColumn} is a stored column left by an unreleased build. Delete the database file to let this build recreate it.`);
+  // Last of the message columns, and not only for tidiness: SQLite resolves a
+  // generated expression against the table as it stands, so effective_mailbox
+  // cannot be added before the pending_move_* columns its CASE reads exist.
+  for (const [name, definition] of Object.entries(GENERATED_LIST_COLUMNS)) addMessageColumn(name, definition);
   db.exec("CREATE INDEX IF NOT EXISTS idx_messages_snoozed_until ON messages(snoozed_until) WHERE snoozed_until IS NOT NULL");
   // Partial index for the cross-folder Attachments view and its sidebar
   // count: only attachment-carrying rows are indexed, so both stay cheap no
   // matter how large the mailbox grows.
   db.exec("CREATE INDEX IF NOT EXISTS idx_messages_has_attachments ON messages(has_attachments) WHERE has_attachments = 1");
   db.exec("CREATE INDEX IF NOT EXISTS idx_messages_account_mailbox_remote_id ON messages(account_id, mailbox, remote_id_lookup)");
+  // The list's ordering indexes, including the one the keyset cursor seeks in
+  // and the global one the cross-account view has no alternative to. Defined
+  // in message-list-indexes.ts, which carries why each shape is what it is.
+  db.exec(MESSAGE_LIST_ACCOUNT_INDEX_SQL);
+  db.exec(MESSAGE_LIST_GLOBAL_INDEX_SQL);
+  // The full-mailbox backup walks the whole table in (account, mailbox, sort_key, uid)
+  // order with a keyset cursor. No earlier index carries that prefix ascending:
+  // idx_messages_account_mailbox sorts sent_at DESC, not sort_key, and
+  // idx_messages_account_sort_key has no mailbox. Without this one every page of
+  // the backup would re-scan the table instead of seeking — slower than the
+  // single query it replaces.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_messages_account_mailbox_sort_key ON messages(account_id, mailbox, sort_key, uid)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_messages_pending_move_remote_id ON messages(account_id, pending_move_destination, remote_id_lookup)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_messages_pending_move_candidate ON messages(account_id, pending_move_destination, pending_move_candidate_uid)");
   // Sender data no longer remains in this plaintext compatibility column.

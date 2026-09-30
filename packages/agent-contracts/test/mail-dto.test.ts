@@ -6,6 +6,7 @@ import {
   folderSchema,
   mailAddressSchema,
   messageAttachmentSchema,
+  messageDetailSchema,
   messageSchema,
   statsSchema,
 } from "../src/mail-dto.js";
@@ -98,4 +99,35 @@ test("mail DTO schemas reject malformed payloads", () => {
   );
   assert.equal(folderSchema.safeParse({ path: 1 }).success, false);
   assert.equal(contactSchema.safeParse({ id: "c1" }).success, false);
+});
+
+test("a list row carries no body while a detail always does", () => {
+  const address = { name: "Ada", address: "ada@example.com" };
+  const listRow = {
+    id: "m1",
+    accountId: "a1",
+    accountEmail: "a@example.com",
+    providerName: "Gmail",
+    mailbox: "INBOX",
+    uid: 7,
+    subject: "s",
+    from: address,
+    to: [address],
+    cc: [],
+    sentAt: "2026-01-01T00:00:00.000Z",
+    snippet: "",
+    // A list row answers with a bounded text preview and no HTML part at all.
+    textBody: "preview",
+    flags: ["\\Seen"],
+    seen: true,
+    flagged: false,
+    hasAttachments: false,
+    attachments: [],
+    size: 0,
+  };
+  assert.equal(messageSchema.safeParse(listRow).success, true);
+  assert.equal(messageDetailSchema.safeParse(listRow).success, false);
+  // An empty body is a body: the detail endpoints must not omit the key.
+  assert.equal(messageDetailSchema.safeParse({ ...listRow, textBody: "", htmlBody: "" }).success, true);
+  assert.equal(messageDetailSchema.safeParse({ ...listRow, textBody: "full" }).success, false);
 });

@@ -1,5 +1,6 @@
 import {
   appSettingsCoreDefaults,
+  autoReplyConfigDefaults,
   type AccountWire,
   type AppSettingsCore,
 } from "@nami/agent-contracts";
@@ -13,6 +14,7 @@ import type {
   MailAddress,
   Message,
   MessageAttachment,
+  MessageDetail,
   Stats,
 } from "@nami/agent-contracts";
 
@@ -22,6 +24,7 @@ export type {
   MailAddress,
   Message,
   MessageAttachment,
+  MessageDetail,
   Stats,
 };
 
@@ -39,65 +42,27 @@ export type OutboundAttachment = {
   size: number;
 };
 
-export type OutboundSubmissionStatus = "pending" | "submitting" | "submitted" | "confirmed" | "unknown_delivery" | "failed";
+// The submission record and its status vocabulary are single-sourced in the
+// contract (`publicSubmission` on the server is the producer); subject and
+// recipients are always present on the wire.
+import type { OutboundSubmission, OutboundSubmissionStatus } from "@nami/agent-contracts";
+export type { OutboundSubmission, OutboundSubmissionStatus };
 
-/** A local record of one user-initiated SMTP submission. It deliberately omits mail body content. */
-export type OutboundSubmission = {
-  id: string;
-  accountId: string;
-  messageId: string;
-  /** Optional display-only summary decrypted by the local service; never includes body content. */
-  subject?: string | null;
-  recipients?: string[];
-  deliveryStatus: OutboundSubmissionStatus;
-  /** ISO time a scheduled send should leave the local queue, when this is a scheduled send. */
-  sendAt: string | null;
-  errorCode: string | null;
-  errorMessage: string | null;
-  postSubmitWarning: string | null;
-  submittedAt: string | null;
-  confirmedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type ProviderInfo = {
-  id: string;
-  name: string;
-  domains: string[];
-  credentialHint: string;
-  credentialName: string;
-  setupSteps: string[];
-  helpUrl?: string;
-  helpLabel?: string;
-  basicAuthLimited: boolean;
-  /** A supported interactive authorization route, when the provider has one. */
-  oauthProvider?: OAuthProvider | null;
-  /** Whether this Nami Mail installation has that authorization route configured. */
-  oauthAvailable?: boolean;
-  family?: string;
-  priority?: "P0" | "P1" | "P2" | string;
-  authMethods?: string[];
-  recommendedAuthMethod?: string;
-  credentialLabel?: string;
-  helpText?: string;
-  caveat?: string;
-  capabilities?: { imap: boolean; smtp: boolean; pop: boolean; apis: string[] };
-  /** Legacy shared rule retained for older providers. */
-  usernameMode?: "email" | "local";
-  imapUsernameMode?: "email" | "local";
-  smtpUsernameMode?: "email" | "local";
-  imap?: MailServerPreset;
-  smtp?: MailServerPreset;
-};
-
-export type MailTransport = "tls" | "starttls";
-
-export type MailServerPreset = {
-  host: string;
-  port: number;
-  transport: MailTransport;
-  secure?: boolean;
+// The provider catalog/discovery payloads are single-sourced in the contract;
+// `providerInfo`/`providerDiscovery` on the server serialize against them.
+import type {
+  MailServerPreset,
+  MailTransport,
+  OAuthProvider,
+  ProviderDiscovery,
+  ProviderInfo,
+} from "@nami/agent-contracts";
+export type {
+  MailServerPreset,
+  MailTransport,
+  OAuthProvider,
+  ProviderDiscovery,
+  ProviderInfo,
 };
 
 export type ManualMailServerConfig = MailServerPreset & {
@@ -108,36 +73,6 @@ export type ManualAccountConfig = {
   imap: ManualMailServerConfig;
   smtp: ManualMailServerConfig;
 };
-
-export type ProviderDiscovery = {
-  id: string;
-  name: string;
-  family: string;
-  priority?: string;
-  domain: string;
-  isCustom: boolean;
-  source: string;
-  confidence: string;
-  authMethods: string[];
-  recommendedAuthMethod?: string;
-  credentialLabel: string;
-  credentialName: string;
-  credentialHint: string;
-  helpText?: string;
-  caveat?: string;
-  setupSteps: string[];
-  helpUrl?: string;
-  helpLabel?: string;
-  usernameMode: "email" | "local";
-  imapUsernameMode?: "email" | "local";
-  smtpUsernameMode?: "email" | "local";
-  basicAuthLimited: boolean;
-  capabilities: { imap: boolean; smtp: boolean; pop: boolean; apis: string[] };
-  imap: MailServerPreset;
-  smtp: MailServerPreset;
-};
-
-export type OAuthProvider = "google" | "microsoft";
 
 export type AccountDiscoveryResult = {
   ok: boolean;
@@ -159,40 +94,22 @@ export type OAuthAttemptStatus = {
   message?: string;
 };
 
-export type FilterRuleCondition =
-  | { kind: "from"; value: string }
-  | { kind: "to"; value: string }
-  | { kind: "subject"; value: string }
-  | { kind: "has_attachments"; value: boolean };
-
-export type FilterRuleAction =
-  | { kind: "mark_seen" }
-  | { kind: "add_flag" }
-  | { kind: "archive" }
-  | { kind: "move_to_folder"; folderPath: string };
-
-export type FilterRule = {
-  id: string;
-  name: string;
-  enabled: boolean;
-  /** null applies the rule to every account; otherwise only that account. */
-  accountId: string | null;
-  conditions: FilterRuleCondition[];
-  actions: FilterRuleAction[];
-  position: number;
-  createdAt: string;
-  updatedAt: string;
+// The filter-rule payloads are single-sourced in the contract (the server
+// routes validate bodies with the same schemas).
+import type {
+  FilterRule,
+  FilterRuleAction,
+  FilterRuleCondition,
+  FilterRuleInput,
+  FilterRuleUpdate,
+} from "@nami/agent-contracts";
+export type {
+  FilterRule,
+  FilterRuleAction,
+  FilterRuleCondition,
+  FilterRuleInput,
+  FilterRuleUpdate,
 };
-
-export type FilterRuleInput = {
-  name: string;
-  accountId?: string | null;
-  enabled?: boolean;
-  conditions: FilterRuleCondition[];
-  actions: FilterRuleAction[];
-};
-
-export type FilterRuleUpdate = Partial<FilterRuleInput>;
 
 export type ContactInput = {
   email: string;
@@ -222,8 +139,11 @@ export type MailTemplateInput = {
 
 export type MailTemplateUpdate = Partial<MailTemplateInput>;
 
-export const calendarEventColors = ["blue", "green", "amber", "red", "purple", "teal"] as const;
-export type CalendarEventColor = typeof calendarEventColors[number];
+// The calendar color vocabulary is single-sourced in the contract so the web
+// month view and the server calendar surface cannot drift.
+import { calendarEventColors, type CalendarEventColor } from "@nami/agent-contracts";
+export { calendarEventColors };
+export type { CalendarEventColor };
 
 /** A local calendar event. Timestamps are UTC ISO strings. */
 export type CalendarEvent = {
@@ -261,52 +181,54 @@ export type {
   SyncMessageLimit,
 } from "@nami/agent-contracts";
 
-export type AutoReplyMode = "llm" | "template";
+// The auto-reply vocabulary is single-sourced in @nami/agent-contracts. Only
+// the scope's date window differs: the wire leaves both dates absent until the
+// user sets them (nullable-optional), while the web model keeps them always
+// present as `string | null` so date inputs and persistence code never branch
+// on `undefined`. `autoReplyConfigFromWire` below is the single seam between
+// the two shapes; do not redeclare the contract shapes here.
+export type {
+  AutoReplyMode,
+  AutoReplyScopeAction,
+  AutoReplyScopeField,
+  AutoReplyScopeOperator,
+  AutoReplyScopeRule,
+  AutoReplyTemplate,
+} from "@nami/agent-contracts";
+import type {
+  AutoReplyConfig as AutoReplyConfigWire,
+  AutoReplyScope as AutoReplyScopeWire,
+} from "@nami/agent-contracts";
 
-export type AutoReplyScopeField = "from" | "domain" | "subject";
-export type AutoReplyScopeOperator = "contains" | "not-contains" | "equals";
-export type AutoReplyScopeAction = "reply" | "ignore";
-
-export type AutoReplyScopeRule = {
-  id: string;
-  field: AutoReplyScopeField;
-  op: AutoReplyScopeOperator;
-  value: string;
-  action: AutoReplyScopeAction;
-  enabled: boolean;
-};
-
-export type AutoReplyScope = {
-  contactsOnly: boolean;
+export type AutoReplyScope = Omit<AutoReplyScopeWire, "startDate" | "endDate"> & {
   startDate: string | null;
   endDate: string | null;
-  threadOnce: boolean;
-  rules: AutoReplyScopeRule[];
 };
 
-export type AutoReplyTemplate = {
-  text: string;
-  skipConfirmation: boolean;
-};
+export type AutoReplyConfig = Omit<AutoReplyConfigWire, "scope"> & { scope: AutoReplyScope };
 
-export type AutoReplyConfig = {
-  enabled: boolean;
-  /** Mailbox scope selected by the user; empty means nothing is monitored. */
-  accountIds: string[];
-  /** llm = Agent drafts each reply; template = fixed template with placeholder substitution. */
-  mode: AutoReplyMode;
-  template: AutoReplyTemplate;
-  scope: AutoReplyScope;
-  /** LLM-mode auto-replies are always drafted for user confirmation before sending. */
-  requireConfirmation: boolean;
-  /** Per-account daily cap on confirmed auto-replies. */
-  dailyLimitPerAccount: number;
-};
+/**
+ * Wire → web seam for the auto-reply config: normalizes the contract scope's
+ * optional date fields into the web model's always-present `string | null`.
+ * Every AutoReplyConfig entering the web flows through this one function
+ * (settings responses in api.ts and the contract defaults in
+ * `defaultAppSettings` below); no other site may adapt the two shapes.
+ */
+export function autoReplyConfigFromWire(config: AutoReplyConfigWire): AutoReplyConfig {
+  return {
+    ...config,
+    scope: {
+      ...config.scope,
+      startDate: config.scope.startDate ?? null,
+      endDate: config.scope.endDate ?? null,
+    },
+  };
+}
 
-/** Mirrors the server-side decline reasons surfaced by the auto-reply review dialog. */
-export type AutoReplyDecisionReason =
-  | "screening" | "scope" | "low-value" | "sensitive" | "user-rejected"
-  | "daily-cap" | "llm-failed" | "send-failed" | "no-template" | "expired";
+// The decline-reason vocabulary mirrors the server-side audit store through
+// the contract; the review dialog filters on exactly these values.
+import type { AutoReplyDecisionReason } from "@nami/agent-contracts";
+export type { AutoReplyDecisionReason };
 
 export type AutoReplyDecisionRecord = {
   id: string;
@@ -321,8 +243,8 @@ export type AutoReplyDecisionRecord = {
 
 /**
  * Derived from the shared settings contract (`AppSettingsCore`) plus the
- * server-derived wire fields. `autoReply` keeps the web-local shape because
- * the contract's scope carries optional dates.
+ * server-derived wire fields. `autoReply` uses the web-local scope shape
+ * (always-present dates) bridged by `autoReplyConfigFromWire`.
  */
 export type AppSettings = AppSettingsCore & {
   autoReply: AutoReplyConfig;
@@ -340,15 +262,9 @@ export type AppSettingsPatch = Partial<Pick<
 
 export const defaultAppSettings: AppSettings = {
   ...appSettingsCoreDefaults,
-  autoReply: {
-    enabled: false,
-    accountIds: [],
-    mode: "llm",
-    template: { text: "", skipConfirmation: false },
-    scope: { contactsOnly: false, startDate: null, endDate: null, threadOnce: true, rules: [] },
-    requireConfirmation: true,
-    dailyLimitPerAccount: 30,
-  },
+  // The contract defaults parse with the scope dates absent; the seam makes
+  // them explicit nulls so the web model's invariant holds from the start.
+  autoReply: autoReplyConfigFromWire(autoReplyConfigDefaults),
   effectiveSyncMessageLimit: null,
   customBackgroundUrl: null,
   autoReplyInvalid: false,

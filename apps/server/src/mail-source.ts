@@ -1,11 +1,8 @@
 import type { DatabaseHandle } from "./db.js";
+import { accountById } from "./account-store.js";
 import { imapClientForAccount, type AccountAccessTokenProvider } from "./mail.js";
 import type { AccountRecord } from "./types.js";
 import { moveActionBlockedError, messagePayloadForRow, type MessageStorageRow } from "./message-storage.js";
-
-function accountById(db: DatabaseHandle, id: string): AccountRecord | undefined {
-  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRecord | undefined;
-}
 
 export type MessageSourceDownload = {
   /** The provider's original RFC822 source for the message. */

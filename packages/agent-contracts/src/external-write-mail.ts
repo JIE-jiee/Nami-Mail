@@ -33,6 +33,13 @@ export const outboundSubmissionStatuses = [
   "failed",
 ] as const;
 
+/**
+ * The submission lifecycle shared by the external write surface, the local
+ * outbox state machine, and the `outbound_submissions.status` CHECK
+ * constraint.
+ */
+export type OutboundSubmissionStatus = (typeof outboundSubmissionStatuses)[number];
+
 export const draftRecipientInputSchema = z.object({
   name: z.string().trim().min(1).max(externalMailWriteBounds.recipientNameCharacters).optional(),
   address: z.string().trim().email().max(externalMailWriteBounds.recipientAddressCharacters),

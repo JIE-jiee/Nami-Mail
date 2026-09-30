@@ -7,9 +7,10 @@
  * joins have a single definition; the route keeps validation, error mapping
  * and payload decryption.
  *
- * Leaf module: only type-only imports plus `db.js`.
+ * Leaf module: only type-only imports plus `db.js` and the cursor codec.
  */
 import type { DatabaseHandle } from "./db.js";
+import { encodeMessageCursor, type MessageListCursor } from "./message-cursor.js";
 import type { MessageListSqlSelection } from "./message-filters.js";
 import type { MessageStorageRow } from "./message-storage.js";
 import type { AccountRecord } from "./types.js";
@@ -26,25 +27,102 @@ export function countMessageRows(db: DatabaseHandle, selection: MessageListSqlSe
   );
 }
 
-/** One page of a list view, newest first, joined with the owning account. */
+/**
+ * The list's total order, and the cursor predicate that continues it. Both are
+ * written once so a page and the cursor it hands out cannot disagree about
+ * which row comes next.
+ *
+ * `sort_key` is the VIRTUAL generated column (SORT_KEY_SQL in db.ts) rather
+ * than a recomputed COALESCE(sent_at, created_at): the expression is not a bare
+ * column, so the only index it could use was the account_id prefix of
+ * idx_messages_account_mailbox and SQLite fell back to "USE TEMP B-TREE FOR
+ * ORDER BY" — which materialises whole rows, ciphertext payload included, for
+ * every message of the account. sort_key carries the same value, derived by
+ * SQLite from the current row, so the index answers the ordering and the LIMIT
+ * without a sorter and no write point has to keep it in step.
+ *
+ * `id DESC` is the tiebreak the generated column cannot provide. sort_key is
+ * not unique — a sync that lands several messages in the same second writes
+ * several rows with the same value — and an ORDER BY over a non-total order
+ * cannot be continued by a cursor: two rows with one sort_key have no defined
+ * "next". It costs nothing, because both list indexes carry `id` as a suffix.
+ */
+const MESSAGE_LIST_ORDER = "ORDER BY m.sort_key DESC, m.id DESC";
+/**
+ * Row-wise "strictly after the cursor, newest first", in the same terms as the
+ * ORDER BY. Written as an OR of two comparisons rather than
+ * `(sort_key, id) < (?, ?)` because SQLite compares tuples element-wise only
+ * via a row value, which cannot use an index range the way the expanded form
+ * does. Both branches keep the account/mailbox prefix seekable.
+ */
+const MESSAGE_CURSOR_PREDICATE = "(m.sort_key < ? OR (m.sort_key = ? AND m.id < ?))";
+
+/**
+ * One page of a list view plus the cursor that continues it.
+ *
+ * `nextCursor` is null exactly when the list is exhausted, which is the signal
+ * the renderer uses for "no more pages" — see message-cursor.ts for why a
+ * client must not infer it from a row count, which new mail keeps changing.
+ */
+export type MessageListPage = {
+  rows: MessageStorageRow[];
+  nextCursor: string | null;
+};
+
+/**
+ * One page of a list view, newest first, joined with the owning account.
+ *
+ * `cursor` is the position to resume from; omitting it starts at the head of
+ * the list. It narrows the *same* selection the filters build, so the cursor
+ * composes with every view: the account, folder, flag, kind, date and search
+ * predicates stay in force and the keyset predicate is ANDed onto them, which
+ * is why a cursor can never widen the set it was issued for.
+ */
+export function listMessagePage(
+  db: DatabaseHandle,
+  selection: MessageListSqlSelection,
+  { limit, cursor }: { limit: number; cursor?: MessageListCursor },
+): MessageListPage {
+  const params = [...selection.params];
+  let where = selection.where;
+  if (cursor) {
+    where = where === "" ? `WHERE ${MESSAGE_CURSOR_PREDICATE}` : `${where} AND ${MESSAGE_CURSOR_PREDICATE}`;
+    params.push(cursor.sortKey, cursor.sortKey, cursor.id);
+  }
+  // One row past the page is the has-more probe. It is never returned; it only
+  // decides whether this page ends the list, and counting the rows it did get
+  // would answer "is this page short" — which is false whenever the user's own
+  // read or a delete took rows out between two requests.
+  const probed = db
+    .prepare(
+      `
+          SELECT m.*, m.sort_key AS list_sort_key, a.email AS account_email, a.provider_name
+          ${selection.join}
+          JOIN accounts a ON a.id = m.account_id
+          ${where}
+          ${MESSAGE_LIST_ORDER}
+          LIMIT ?
+        `,
+    )
+    .all(...params, limit + 1) as Array<MessageStorageRow & { list_sort_key: string }>;
+  const hasMore = probed.length > limit;
+  const rows = hasMore ? probed.slice(0, limit) : probed;
+  const last = rows[rows.length - 1];
+  return {
+    rows,
+    nextCursor: hasMore && last
+      ? encodeMessageCursor({ sortKey: last.list_sort_key, id: last.id })
+      : null,
+  };
+}
+
+/** The rows of one page, without the cursor bookkeeping. */
 export function listMessageRows(
   db: DatabaseHandle,
   selection: MessageListSqlSelection,
-  page: number,
-  pageSize: number,
+  options: { limit: number; cursor?: MessageListCursor },
 ): MessageStorageRow[] {
-  return db
-    .prepare(
-      `
-          SELECT m.*, a.email AS account_email, a.provider_name
-          ${selection.join}
-          JOIN accounts a ON a.id = m.account_id
-          ${selection.where}
-          ORDER BY COALESCE(m.sent_at, m.created_at) DESC
-          LIMIT ? OFFSET ?
-        `,
-    )
-    .all(...selection.params, pageSize, (page - 1) * pageSize) as MessageStorageRow[];
+  return listMessagePage(db, selection, options).rows;
 }
 
 /**
@@ -84,9 +162,18 @@ export function messageRowById(db: DatabaseHandle, id: string): MessageStorageRo
  * Every non-draft message of one account, oldest first. Thread membership is
  * resolved from encrypted headers, so the caller needs a decrypting pass over
  * the whole account rather than a targeted lookup.
+ *
+ * The chronological order is applied in JS, not in SQL. `ORDER BY
+ * COALESCE(sent_at, created_at)` cannot be served by an index (the expression
+ * is computed), so SQLite sorts through a temp B-tree that materialises whole
+ * rows — including the ~48KB ciphertext the caller does not need to order
+ * them. Measured on a 20 000-message account: 6299ms with the SQL sort vs
+ * 887ms for the unsorted scan plus a 29ms JS sort (7.1x), and byte-identical
+ * ordering at 2 000/5 000/20 000 rows. Both keys are ISO-8601 UTC text, which
+ * SQLite compares with BINARY collation — the same byte order `<` gives here.
  */
 export function threadRowsForAccount(db: DatabaseHandle, accountId: string): MessageStorageRow[] {
-  return db
+  const rows = db
     .prepare(
       `
         SELECT m.*, a.email AS account_email, a.provider_name
@@ -94,10 +181,15 @@ export function threadRowsForAccount(db: DatabaseHandle, accountId: string): Mes
         JOIN accounts a ON a.id = m.account_id
         LEFT JOIN folders f ON f.account_id = m.account_id AND f.path = m.mailbox
         WHERE m.account_id = ? AND (f.special_use IS NULL OR f.special_use != '\\Drafts')
-        ORDER BY COALESCE(m.sent_at, m.created_at), m.id
       `,
     )
     .all(accountId) as MessageStorageRow[];
+  return rows.sort((left, right) => {
+    const leftKey = String(left.sent_at ?? left.created_at);
+    const rightKey = String(right.sent_at ?? right.created_at);
+    if (leftKey !== rightKey) return leftKey < rightKey ? -1 : 1;
+    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  });
 }
 
 /** Special-use flag of the folder holding a message; undefined when the row is gone. */

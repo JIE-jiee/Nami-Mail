@@ -70,7 +70,7 @@ export function buildMessageQuery({
   attachmentKind,
   after,
   before,
-  page = 1,
+  cursor,
 }: {
   accountId: string;
   folder: string;
@@ -80,10 +80,17 @@ export function buildMessageQuery({
   attachmentKind?: AttachmentKind;
   after?: string;
   before?: string;
-  page?: number;
+  /**
+   * Where this page resumes from — the `nextCursor` of the page before it,
+   * echoed back verbatim. Absent for the first page. This replaces the old
+   * `page` number: an offset shifts by one every time mail arrives above it,
+   * so a scroll-through could skip rows outright, while a position in the
+   * list's order cannot be pushed around.
+   */
+  cursor?: string;
 }): string {
   const query = new URLSearchParams({ pageSize: "100" });
-  if (page > 1) query.set("page", String(page));
+  if (cursor) query.set("cursor", cursor);
   const globalSearch = searchScope === "all" && search.trim() !== "";
   if (!globalSearch) {
     if (accountId !== "all") query.set("accountId", accountId);

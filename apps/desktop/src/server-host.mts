@@ -209,9 +209,74 @@ export async function startServerHost(
 
 const DESKTOP_CONFIRMATION_CAPABILITY = Object.freeze({ __namiDesktopConfirmation: true });
 
+/**
+ * Exit code for a controlled crash exit: sysexits' EX_SOFTWARE, distinct from
+ * the 1 the boot-failure path uses. main.mts's restart policy treats every
+ * unexpected exit the same way and only records the code, so a specific value
+ * costs nothing and keeps the crash distinguishable in runtime-log.jsonl.
+ */
+export const serviceCrashExitCode = 70;
+
+export type ServiceCrashGuardHooks = {
+  /** Sink for the one diagnostic line; stderr in production. */
+  write(line: string): void;
+  /** Controlled shutdown; process.exit in production. */
+  exit(code: number): void;
+};
+
+/** Minimal shape of the only process method the guard needs. */
+export type UncaughtExceptionTarget = {
+  on(event: "uncaughtException", listener: (error: unknown) => void): unknown;
+};
+
+/**
+ * Turns an uncaught exception into exactly one structured line plus a
+ * deliberate exit.
+ *
+ * This module is the utility-process entry: it runs beside SQLite, the IMAP
+ * connections, the Agent loop and the HTTP server, and it is a *different
+ * process* from Electron's main, so main.mts's `uncaughtException` handler
+ * cannot see anything raised here. Without this guard Node's default behavior
+ * applies: the child prints to stderr and dies instantly, taking the database
+ * handle, every live IMAP socket and the local HTTP API with it — and, because
+ * there is no process-level record of why, the desktop's bounded restart policy
+ * has nothing to attach a cause to in runtime-log.jsonl.
+ *
+ * Swallowing the exception is deliberately NOT an option: process state after
+ * an uncaught exception is unknown, so the correct move is one diagnostic and
+ * one controlled exit, after which main.mts's crash-restart policy takes over.
+ */
+export function installServiceCrashGuard(
+  target: UncaughtExceptionTarget = process,
+  hooks: ServiceCrashGuardHooks = {
+    write: (line) => process.stderr.write(line),
+    exit: (code) => process.exit(code),
+  },
+): void {
+  target.on("uncaughtException", (error) => {
+    const line = `${JSON.stringify({
+      level: 50,
+      time: Date.now(),
+      event: "uncaught-exception",
+      message: error instanceof Error ? error.message : String(error),
+      name: error instanceof Error ? error.name : undefined,
+      stack: error instanceof Error ? error.stack : undefined,
+    })}\n`;
+    try {
+      hooks.write(line);
+    } catch {
+      // A dead stderr must not stop the exit below from happening.
+    }
+    hooks.exit(serviceCrashExitCode);
+  });
+}
+
 // Auto-start when loaded as the utility-process entry (the default export is
-// exported separately so tests can drive startServerHost() directly).
+// exported separately so tests can drive startServerHost() directly). The crash
+// guard is installed first so even a failure during boot start-up is reported
+// and controlled instead of killing the child silently.
 if (process.env.NAMI_MAIL_SERVER_HOST_AUTOSTART === "1") {
+  installServiceCrashGuard();
   const runtimePath = "../../server/dist/runtime.js";
   void startServerHost(
     parentPortTransport(),
@@ -221,3 +286,4 @@ if (process.env.NAMI_MAIL_SERVER_HOST_AUTOSTART === "1") {
     process.exit(1);
   });
 }
+

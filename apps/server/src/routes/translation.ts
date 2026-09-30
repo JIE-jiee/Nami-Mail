@@ -16,6 +16,7 @@ import { buildTranslationBlocks, splitTranslatedBlock } from "../translation-seg
 import { messagePayloadById } from "../message-storage.js";
 import { messageTranslationSchema, translationConfigurationPatchSchema } from "../schemas.js";
 import type { RuntimeContext, TranslationServiceLike } from "../types.js";
+import { ROUTE_ERROR_CODES } from "./error-codes.js";
 
 export type TranslationRouteDeps = {
   context: RuntimeContext;
@@ -118,7 +119,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
     if (!translationConfigurationManaged) {
       return reply.code(409).send({
         ok: false,
-        code: "translation_configuration_managed",
+        code: ROUTE_ERROR_CODES.translation_configuration_managed,
         message: "Translation configuration is managed by this runtime.",
       });
     }
@@ -129,7 +130,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
     if (!translationConfigurationManaged) {
       return reply.code(409).send({
         ok: false,
-        code: "translation_configuration_managed",
+        code: ROUTE_ERROR_CODES.translation_configuration_managed,
         message: "Translation configuration is managed by this runtime.",
       });
     }
@@ -137,7 +138,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
     if (!parsed.success) {
       return reply.code(400).send({
         ok: false,
-        code: "translation_configuration_invalid",
+        code: ROUTE_ERROR_CODES.translation_configuration_invalid,
         message: "Translation configuration is invalid.",
       });
     }
@@ -149,14 +150,14 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
       if (error instanceof TranslationServiceError) {
         return reply.code(400).send({
           ok: false,
-          code: "translation_configuration_invalid",
+          code: ROUTE_ERROR_CODES.translation_configuration_invalid,
           message: "Translation configuration is invalid.",
         });
       }
       app.log.warn("Could not save translation configuration");
       return reply.code(500).send({
         ok: false,
-        code: "translation_configuration_failed",
+        code: ROUTE_ERROR_CODES.translation_configuration_failed,
         message: "Translation configuration could not be saved.",
       });
     }
@@ -166,7 +167,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
     if (!translationConfigurationManaged) {
       return reply.code(409).send({
         ok: false,
-        code: "translation_configuration_managed",
+        code: ROUTE_ERROR_CODES.translation_configuration_managed,
         message: "Translation configuration is managed by this runtime.",
       });
     }
@@ -178,7 +179,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
       app.log.warn("Could not remove translation configuration");
       return reply.code(500).send({
         ok: false,
-        code: "translation_configuration_failed",
+        code: ROUTE_ERROR_CODES.translation_configuration_failed,
         message: "Translation configuration could not be removed.",
       });
     }
@@ -197,14 +198,14 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
     ) {
       return reply.code(400).send({
         ok: false,
-        code: "translation_invalid_target",
+        code: ROUTE_ERROR_CODES.translation_invalid_target,
         message: "The translation target or segments are invalid.",
       });
     }
     if (body.segments.length > 1_000) {
       return reply.code(400).send({
         ok: false,
-        code: "translation_request_too_large",
+        code: ROUTE_ERROR_CODES.translation_request_too_large,
         message: "Too many translation segments.",
       });
     }
@@ -244,7 +245,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
       app.log.warn("Segment translation failed");
       return reply.code(500).send({
         ok: false,
-        code: "translation_failed",
+        code: ROUTE_ERROR_CODES.translation_failed,
         message: "The message text could not be translated.",
       });
     }
@@ -255,7 +256,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
     if (!parsed.success) {
       return reply.code(400).send({
         ok: false,
-        code: "translation_invalid_target",
+        code: ROUTE_ERROR_CODES.translation_invalid_target,
         message: "The translation target is invalid.",
       });
     }
@@ -267,7 +268,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
       if (!stored) {
         return reply.code(404).send({
           ok: false,
-          code: "translation_content_unavailable",
+          code: ROUTE_ERROR_CODES.translation_content_unavailable,
           message: "The selected message is no longer available.",
           ...(llmProviders.length > 0 ? { llmAvailable: true } : {}),
         });
@@ -280,7 +281,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
       if (!translatableText) {
         return reply.code(422).send({
           ok: false,
-          code: "translation_content_unavailable",
+          code: ROUTE_ERROR_CODES.translation_content_unavailable,
           message: "The message does not contain translatable text.",
           ...(llmProviders.length > 0 ? { llmAvailable: true } : {}),
         });
@@ -370,7 +371,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
       app.log.warn({ messageId: request.params.id }, "Selected message translation failed");
       return reply.code(500).send({
         ok: false,
-        code: "translation_failed",
+        code: ROUTE_ERROR_CODES.translation_failed,
         message: "The selected message could not be translated.",
         ...(llmProviders.length > 0 ? { llmAvailable: true } : {}),
       });
@@ -381,7 +382,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
   // translate the message when the external free service is unavailable.
   app.post<{ Params: { id: string } }>("/api/messages/:id/translate-llm", async (request, reply) => {
     if (!agentService) {
-      return reply.code(503).send({ ok: false, code: "agent_unavailable", message: "Agent 服务当前不可用。" });
+      return reply.code(503).send({ ok: false, code: ROUTE_ERROR_CODES.agent_unavailable, message: "Agent 服务当前不可用。" });
     }
     const bodySchema = z.object({
       targetLocale: z.string().trim().min(2).max(16),
@@ -390,7 +391,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
     });
     const parsed = bodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, code: "translation_invalid_target", message: "The translation request is invalid." });
+      return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.translation_invalid_target, message: "The translation request is invalid." });
     }
 
     try {
@@ -399,17 +400,17 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
       translationLanguageForLocale(parsed.data.targetLocale);
       const stored = messagePayloadById(context.db, context.masterKey, request.params.id);
       if (!stored) {
-        return reply.code(404).send({ ok: false, code: "translation_content_unavailable", message: "The selected message is no longer available." });
+        return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.translation_content_unavailable, message: "The selected message is no longer available." });
       }
       if (!stored.payload.textBody?.trim() && !stored.payload.htmlBody?.trim()) {
-        return reply.code(422).send({ ok: false, code: "translation_content_unavailable", message: "The message does not contain translatable text." });
+        return reply.code(422).send({ ok: false, code: ROUTE_ERROR_CODES.translation_content_unavailable, message: "The message does not contain translatable text." });
       }
       const translatableText = translatableTextFromPayload(stored.payload);
       if (!translatableText) {
-        return reply.code(422).send({ ok: false, code: "translation_content_unavailable", message: "The message does not contain translatable text." });
+        return reply.code(422).send({ ok: false, code: ROUTE_ERROR_CODES.translation_content_unavailable, message: "The message does not contain translatable text." });
       }
       if (translatableText.length > MAX_TRANSLATION_TEXT_LENGTH) {
-        return reply.code(413).send({ ok: false, code: "translation_request_too_large", message: "The message is too large to translate." });
+        return reply.code(413).send({ ok: false, code: ROUTE_ERROR_CODES.translation_request_too_large, message: "The message is too large to translate." });
       }
       // Combine the shutdown signal with client disconnect so cancelling the
       // request aborts the in-flight LLM call instead of wasting provider quota.
@@ -465,7 +466,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
           try { send({ type: "error", message: error.message, code: error.code }); } catch { /* client may have disconnected */ }
         } else {
           app.log.warn({ messageId: request.params.id }, "LLM translation failed");
-          try { send({ type: "error", message: "The selected message could not be translated.", code: "translation_failed" }); } catch { /* client may have disconnected */ }
+          try { send({ type: "error", message: "The selected message could not be translated.", code: ROUTE_ERROR_CODES.translation_failed }); } catch { /* client may have disconnected */ }
         }
       } finally {
         request.raw.removeListener("aborted", abortForClientDisconnect);
@@ -482,7 +483,7 @@ export function registerTranslationRoutes(app: FastifyInstance, deps: Translatio
         return reply.code(error.statusCode).send({ ok: false, code: error.code, message: error.message });
       }
       app.log.warn({ messageId: request.params.id }, "LLM translation failed");
-      return reply.code(500).send({ ok: false, code: "translation_failed", message: "The selected message could not be translated." });
+      return reply.code(500).send({ ok: false, code: ROUTE_ERROR_CODES.translation_failed, message: "The selected message could not be translated." });
     }
   });
 }

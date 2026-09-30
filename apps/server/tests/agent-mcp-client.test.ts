@@ -1,7 +1,8 @@
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { McpClientError, McpStdioClient, probeMcpServer } from "../src/agent/mcp-client.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { McpClientError, McpStdioClient, isSafeJsonValue, maxJsonDepth, probeMcpServer } from "../src/agent/mcp-client.js";
+import { setServerLogger } from "../src/logging.js";
 
 const fixturePath = fileURLToPath(new URL("./fixtures/mock-mcp-server.mjs", import.meta.url));
 
@@ -13,6 +14,19 @@ function transport(overrides: { requestTimeoutMs?: number; env?: Record<string, 
     connectTimeoutMs: 10_000,
     ...(overrides.env ? { env: overrides.env } : {}),
   };
+}
+
+type LoggedCall = { meta: object; message: string };
+
+/** Captures the module's warn channel for the duration of one test. */
+function captureWarnings(): LoggedCall[] {
+  const logged: LoggedCall[] = [];
+  setServerLogger({
+    info: () => {},
+    warn: (meta, message) => { logged.push({ meta, message }); },
+    error: () => {},
+  });
+  return logged;
 }
 
 describe("McpStdioClient", () => {
@@ -151,6 +165,104 @@ describe("McpStdioClient", () => {
       if (previous === undefined) delete process.env.NAMI_MAIL_LOCAL_API_TOKEN;
       else process.env.NAMI_MAIL_LOCAL_API_TOKEN = previous;
     }
+  });
+});
+
+describe("MCP stdio resource bounds", () => {
+  afterEach(() => {
+    setServerLogger(undefined);
+  });
+
+  // The reviewed reproduction: a ~65 KB JSON-RPC line nested thousands of
+  // levels deep. Walking that shape used to raise
+  // `RangeError: Maximum call stack size exceeded` inside the readline 'line'
+  // callback, where it escaped straight to uncaughtException — killing SQLite,
+  // IMAP, the Agent and the HTTP API with it.
+  it("drops a pathologically nested line without letting anything escape the line handler", async () => {
+    const logged = captureWarnings();
+    const client = new McpStdioClient(transport({ env: { MOCK_MCP_DEEP_LINE: "1" } }));
+    try {
+      await client.connect();
+      // The fixture interleaves the deep frame with a normal answer, so one
+      // round-trip proves both halves: the frame was dropped and the response
+      // it shared a batch of stdout with still landed.
+      const deep = await client.callTool("deep", {});
+      expect(deep.isError).toBe(false);
+      expect(deep.content[0]?.text).toBe("deep");
+
+      await vi.waitFor(() => {
+        expect(logged.map((call) => call.message)).toContain("Dropped an MCP stdio line nested past the accepted JSON depth");
+      });
+      expect(logged.find((call) => call.message.includes("nested past"))?.meta).toMatchObject({ reason: "depth" });
+
+      // …and the connection is still usable afterwards.
+      expect(client.isConnected).toBe(true);
+      const weather = await client.callTool("get_weather", { city: "Tokyo" });
+      expect(weather.content[0]?.text).toBe("Weather in Tokyo: sunny");
+    } finally {
+      client.close();
+    }
+  });
+
+  // readline has no line-length limit of its own, so the byte budget has to be
+  // applied before readline ever assembles a line: a server that never writes
+  // a newline otherwise makes it concatenate until Node throws
+  // `RangeError: Invalid string length` from inside its own emit stack.
+  it("tears the connection down when the server floods stdout without ever terminating a line", async () => {
+    const logged = captureWarnings();
+    const client = new McpStdioClient(transport({ env: { MOCK_MCP_FLOOD: "1" }, requestTimeoutMs: 20_000 }));
+    try {
+      await client.connect();
+      await expect(client.callTool("flood", {})).rejects.toMatchObject({ code: "CLOSED" });
+      expect(client.isConnected).toBe(false);
+      expect(client.isAlive).toBe(false);
+
+      const floodWarning = logged.find((call) => call.message.includes("stdout byte budget"));
+      expect(floodWarning?.meta).toMatchObject({ reason: "line" });
+    } finally {
+      client.close();
+    }
+  });
+
+  // The catch around the line handler is the last line of defence: it is what
+  // keeps any future validator change from turning a peer's input into an
+  // uncaughtException. Stubbing the body reproduces the failure mode exactly
+  // (a RangeError raised while the line is being validated) without depending
+  // on the depth bound below to have already stopped it.
+  it("contains any exception raised while a line is being dispatched", () => {
+    const logged = captureWarnings();
+    const client = new McpStdioClient(transport());
+    const boundary = client as unknown as {
+      handleLine(line: string): void;
+      dispatchLine(line: string): void;
+    };
+    boundary.dispatchLine = () => { throw new RangeError("Maximum call stack size exceeded"); };
+
+    expect(() => boundary.handleLine('{"jsonrpc":"2.0","id":1,"result":{}}')).not.toThrow();
+    expect(logged.map((call) => call.message)).toContain("Dropped an MCP stdio line that failed validation");
+  });
+
+  it("bounds JSON nesting depth in the value walk", () => {
+    const nest = (levels: number): unknown => {
+      let value: unknown = "leaf";
+      for (let level = 0; level < levels; level += 1) value = [value];
+      return value;
+    };
+
+    expect(isSafeJsonValue(nest(maxJsonDepth))).toBe(true);
+    expect(isSafeJsonValue(nest(maxJsonDepth + 1))).toBe(false);
+
+    // The reviewed payload depth: rejected without a stack overflow.
+    expect(() => isSafeJsonValue(nest(50_000))).not.toThrow();
+    expect(isSafeJsonValue(nest(50_000))).toBe(false);
+
+    // The pre-existing rejections still hold.
+    expect(isSafeJsonValue(JSON.parse('{"__proto__": {"polluted": true}}'))).toBe(false);
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    expect(isSafeJsonValue(cycle)).toBe(false);
+    expect(isSafeJsonValue(Number.POSITIVE_INFINITY)).toBe(false);
+    expect(isSafeJsonValue({ city: "Tokyo", nested: { list: [1, "two", null, true] } })).toBe(true);
   });
 });
 

@@ -4,15 +4,20 @@ import type { AttachmentKind } from "./attachment-kind.js";
 // Authoritative WHERE filter fragments for the message list view. Shared by
 // GET /api/messages and the batch-job query resolver so "select all matching
 // this view" always matches exactly what the list shows.
-
-export const effectiveMailboxExpression = "CASE WHEN m.pending_move_state = 'intent' THEN m.mailbox ELSE COALESCE(NULLIF(m.pending_move_destination, ''), m.mailbox) END";
+//
+// Folder membership reads the `m.effective_mailbox` VIRTUAL generated column
+// rather than the CASE expression it is defined as: the expression is not a
+// bare column, so a folder view could not use any index prefix and fell back to
+// a full scan plus sorter. EFFECTIVE_MAILBOX_SQL in db.ts is the one definition
+// of that value and SQLite owns the column, so this file must never restate the
+// expression.
 
 export const inboxMessageFilter = `(
-  UPPER(${effectiveMailboxExpression}) = 'INBOX'
+  UPPER(m.effective_mailbox) = 'INBOX'
   OR EXISTS (
     SELECT 1 FROM folders f
     WHERE f.account_id = m.account_id
-      AND f.path = ${effectiveMailboxExpression}
+      AND f.path = m.effective_mailbox
       AND f.special_use = '\\Inbox'
   )
 )`;
@@ -29,7 +34,7 @@ export const archivedMessageFilter = `(
   OR EXISTS (
     SELECT 1 FROM folders f
     WHERE f.account_id = m.account_id
-      AND f.path = ${effectiveMailboxExpression}
+      AND f.path = m.effective_mailbox
       AND f.special_use = '\\Archive'
   )
   OR (
@@ -37,7 +42,7 @@ export const archivedMessageFilter = `(
     AND EXISTS (
       SELECT 1 FROM folders f
       WHERE f.account_id = m.account_id
-        AND f.path = ${effectiveMailboxExpression}
+        AND f.path = m.effective_mailbox
         AND f.special_use = '\\All'
     )
     AND NOT EXISTS (
@@ -103,7 +108,7 @@ export function buildMessageListSql(query: MessageListFilterQuery): MessageListS
     params.push(query.accountId);
   }
   if (!globalSearch && query.folder) {
-    filters.push(`${effectiveMailboxExpression} = ?`);
+    filters.push("m.effective_mailbox = ?");
     params.push(query.folder);
   } else if (!globalSearch && query.archived) {
     filters.push(archivedMessageFilter);
@@ -134,6 +139,15 @@ export function buildMessageListSql(query: MessageListFilterQuery): MessageListS
     params.push(`%"${query.attachmentKind}"%`);
   }
   if (query.after) {
+    // Deliberately still the expression rather than m.sort_key. Switching is
+    // safe on value exactly when the column can never be NULL or stale: the
+    // expression yields created_at whenever sent_at is NULL, so the two agree
+    // only if the column is always derived from that same expression. A
+    // VIRTUAL generated column guarantees it and created_at is NOT NULL, so
+    // the values are now identical by construction; the remaining question is
+    // only whether the range predicate would be served as an index seek on
+    // idx_messages_account_sort_key instead of a scan, which is worth
+    // measuring before changing a query every list view runs.
     filters.push("COALESCE(m.sent_at, m.created_at) >= ?");
     params.push(query.after);
   }

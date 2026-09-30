@@ -131,11 +131,14 @@ function startCommandRun(value: ReturnType<typeof fixture>, content: string, mod
 }
 
 function persistedMessages(service: AgentService, conversationId: string) {
+  // The conversation read path moved to the run engine; reach it through the service's engine field.
   return (service as unknown as {
-    readConversation: (id: string) => {
-      messages: Array<{ role: string; content: string; mailContextIncluded: boolean }>;
+    engine: {
+      readConversation: (id: string) => {
+        messages: Array<{ role: string; content: string; mailContextIncluded: boolean }>;
+      };
     };
-  }).readConversation(conversationId).messages;
+  }).engine.readConversation(conversationId).messages;
 }
 
 function persistedUserMessages(service: AgentService, conversationId: string) {

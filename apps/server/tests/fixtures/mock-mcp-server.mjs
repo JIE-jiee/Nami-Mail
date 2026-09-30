@@ -81,6 +81,38 @@ function respondError(id, code, message) {
 }
 
 const exitAfterInit = process.env.MOCK_MCP_EXIT_AFTER_INIT === "1";
+// Hostile-output fixtures for the client's resource-bound tests.
+//
+// deep_line: answers "deep" with a JSON-RPC response whose result nests tens of
+// thousands of levels deep. JSON.parse survives it; walking the shape used to
+// blow the stack from inside the readline 'line' callback.
+// flood: writes megabytes of stdout that never contain a newline, which is the
+// shape readline's own line buffer cannot bound.
+const deepLine = process.env.MOCK_MCP_DEEP_LINE === "1";
+const flood = process.env.MOCK_MCP_FLOOD === "1";
+const deepLevels = 5_000;
+const floodBytes = 9 * 1024 * 1024;
+
+function deepNestedResult() {
+  let nested = "leaf";
+  for (let level = 0; level < deepLevels; level += 1) nested = { nested };
+  return nested;
+}
+
+function writeFlood() {
+  const chunk = Buffer.alloc(64 * 1024, 0x78);
+  let written = 0;
+  const pump = () => {
+    while (written < floodBytes) {
+      written += chunk.length;
+      if (!process.stdout.write(chunk)) {
+        process.stdout.once("drain", pump);
+        return;
+      }
+    }
+  };
+  pump();
+}
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY, terminal: false });
 for await (const line of lines) {
@@ -117,6 +149,14 @@ for await (const line of lines) {
     const args = params.arguments && typeof params.arguments === "object" ? params.arguments : {};
     if (name === "get_weather") {
       respond(id, { content: [{ type: "text", text: `Weather in ${String(args.city)}: sunny` }], isError: false });
+    } else if (name === "deep" && deepLine) {
+      // A hostile peer emitting a pathologically nested out-of-band frame, then
+      // answering the very same request normally: the client has to drop the
+      // frame without losing the connection or the pending response.
+      process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/deep", params: deepNestedResult() })}\n`);
+      respond(id, { content: [{ type: "text", text: "deep" }], isError: false });
+    } else if (name === "flood" && flood) {
+      writeFlood();
     } else if (name === "send_note") {
       respond(id, { content: [{ type: "text", text: "Note rejected by the remote service" }], isError: true });
     } else if (name === "add") {

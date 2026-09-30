@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type CompositionEvent, type FormEvent, type RefObject } from "react";
 import {
-  BookOpen,
   Check,
   ChevronDown,
   ChevronRight,
@@ -15,7 +14,6 @@ import {
   Mailbox,
   Plus,
   ShieldCheck,
-  Wand2,
   X,
 } from "lucide-react";
 import { api } from "./api";
@@ -26,13 +24,10 @@ import {
   CUSTOM_IMAP_PROVIDER_ID,
   fullCatalogProviders,
   localizedProviderOnboarding,
-  orderedProviderCatalog,
-  providerAuthLabel,
   providerDisplayName,
   providerIconUrl,
   providerMonogram,
   providerServerConfiguration,
-  quickProviderCatalog,
   serverEndpointLabel,
 } from "./providerOnboarding";
 import ThemedSelect from "./ThemedSelect";
@@ -356,10 +351,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
     () => guideProvider ? localizedProviderOnboarding(guideProvider, locale, t) : undefined,
     [guideProvider, locale, t],
   );
-  const activeProviderName = activeOnboarding?.name ?? activeDiscovery?.name ?? "";
   const guideProviderName = guideOnboarding?.name ?? guideProvider?.name ?? "";
-  const orderedProviders = useMemo(() => orderedProviderCatalog(providers, locale), [locale, providers]);
-  const quickProviders = useMemo(() => quickProviderCatalog(providers, locale), [locale, providers]);
   const allProviders = useMemo(() => fullCatalogProviders(providers, locale), [locale, providers]);
 
   const targetProviderId = guideProvider?.id || activeDiscovery?.id || matchedProvider?.id || selectedProviderId;
@@ -518,8 +510,6 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
   const needsProviderDiscovery = discoveryRequired;
   const authMethods = activeDiscovery?.authMethods ?? providerAuthMethods(matchedProvider);
   const oauthOnly = Boolean(activeOAuthProvider) && authMethods.length > 0 && authMethods.every((method) => method === "oauth2");
-  const passwordLooksLikeAppCredential = !manualOpen
-    && authMethods.some((method) => method === "app-password" || method === "client-authorization-code");
   const canUsePassword = !oauthOnly;
   const providerPrefersOAuth = Boolean(
     activeOAuthProvider && oauthAvailable && activeDiscovery?.recommendedAuthMethod !== "app-password" && !isGmail
@@ -978,17 +968,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
     }
   };
 
-  const credentialName = activeOnboarding?.credentialName
-    ?? activeOnboarding?.credentialLabel
-    ?? t("account.credential.fallback");
   const passwordFallbackName = activeOnboarding?.credentialName ?? t("account.credential.oauth_fallback");
-  const setupSteps = guideOnboarding?.setupSteps ?? [];
-  const guideIsPreview = !activeDiscovery && Boolean(selectedProviderGuide);
-  const sourceNote = guideProvider?.isCustom
-    ? guideIsPreview
-      ? t("account.guide.custom_preview")
-      : t("account.guide.custom_discovered")
-    : guideOnboarding?.caveat;
   const guideAvailable = Boolean(guideProvider) && (!needsProviderDiscovery || Boolean(selectedProviderId));
   const serverConfiguration = guideProvider && !guideProvider.isCustom
     ? providerServerConfiguration(guideOnboarding?.name ?? guideProvider.name, guideProvider.imap, guideProvider.smtp, t)
@@ -1062,7 +1042,6 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
   const displayIsOAuthWaiting = isFlowActive ? isOAuthWaiting : Boolean(activeSnapshot?.isOAuthWaiting);
   const displayCredentialDetails = isFlowActive ? credentialDetails : (activeSnapshot?.credentialDetails ?? credentialDetails);
   const displayManualOpen = isFlowActive ? manualOpen : Boolean(activeSnapshot?.manualOpen);
-  const hasFlowDetails = isFlowActive || activeSnapshot !== null;
 
   const copyServerConfiguration = async () => {
     if (!serverConfiguration) return;

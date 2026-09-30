@@ -12,8 +12,9 @@ import { imapClientForAccount, type AccountAccessTokenProvider } from "./mail.js
 import { moveActionBlockedError } from "./message-storage.js";
 import { messageFlagNames, type MessageFlagsPatch } from "./message-flags.js";
 export type { MessageFlagsPatch };
-import { pendingPushRowById } from "./message-queries.js";
-import { accountById, withAccountWriteLocks } from "./sync-locks.js";
+import { messageAccountId, messageAccountIds, type PendingPushRow } from "./message-queries.js";
+import { withAccountWriteLocks } from "./sync-locks.js";
+import { accountById } from "./account-store.js";
 
 
 export async function updateMessageFlags(
@@ -24,31 +25,25 @@ export async function updateMessageFlags(
   accessTokenProvider?: AccountAccessTokenProvider,
   agentEvents?: AgentMailEventSink,
 ): Promise<void> {
-  const message = pendingPushRowById(db, messageId);
-  if (!message) throw new Error("Message not found.");
-  const moveBlockedError = moveActionBlockedError(message);
-  if (moveBlockedError) throw new Error(moveBlockedError);
+  // Only the account id is read outside the lock: it is what names the lock.
+  // Everything the patch is computed from — including the existence and
+  // pending-move checks — is re-read inside it, so the read-modify-write is
+  // serialized as a whole against a concurrent move or flag update. Reading
+  // flags_json out here instead would let two writers compute their next flags
+  // from the same stale snapshot, and the later write would overwrite the
+  // earlier one's local flags even though both STOREs reached the server.
+  const accountId = messageAccountId(db, messageId);
+  if (!accountId) throw new Error("Message not found.");
   // The account-level write slot queues a flag update behind any move in
   // flight on the same account. Without it, starring a message while its
   // delete is still dispatching fails with a "pending move" error instead of
   // simply waiting its turn. This also serializes filter-rule and agent flag
   // writes against user moves.
-  await withAccountWriteLocks([message.account_id], async () => {
-    const currentFlags = new Set<string>(JSON.parse(message.flags_json));
-    const nextFlags = new Set(currentFlags);
-    const add: string[] = [];
-    const remove: string[] = [];
-    for (const [field, flag] of Object.entries(messageFlagNames) as Array<[keyof MessageFlagsPatch, string]>) {
-      const value = patch[field];
-      if (value === undefined || currentFlags.has(flag) === value) continue;
-      if (value) {
-        nextFlags.add(flag);
-        add.push(flag);
-      } else {
-        nextFlags.delete(flag);
-        remove.push(flag);
-      }
-    }
+  await withAccountWriteLocks([accountId], async () => {
+    const { messages, blocked } = planFlagPatch(db, [messageId], patch);
+    const prepared = messages[0];
+    if (!prepared) throw new Error(blocked.get(messageId) ?? "Message not found.");
+    const { message, nextFlags, add, remove, seenChanged } = prepared;
     // The requested state is already reflected in the last server-confirmed
     // cache. Avoid a redundant STORE command and, importantly, a second count
     // adjustment for an idempotent read/open action.
@@ -72,7 +67,6 @@ export async function updateMessageFlags(
       } finally {
         lock.release();
       }
-      const seenChanged = currentFlags.has("\\Seen") !== nextFlags.has("\\Seen");
       db.transaction(() => {
         db.prepare("UPDATE messages SET flags_json = ? WHERE id = ?").run(JSON.stringify([...nextFlags]), messageId);
         if (seenChanged) {
@@ -86,7 +80,7 @@ export async function updateMessageFlags(
               ELSE unseen + 1
             END
             WHERE account_id = ? AND path = ?
-          `).run(nextFlags.has("\\Seen") ? 1 : 0, message.account_id, message.mailbox);
+          `).run(nextFlags.includes("\\Seen") ? 1 : 0, message.account_id, message.mailbox);
         }
         if (agentEvents && agentLease) {
           agentEvents.messageUpsertedWithinTransaction(agentLease, messageId, {
@@ -105,51 +99,54 @@ export async function updateMessageFlags(
   });
 }
 
+/** Columns a flag patch needs, in both the single and the batch path. */
+const FLAG_PATCH_ROW_SQL =
+  "SELECT id, account_id, mailbox, uid, flags_json, remote_id_lookup, pending_move_destination, pending_move_state FROM messages";
+
+/** One message's next flags, derived from a snapshot read while the account
+ * write slot was held. */
+type PreparedFlagMessage = {
+  message: PendingPushRow & { id: string };
+  nextFlags: string[];
+  add: string[];
+  remove: string[];
+  seenChanged: boolean;
+};
+
+/** What a patch would do to a set of ids, with the reason for every id it
+ * cannot touch. */
+type FlagPatchPlan = {
+  messages: PreparedFlagMessage[];
+  /** id -> the error explaining why it was left alone (missing row, or a move
+   * that has to be reconciled first). The single-message path rethrows it; the
+   * batch counts it as a failure. */
+  blocked: Map<string, string>;
+};
+
 /**
- * Applies the same flag patch to many messages using one IMAP connection per
- * account and one STORE command per mailbox, instead of one connection and one
- * command per message. Failures are per-message: the caller receives how many
- * messages were updated and how many failed, mirroring the per-id behavior of
- * the previous loop.
+ * Computes the next flags for `messageIds` from one snapshot of their rows.
+ *
+ * Callers must hold the account write slot(s) for the accounts involved while
+ * calling this: it is the snapshot the read-modify-write is computed from, and
+ * the whole point of the slot is that no other writer can advance the row
+ * between this read and the write that follows. Reading it before taking the
+ * slot is what let two writers compute their next flags from the same stale
+ * state and the later one silently drop the earlier one's local flags.
+ *
+ * Messages already in the requested state are kept (with empty add/remove) so
+ * the caller can still count them as idempotently updated.
  */
-export async function updateMessageFlagsBatch(
-  db: DatabaseHandle,
-  masterKey: Buffer,
-  messageIds: readonly string[],
-  patch: MessageFlagsPatch,
-  accessTokenProvider?: AccountAccessTokenProvider,
-  agentMailEvents?: AgentMailEventSink,
-): Promise<{ updated: number; failed: number; changedIds: string[] }> {
-  if (!messageIds.length) return { updated: 0, failed: 0, changedIds: [] };
+function planFlagPatch(db: DatabaseHandle, messageIds: readonly string[], patch: MessageFlagsPatch): FlagPatchPlan {
   const placeholders = messageIds.map(() => "?").join(", ");
   const rows = db
-    .prepare(`SELECT id, account_id, mailbox, uid, flags_json, remote_id_lookup, pending_move_destination, pending_move_state FROM messages WHERE id IN (${placeholders})`)
-    .all(...messageIds) as Array<{
-      id: string;
-      account_id: string;
-      mailbox: string;
-      uid: number;
-      flags_json: string;
-      remote_id_lookup: string | null;
-      pending_move_destination: string | null;
-      pending_move_state: string | null;
-    }>;
-
-  // Prepare per-message next flags; skip messages that no longer exist or
-  // would not change. These are counted as "updated" to keep the overall
-  // operation idempotent (they were already in the requested state).
-  type PreparedMessage = {
-    message: typeof rows[number];
-    nextFlags: string[];
-    add: string[];
-    remove: string[];
-    seenChanged: boolean;
-  };
-  const prepared: PreparedMessage[] = [];
-  const blocked: string[] = [];
+    .prepare(`${FLAG_PATCH_ROW_SQL} WHERE id IN (${placeholders})`)
+    .all(...messageIds) as Array<{ id: string } & PendingPushRow>;
+  const messages: PreparedFlagMessage[] = [];
+  const blocked = new Map<string, string>();
   for (const message of rows) {
-    if (moveActionBlockedError(message)) {
-      blocked.push(message.id);
+    const moveBlockedError = moveActionBlockedError(message);
+    if (moveBlockedError) {
+      blocked.set(message.id, moveBlockedError);
       continue;
     }
     const currentFlags = new Set<string>(JSON.parse(message.flags_json));
@@ -167,26 +164,60 @@ export async function updateMessageFlagsBatch(
         remove.push(flag);
       }
     }
-    prepared.push({ message, nextFlags: [...nextFlags], add, remove, seenChanged: currentFlags.has("\\Seen") !== nextFlags.has("\\Seen") });
+    messages.push({
+      message,
+      nextFlags: [...nextFlags],
+      add,
+      remove,
+      seenChanged: currentFlags.has("\\Seen") !== nextFlags.has("\\Seen"),
+    });
   }
+  return { messages, blocked };
+}
 
-  // Group by account: one connection per account, one STORE per mailbox.
-  const byAccount = new Map<string, PreparedMessage[]>();
-  for (const item of prepared) {
-    const group = byAccount.get(item.message.account_id) ?? [];
-    group.push(item);
-    byAccount.set(item.message.account_id, group);
+/**
+ * Applies the same flag patch to many messages using one IMAP connection per
+ * account and one STORE command per mailbox, instead of one connection and one
+ * command per message. Failures are per-message: the caller receives how many
+ * messages were updated and how many failed, mirroring the per-id behavior of
+ * the previous loop.
+ */
+export async function updateMessageFlagsBatch(
+  db: DatabaseHandle,
+  masterKey: Buffer,
+  messageIds: readonly string[],
+  patch: MessageFlagsPatch,
+  accessTokenProvider?: AccountAccessTokenProvider,
+  agentMailEvents?: AgentMailEventSink,
+): Promise<{ updated: number; failed: number; changedIds: string[] }> {
+  if (!messageIds.length) return { updated: 0, failed: 0, changedIds: [] };
+  // Only the id -> account routing is read outside the lock: it is what names
+  // the lock each group of ids waits for. The rows themselves are re-read
+  // inside it (planFlagPatch), so a batch never writes next flags computed
+  // from a snapshot another writer has already superseded.
+  const idsByAccount = new Map<string, string[]>();
+  for (const { id, account_id: accountId } of messageAccountIds(db, messageIds)) {
+    const group = idsByAccount.get(accountId) ?? [];
+    group.push(id);
+    idsByAccount.set(accountId, group);
   }
-
+  const routed = [...idsByAccount.values()].reduce((total, ids) => total + ids.length, 0);
+  // Ids with no message row at all (deleted, or never in this database) cannot
+  // be updated; the rest of the accounting happens under the lock.
+  let failed = messageIds.length - routed;
   let updated = 0;
-  let failed = blocked.length + (messageIds.length - rows.length);
   const changedIds: string[] = [];
-  for (const [accountId, messages] of byAccount) {
-    // The account write slot serializes the read-modify-write against any move
-    // or flag update in flight on the same account, mirroring the single-message
-    // `updateMessageFlags` path. Without it, a batch STORE racing a move (or
-    // sync) can overwrite the freshly reconciled flags_json.
+  for (const [accountId, accountMessageIds] of idsByAccount) {
+    // The account write slot serializes the whole read-modify-write — the
+    // snapshot the next flags are computed from included — against any move or
+    // flag update in flight on the same account, mirroring the single-message
+    // `updateMessageFlags` path. Without it, a batch STORE racing a move (or a
+    // concurrent flag update) overwrites the freshly reconciled flags_json.
     await withAccountWriteLocks([accountId], async () => {
+      const { messages, blocked } = planFlagPatch(db, accountMessageIds, patch);
+      // A row can also disappear between the routing read and this one.
+      failed += blocked.size;
+      if (!messages.length) return;
       const account = accountById(db, accountId);
       if (!account) {
         failed += messages.length;
@@ -197,7 +228,7 @@ export async function updateMessageFlagsBatch(
       let remoteSucceeded = false;
       try {
         await client.connect();
-        const byMailbox = new Map<string, PreparedMessage[]>();
+        const byMailbox = new Map<string, PreparedFlagMessage[]>();
         for (const item of messages) {
           const group = byMailbox.get(item.message.mailbox) ?? [];
           group.push(item);

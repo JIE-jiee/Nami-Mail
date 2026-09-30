@@ -32,7 +32,14 @@ export function isLoopbackHost(value: string): boolean {
   return false;
 }
 
-/** True for loopback socket peer addresses, including Node's IPv4-mapped forms. */
+/**
+ * True for loopback socket peer addresses, including Node's IPv4-mapped forms.
+ *
+ * This alone no longer authorizes token-less requests: DNS rebinding presents
+ * a loopback peer from an attacker-controlled origin, so app.ts additionally
+ * validates the Host header of token-less requests (see
+ * isTrustedTokenlessHost there).
+ */
 export function isLoopbackRemoteAddress(value: string | undefined): boolean {
   if (!value) return true; // injected requests and abstract sockets carry no peer address
   const remote = value.trim().toLowerCase();

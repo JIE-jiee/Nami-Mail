@@ -94,19 +94,21 @@ describe("Agent service mailbox scope", () => {
     applyAgentStoreSchema(db, "2026-07-27T10:00:00.000Z");
     const service = serviceFixture(db, masterKey);
     const internals = service as unknown as {
-      normalizeStoredScope: (value: unknown) => { mode: string; accountIds: string[]; messageIds: string[] };
+      engine: {
+        normalizeStoredScope: (value: unknown) => { mode: string; accountIds: string[]; messageIds: string[] };
+      };
     };
-    expect(internals.normalizeStoredScope({
+    expect(internals.engine.normalizeStoredScope({
       mode: "current_message",
       accountIds: ["account-1"],
       messageIds: ["message-1"],
     })).toEqual({ mode: "selected_account", accountIds: ["account-1"], messageIds: [] });
-    expect(internals.normalizeStoredScope({
+    expect(internals.engine.normalizeStoredScope({
       mode: "current_thread",
       accountIds: ["account-1"],
       messageIds: ["message-1", "message-2"],
     })).toEqual({ mode: "selected_account", accountIds: ["account-1"], messageIds: [] });
-    expect(internals.normalizeStoredScope({
+    expect(internals.engine.normalizeStoredScope({
       mode: "all_accounts",
       accountIds: ["account-1"],
       messageIds: [],
