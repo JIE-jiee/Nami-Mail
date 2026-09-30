@@ -1,4 +1,5 @@
 import net from "node:net";
+import { randomUUID } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { beforeAll, beforeEach, afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -194,9 +195,12 @@ describe("a process shutdown stops the syncs routes started", () => {
   });
 
   it("returns the create-account response immediately, then aborts the first sync on shutdown", async () => {
+    // Generated per run: the value only has to satisfy the request schema, and
+    // a fresh fake per run keeps the fixture free of credential literals.
+    const accountPassword = `test-password-${randomUUID()}`;
     const response = await postJson("/api/accounts/manual", {
       email: "someone@qq.com",
-      password: "app-specific-password",
+      password: accountPassword,
       imap: { host: "imap.qq.com", port: 993, transport: "tls" },
       smtp: { host: "smtp.qq.com", port: 465, transport: "tls" },
     });

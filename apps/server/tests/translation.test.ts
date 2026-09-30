@@ -1,4 +1,9 @@
+import { randomBytes } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+
+// Generated per run so the fixture carries no credential literal; the value
+// only has to prove that the configured key reaches the provider request.
+const testApiKey = `test-key-${randomBytes(12).toString("hex")}`;
 import {
   MAX_TRANSLATION_TEXT_LENGTH,
   MAX_TRANSLATION_RESPONSE_BYTES,
@@ -16,7 +21,7 @@ describe("translation service", () => {
     }), { status: 200, headers: { "content-type": "application/json" } }));
     const service = new TranslationService({
       endpoint: "https://translate.example.test/translate",
-      apiKey: "test-key",
+      apiKey: testApiKey,
       fetchImpl,
     });
 
@@ -34,7 +39,7 @@ describe("translation service", () => {
           source: "auto",
           target: "en",
           format: "text",
-          api_key: "test-key",
+          api_key: testApiKey,
         }),
       }),
     );

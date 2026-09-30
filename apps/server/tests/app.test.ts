@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import { request as httpRequest } from "node:http";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+
+// Generated per run so the fixture carries no credential literal; the value
+// only has to prove that the token header flows through to the routes.
+const desktopSessionToken = `desktop-session-${randomUUID()}`;
 import type { FastifyInstance } from "fastify";
 import sharp from "sharp";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -143,7 +148,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       masterKey: Buffer.alloc(32, 7),
       backgroundDirectory,
       agentService: agentService as never,
-    }, { localApiAccessToken: "desktop-session-token" });
+    }, { localApiAccessToken: desktopSessionToken });
     await streamingApp.listen({ host: "127.0.0.1", port: 0 });
     const address = streamingApp.server.address();
     if (!address || typeof address === "string") throw new Error("Expected a TCP listener.");
@@ -155,7 +160,7 @@ it("keeps an Agent stream running after the client closes its response", async (
           port: address.port,
           method: "POST",
           path: "/api/agent/conversations/conversation-1/messages",
-          headers: { "content-type": "application/json", "x-nami-api-token": "desktop-session-token" },
+          headers: { "content-type": "application/json", "x-nami-api-token": desktopSessionToken },
         }, (response) => {
           response.once("data", () => {
             client.destroy();
@@ -222,7 +227,7 @@ it("keeps an Agent stream running after the client closes its response", async (
         yield { type: "completed", reason: "stop" };
       });
 
-      const streamingApp = await buildApp({ db, masterKey: serviceMasterKey, backgroundDirectory, agentService }, { localApiAccessToken: "desktop-session-token" });
+      const streamingApp = await buildApp({ db, masterKey: serviceMasterKey, backgroundDirectory, agentService }, { localApiAccessToken: desktopSessionToken });
       await streamingApp.listen({ host: "127.0.0.1", port: 0 });
       const address = streamingApp.server.address();
       if (!address || typeof address === "string") throw new Error("Expected a TCP listener.");
@@ -234,7 +239,7 @@ it("keeps an Agent stream running after the client closes its response", async (
             port: address.port,
             method: "POST",
             path: `/api/agent/conversations/${conversation.id}/messages`,
-            headers: { "content-type": "application/json", "x-nami-api-token": "desktop-session-token" },
+            headers: { "content-type": "application/json", "x-nami-api-token": desktopSessionToken },
           }, (response) => {
             response.once("data", () => {
               // The user moved away from the assistant panel mid-generation.
@@ -257,7 +262,7 @@ it("keeps an Agent stream running after the client closes its response", async (
         let lastMessage: { role: string; content: string; state?: string } | undefined;
         let roles: string[] = [];
         while (Date.now() < deadline) {
-          const response = await streamingApp.inject({ method: "GET", url: `/api/agent/conversations/${conversation.id}`, headers: { "x-nami-api-token": "desktop-session-token" } });
+          const response = await streamingApp.inject({ method: "GET", url: `/api/agent/conversations/${conversation.id}`, headers: { "x-nami-api-token": desktopSessionToken } });
           const conversationSnapshot = response.json();
           roles = conversationSnapshot.messages.map((message: { role: string }) => message.role);
           lastMessage = conversationSnapshot.messages[conversationSnapshot.messages.length - 1];
@@ -508,7 +513,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       db,
       masterKey: Buffer.alloc(32, 7),
       backgroundDirectory,
-    }, { localApiAccessToken: "desktop-session-token" });
+    }, { localApiAccessToken: desktopSessionToken });
     try {
       const health = await protectedApp.inject({ method: "GET", url: "/api/health" });
       const unauthorized = await protectedApp.inject({ method: "GET", url: "/api/accounts" });
@@ -520,7 +525,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       const authorized = await protectedApp.inject({
         method: "GET",
         url: "/api/accounts",
-        headers: { "x-nami-api-token": "desktop-session-token" },
+        headers: { "x-nami-api-token": desktopSessionToken },
       });
       const oauthCallback = await protectedApp.inject({
         method: "GET",
@@ -530,7 +535,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       expect(health.statusCode).toBe(200);
       expect(unauthorized.statusCode).toBe(401);
       expect(unauthorized.json()).toMatchObject({ ok: false, code: "local_api_unauthorized" });
-      expect(unauthorized.body).not.toContain("desktop-session-token");
+      expect(unauthorized.body).not.toContain(desktopSessionToken);
       expect(wrongToken.statusCode).toBe(401);
       expect(authorized.statusCode).toBe(200);
       expect(oauthCallback.statusCode).not.toBe(401);
@@ -608,12 +613,12 @@ it("keeps an Agent stream running after the client closes its response", async (
       db,
       masterKey: Buffer.alloc(32, 7),
       backgroundDirectory,
-    }, { localApiAccessToken: "desktop-session-token" });
+    }, { localApiAccessToken: desktopSessionToken });
     try {
       const authorized = await protectedApp.inject({
         method: "GET",
         url: "/api/accounts",
-        headers: { host: `evil.example:${config.port}`, "x-nami-api-token": "desktop-session-token" },
+        headers: { host: `evil.example:${config.port}`, "x-nami-api-token": desktopSessionToken },
       });
       const missingToken = await protectedApp.inject({
         method: "GET",

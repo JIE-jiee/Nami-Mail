@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -132,6 +133,10 @@ describe("selected message translation route", () => {
   });
 
   it("protects translation status and requests with the desktop session capability", async () => {
+    // Generated per run so the fixture carries no credential literal; both
+    // sides read the same variable, so the header/buildApp pairing is what's
+    // under test.
+    const sessionToken = `translation-session-${randomBytes(12).toString("hex")}`;
     await app.close();
     app = await buildApp({
       db,
@@ -141,7 +146,7 @@ describe("selected message translation route", () => {
         endpoint: "https://translate.example.test/translate",
         fetchImpl,
       }),
-    }, { localApiAccessToken: "translation-session-token" });
+    }, { localApiAccessToken: sessionToken });
 
     const unauthorizedStatus = await app.inject({ method: "GET", url: "/api/translation/status" });
     const unauthorizedTranslate = await app.inject({
@@ -152,18 +157,18 @@ describe("selected message translation route", () => {
     const authorizedStatus = await app.inject({
       method: "GET",
       url: "/api/translation/status",
-      headers: { "x-nami-api-token": "translation-session-token" },
+      headers: { "x-nami-api-token": sessionToken },
     });
     const authorizedTranslate = await app.inject({
       method: "POST",
       url: "/api/messages/message-translation/translate",
-      headers: { "x-nami-api-token": "translation-session-token" },
+      headers: { "x-nami-api-token": sessionToken },
       payload: { targetLocale: "zh-CN" },
     });
 
     expect(unauthorizedStatus.statusCode).toBe(401);
     expect(unauthorizedTranslate.statusCode).toBe(401);
-    expect(unauthorizedTranslate.body).not.toContain("translation-session-token");
+    expect(unauthorizedTranslate.body).not.toContain(sessionToken);
     expect(authorizedStatus.json()).toEqual({ enabled: true });
     expect(authorizedTranslate.statusCode).toBe(200);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -171,17 +176,18 @@ describe("selected message translation route", () => {
 
   it("protects translation configuration requests and allows the PUT preflight", async () => {
     await app.close();
+    const configurationToken = `translation-configuration-${randomBytes(12).toString("hex")}`;
     app = await buildApp({
       db,
       masterKey: Buffer.alloc(32, 9),
       outboundAttachmentDirectory: outboundDirectory,
-    }, { localApiAccessToken: "translation-configuration-token" });
+    }, { localApiAccessToken: configurationToken });
 
     const unauthorizedRead = await app.inject({ method: "GET", url: "/api/translation/configuration" });
     const authorizedRead = await app.inject({
       method: "GET",
       url: "/api/translation/configuration",
-      headers: { "x-nami-api-token": "translation-configuration-token" },
+      headers: { "x-nami-api-token": configurationToken },
     });
     const unauthorizedWrite = await app.inject({
       method: "PUT",
@@ -191,7 +197,7 @@ describe("selected message translation route", () => {
     const authorizedWrite = await app.inject({
       method: "PUT",
       url: "/api/translation/configuration",
-      headers: { "x-nami-api-token": "translation-configuration-token" },
+      headers: { "x-nami-api-token": configurationToken },
       payload: { endpoint: "https://translate.example.test/translate" },
     });
     const unauthorizedDelete = await app.inject({ method: "DELETE", url: "/api/translation/configuration" });
@@ -256,7 +262,8 @@ describe("selected message translation route", () => {
       masterKey: Buffer.alloc(32, 9),
       outboundAttachmentDirectory: outboundDirectory,
     });
-    const apiKey = "reader-configuration-secret";
+    // Generated per run so the fixture carries no credential literal.
+    const apiKey = `reader-secret-${randomBytes(12).toString("hex")}`;
     const endpoint = "https://translate.example.test/translate";
 
     const saved = await app.inject({
