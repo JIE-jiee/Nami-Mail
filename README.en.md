@@ -66,7 +66,7 @@ See [Windows installation and updates](docs/INSTALLING.en.md) for first installa
 
 ## Run from Source
 
-Node.js 22.14.0 or newer is required.
+Node.js 24.21.0 or newer is required (the same major as the Node runtime bundled with Electron 43).
 
 ```powershell
 # Run these commands from the project root.

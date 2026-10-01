@@ -66,7 +66,7 @@ Nami Mail 是一个本地优先的多账户 Windows 桌面邮件客户端。它�
 
 ## 运行
 
-需要 Node.js 22.14.0 或更高版本。
+需要 Node.js 24.21.0 或更高版本（与 Electron 43 内置的 Node 24 同主版本）。
 
 ```powershell
 # 在本项目根目录执行

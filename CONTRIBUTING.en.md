@@ -13,7 +13,7 @@ Thank you for helping improve Nami Mail. This project handles real email, accoun
 
 ## Local Development
 
-The project requires Node.js 22.14.0 or later. Run the following from the repository root:
+The project requires Node.js 24.21.0 or later (the same major as the Node runtime bundled with Electron 43). Run the following from the repository root:
 
 ```powershell
 npm.cmd ci
