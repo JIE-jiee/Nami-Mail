@@ -649,7 +649,7 @@ test("release workflow isolates read-only validation from credential-minimized p
     const setupNode = workflow.jobs[jobName].steps.find(
       (step) => step.uses === "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
     );
-    assert.equal(setupNode.with["node-version"], "22.14.0", `${jobName} must use the supported Node.js minimum.`);
+    assert.equal(setupNode.with["node-version"], "24.21.0", `${jobName} must use the supported Node.js minimum.`);
   }
   const packageStep = workflow.jobs.release.steps.find((step) => step.run === "npm run publish:github");
   const diagnosticsStep = workflow.jobs.release.steps.find(
@@ -719,7 +719,7 @@ test("pull request validation runs the release gate without write credentials", 
   const setupNode = workflow.jobs.validate.steps.find(
     (step) => step.uses === "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
   );
-  assert.equal(setupNode.with["node-version"], "22.14.0", "Pull-request validation must use the supported Node.js minimum.");
+  assert.equal(setupNode.with["node-version"], "24.21.0", "Pull-request validation must use the supported Node.js minimum.");
   assert.ok(
     workflow.jobs.validate.steps.some(
       (step) => step.uses === "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",

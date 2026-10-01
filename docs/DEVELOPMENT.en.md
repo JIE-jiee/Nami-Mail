@@ -6,7 +6,7 @@ This guide is for contributors who build, test, or modify Nami Mail locally. The
 
 ## Prerequisites
 
-- Node.js 22.14.0 or later.
+- Node.js 24.21.0 or later (Electron 43 bundles Node 24, and CI validates this same floor).
 - Windows, required to build an NSIS installer and verify Electron paths.
 - A test account and app-specific password/authorization code for real mail verification. Do not use a primary password or write credentials into code, tests, screenshots, or commits.
 

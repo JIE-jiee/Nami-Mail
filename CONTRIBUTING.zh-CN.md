@@ -13,7 +13,7 @@
 
 ## 本地开发
 
-项目要求 Node.js 22.14.0 或更高版本。在项目根目录执行：
+项目要求 Node.js 24.21.0 或更高版本（与 Electron 43 内置的 Node 24 同主版本）。在项目根目录执行：
 
 ```powershell
 npm.cmd ci

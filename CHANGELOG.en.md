@@ -22,6 +22,7 @@
 
 ### Changed
 
+- Toolchain: the Node floor moves from 22.14 to 24.21 (LTS) — Electron 43 bundles Node 24.17, so CI's 22 window sat two majors behind production (which already produced one "green locally, red in CI" surprise); validation now matches the shipped runtime. The release-policy guard and the development/releasing docs move with it.
 - Microsoft mailbox access is now labeled "not yet available in this build" (waiting on an embedded public client ID, see Issue #116 and the roadmap); advanced users can follow the guide for a one-time manual setup.
 - The server reserves built-in public client ID constants for Google/Microsoft (environment variables win); once embedded, users sign in with zero configuration.
 - Removed the automated wiki sync workflow: the default GITHUB_TOKEN cannot reach the wiki repository, so syncing is done manually with `scripts/wiki-sync.mjs`; the wiki home template gained a project overview. (#97/#98)
