@@ -54,6 +54,7 @@ import {
   UserRound,
 } from "lucide-react";
 import { AgentMark } from "./AgentMark";
+import { MailTextBody } from "./MailTextBody";
 import { CustomAvatar, SenderAvatar } from "./SenderAvatar";
 import { WindowBar } from "./WindowBar";
 import { ApiError, api, type BatchJobCreatePayload, type BatchJobQuery, type BatchJobSnapshot, type MoveTarget } from "./api";
@@ -77,7 +78,7 @@ import { resolveScrollAnchor, type ScrollAnchorRow } from "./scrollAnchor";
 import { buildForwardDraft, buildReplyDraft, isOwnSentMessage } from "./mailActions";
 // ComposeModal loaded lazily below
 import { sortMessages } from "./mailImportance";
-import { groupMessagesByThread, mergeThreadMembers, mergeThreadSnapshot, shouldCollapseThread, sortThreadByTimeline, type ThreadSnapshot } from "./threads";
+import { collapseDuplicateMembers, groupMessagesByThread, mergeThreadMembers, mergeThreadSnapshot, shouldCollapseThread, sortThreadByTimeline, type ThreadSnapshot } from "./threads";
 import { ErrorBoundary } from "./ErrorBoundary";
 import {
   applyBatchSeenChange as applyBatchSeenChangeState,
@@ -115,6 +116,7 @@ import { playNotificationSound, primeNotificationSound } from "./sounds";
 import { saveLocalePreference } from "./localePreference";
 import { getAccountDisplayName, useAccountDisplayNames } from "./accountDisplayNameStore";
 import { loadFolderDisplayMode, saveFolderDisplayMode, type FolderDisplayMode } from "./folderDisplayMode";
+import { shouldShowLoading, type MailboxSelection } from "./folderNavigation";
 import { createSettingsLoadCoordinator } from "./settingsLoadCoordinator";
 import TranslationPanel, { type TranslationAvailability, type TranslationContent, type TranslationPanelState } from "./TranslationPanel";
 import { applyMailTranslation, extractMailTextSegments, isMailMatchingLocale } from "./mailDomTranslation";
@@ -1661,7 +1663,7 @@ await refreshSubmissions(nextAccounts, { silent: true });
     ? threadExtras.members
     : [];
   const selectedThread = selected
-    ? sortThreadByTimeline(mergeThreadMembers(threadById.get(selected.id) ?? [], threadExtrasForSelected))
+    ? collapseDuplicateMembers(sortThreadByTimeline(mergeThreadMembers(threadById.get(selected.id) ?? [], threadExtrasForSelected)), selected.id)
     : null;
   useEffect(() => {
     if (!selectedThread) return;
@@ -3430,16 +3432,25 @@ const emptyMessageList = useMemo(() => (query.trim()
     }
   }, [load, openMessage, showToast, t]);
 
+  /**
+   * Enter the loading phase for a sidebar navigation — but only when the target
+   * is a genuinely different list. One effect keyed on `load` drives the reload
+   * and only `load`'s finally clears the flag, so a click that does not move
+   * the selection raises one nothing can lower. See folderNavigation.ts. */
+  const beginNavigation = useCallback((next: MailboxSelection) => {
+    if (shouldShowLoading({ accountId: selectedAccount, folder: selectedFolder, view }, next)) setLoading(true);
+  }, [selectedAccount, selectedFolder, view]);
+
   const chooseView = useCallback((next: MailView) => {
     viewRef.current = next;
     clearUnreadViewRecentlyRead();
-    setLoading(true);
+    beginNavigation({ accountId: selectedAccount, folder: "", view: next });
     setView(next);
     setSelectedFolder("");
     setSelectedId(null);
     setRecipientDetailsOpen(false);
     actions.closeMobileSidebar();
-  }, [actions, clearUnreadViewRecentlyRead]);
+  }, [actions, beginNavigation, clearUnreadViewRecentlyRead, selectedAccount]);
 
   // Latest handlers for the desktop-bridge subscribers below, read at call time.
   // The subscriptions are installed once (their deps are effectively empty),
@@ -3773,7 +3784,7 @@ const emptyMessageList = useMemo(() => (query.trim()
   const chooseFolder = (path: string) => {
     viewRef.current = "inbox";
     clearUnreadViewRecentlyRead();
-    setLoading(true);
+    beginNavigation({ accountId: selectedAccount, folder: path, view: "inbox" });
     setSelectedFolder(path);
     setView("inbox");
     setSelectedId(null);
@@ -3839,7 +3850,7 @@ const emptyMessageList = useMemo(() => (query.trim()
 
           <div className="accounts-heading"><span>{t("mail.accounts")}</span><span className="accounts-heading-actions"><IconButton label={folderDisplayMode === "tree" ? t("mail.folderMode.switchToFocused") : t("mail.folderMode.switchToTree")} onClick={() => setFolderDisplayMode(folderDisplayMode === "tree" ? "focused" : "tree")}><span className="folder-mode-icon" data-mode={folderDisplayMode} aria-hidden="true"><FolderTree size={16} className="folder-mode-tree" /><Focus size={16} className="folder-mode-focused" /></span></IconButton><IconButton label={t("account.add")} onClick={() => { actions.closeMobileSidebar(); actions.openAddAccount(); }}><Plus size={16} /></IconButton></span></div>
           <div className="account-list" data-folder-mode={folderDisplayMode} ref={accountListRef}>
-            <button aria-pressed={selectedAccount === "all"} className={selectedAccount === "all" ? "active" : ""} onClick={() => { clearUnreadViewRecentlyRead(); setLoading(true); setSelectedAccount("all"); setAccountsExpanded(false); setSelectedFolder(""); setSelectedId(null); setRecipientDetailsOpen(false); actions.closeMobileSidebar(); }}><span className="account-avatar all"><Layers3 size={14} /></span><span className="account-copy"><strong>{t("mail.allAccounts")}</strong><small>{t("mail.accountCount", { count: accounts.length })}</small></span></button>
+            <button aria-pressed={selectedAccount === "all"} className={selectedAccount === "all" ? "active" : ""} onClick={() => { clearUnreadViewRecentlyRead(); beginNavigation({ accountId: "all", folder: "", view }); setSelectedAccount("all"); setAccountsExpanded(false); setSelectedFolder(""); setSelectedId(null); setRecipientDetailsOpen(false); actions.closeMobileSidebar(); }}><span className="account-avatar all"><Layers3 size={14} /></span><span className="account-copy"><strong>{t("mail.allAccounts")}</strong><small>{t("mail.accountCount", { count: accounts.length })}</small></span></button>
             {accounts.map((account) => {
               const issue = accountIssues.get(account.id);
               const providerName = localizedProviderName(account);
@@ -3854,7 +3865,7 @@ const emptyMessageList = useMemo(() => (query.trim()
               const foldersOpen = folderDisplayMode === "tree" && expandedAccountIds.has(account.id) && account.folders.length > 0;
               const selectAccount = () => {
                 clearUnreadViewRecentlyRead();
-                setLoading(true);
+                beginNavigation({ accountId: account.id, folder: "", view });
                 setSelectedAccount(account.id);
                 setAccountsExpanded(false);
                 setSelectedFolder("");
@@ -4219,10 +4230,9 @@ const emptyMessageList = useMemo(() => (query.trim()
                   onCancel={cancelTranslation}
                 />
                 )}
-                <div className="mail-content">
-                  {selected.htmlBody
-                    ? <div className="mail-html" dangerouslySetInnerHTML={{ __html: readerHtml }} />
-                    : <div className="mail-text">{readerTextParts.quote ? (<>{readerTextParts.body}<button type="button" className="mail-quote-toggle" onClick={() => setQuotedExpanded(true)}>{t("mail.reader.showQuoted")}</button></>) : readerTextSource}</div>}
+                <div className="mail-content">{selected.htmlBody
+                  ? <div className="mail-html" dangerouslySetInnerHTML={{ __html: readerHtml }} />
+                  : <div className="mail-text"><MailTextBody body={readerTextParts.quote ? readerTextParts.body : readerTextSource} suffix={readerTextParts.quote ? <button type="button" className="mail-quote-toggle" onClick={() => setQuotedExpanded(true)}>{t("mail.reader.showQuoted")}</button> : null} /></div>}
                 </div>
                 {visibleAttachments.length > 0 && (
                   <section className="attachment-list" aria-label={t("mail.attachment.aria", { count: visibleAttachments.length })}>

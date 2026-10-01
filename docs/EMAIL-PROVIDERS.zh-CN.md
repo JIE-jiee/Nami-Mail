@@ -44,10 +44,12 @@ Nami Mail 只会将凭据用于直接连接你选择的邮箱服务商。凭据�
 Nami Mail 同样完整内置了 Google 和 Microsoft 的 OAuth 2.0 PKCE 登录能力。OAuth 使用公共客户端和本机回环回调，不需要也不接受 client secret。
 
 - **Google**：使用 Google Cloud 的 Desktop app 客户端 ID。如在未配置全局 Client ID 的版本中使用，点击切换到 OAuth 会显示当前未配置，用户可直接使用上述 16 位应用密码登录，或由开发者在环境中注入 Client ID。
-- **Microsoft**：使用 Microsoft Entra 的 Mobile and desktop applications / public client 配置。组织账号如提示 IMAP 或权限限制，需要管理员启用相应能力。
+- **Microsoft**：使用 Microsoft Entra 的**移动和桌面应用程序**平台登记（Electron 应用即属此平台），添加自定义重定向 URI `http://localhost/api/oauth/microsoft/callback`——路径必须与实际回调完全一致。本地服务端口每次启动动态分配，而微软对 localhost 回环重定向 URI **忽略端口匹配**（官方规则：回环 URI 靠路径区分多个用途，如 `http://localhost/MyWebApp` 与 `http://localhost/MyNativeApp` 互不匹配），因此带路径的自定义 URI 在任意端口下都能匹配。两个易错点：只登记平台自动生成的**不带路径** `http://localhost` 会与实际回调不一致，报 `AADSTS50011`；选 **Web** 平台则要求精确匹配端口，安装版动态端口下必然失败。应用侧的「支持的账户类型」需要包含个人 Microsoft 账户（outlook.com/hotmail），否则个人账号登录会报 `AADSTS50020`。个人账户还需先在 Outlook.com 的设置中启用 IMAP/POP 才能收取邮件；组织账号如提示 IMAP 或权限限制，需要管理员启用相应能力，其中**发信**还要管理员在 Microsoft 365 管理中心为该邮箱启用 Authenticated SMTP（SMTP AUTH），否则会发送失败。Microsoft 已永久停用 Basic Auth，没有 16 位应用专用密码可填，Microsoft 账号只能走 OAuth。
 - **OAuth 与密码切换**：界面支持在应用专用密码与 OAuth 授权之间一键平滑切换。
 
 开发者配置回调、client ID 和租户的方式见 [README.en.md](../README.en.md#oauth-configuration) 的 OAuth 配置章节。普通用户不应把 client secret 写入 `nami-mail.env`、Issue、日志或截图。
+
+Microsoft 侧的依据见 [重定向 URI 文档](https://learn.microsoft.com/entra/identity-platform/reply-url)、[授权码流程文档](https://learn.microsoft.com/entra/identity-platform/v2-oauth2-auth-code-flow)、[OIDC 协议文档](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc)、[Exchange Online 停用 Basic Auth 公告](https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online)、[Exchange Online 的 POP3 与 IMAP4 说明](https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/pop3-and-imap4/pop3-and-imap4)与[启用或禁用 SMTP AUTH](https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/authenticated-client-smtp-submission)（本节口径核对日期：2026-01-09）。
 
 ## 手动 IMAP / SMTP 配置
 

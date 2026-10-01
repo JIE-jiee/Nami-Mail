@@ -359,6 +359,84 @@ export function splitQuotedMailText(text: string): { body: string; quote: string
   };
 }
 
+/** One run of a plain-text body: literal prose, or a linkable http(s) URL. */
+export type BodyTextPart = { kind: "text" | "link"; text: string; href?: string };
+
+/**
+ * Characters a bare URL may be built from — RFC 3986's unreserved set plus the
+ * sub-delims and gen-delims real links use. Deliberately ASCII-only: anything
+ * outside it (whitespace, CJK, full-width punctuation, angle and double quotes)
+ * is prose and must never be swallowed, which is what keeps the URL half of
+ * `https://host/pull/12已合并` linkified and the Chinese half as text.
+ */
+const URL_CHARACTERS = "A-Za-z0-9\\-._~:/?#\\[\\]@!$&'()*+,;=%";
+/** The `(?<![\w])` guard keeps `xhttps://…` out: an ASCII word character right
+ *  in front of the scheme means the match is the tail of a longer token, not a
+ *  URL a reader can click. CJK is not `\w`, so adjacency to Chinese still links. */
+const BARE_LINK_SOURCE = `(?<![\\w])https?://[${URL_CHARACTERS}]+`;
+
+/** Sentence punctuation that follows a URL in prose but belongs to the prose. */
+const TRAILING_LINK_PUNCTUATION = new Set([".", ",", ";", ":", "!", "?", "'", "\"", ")", "]"]);
+
+/** True when every closer in `url` was opened, so a trailing `)`/`]` is part of
+ *  the URL (`https://host/wiki/Foo_(bar)`) rather than the sentence around it. */
+function closesOnlyOpened(value: string, closer: string, opener: string): boolean {
+  let balance = 0;
+  for (const char of value) {
+    if (char === opener) balance += 1;
+    else if (char === closer) balance -= 1;
+  }
+  return balance >= 0;
+}
+
+function trimLinkTail(url: string): string {
+  let end = url.length;
+  while (end > 0) {
+    const char = url[end - 1]!;
+    if (!TRAILING_LINK_PUNCTUATION.has(char)) break;
+    const opener = char === ")" ? "(" : char === "]" ? "[" : "";
+    if (opener && closesOnlyOpened(url.slice(0, end), char, opener)) break;
+    end -= 1;
+  }
+  return url.slice(0, end);
+}
+
+/**
+ * Splits a plain-text body into prose runs and bare http(s) links. The reader
+ * typesets the plain-text path as prose (`white-space:pre-wrap`, no markup), so
+ * before this a URL was neither clickable nor distinguishable from the sentence
+ * around it — the exact shape of a Dependabot notification.
+ *
+ * Only http/https linkifies: `javascript:`, `data:`, `file:` and `mailto:` are
+ * a hard no, so a hostile body cannot get an executable scheme into an href.
+ * A single pass, and every other character is copied through verbatim — the
+ * parts always join back into the exact input, so no blank line, tab or
+ * full-width mark can be lost on the way to the DOM.
+ */
+export function splitBodyLinks(text: string): BodyTextPart[] {
+  if (!text) return [];
+  const parts: BodyTextPart[] = [];
+  const pushText = (value: string): void => {
+    if (!value) return;
+    const last = parts[parts.length - 1];
+    if (last?.kind === "text") last.text += value;
+    else parts.push({ kind: "text", text: value });
+  };
+  const pattern = new RegExp(BARE_LINK_SOURCE, "gi");
+  let cursor = 0;
+  for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+    const href = trimLinkTail(match[0]);
+    // A scheme with no authority ("https://", or one trimmed down to it) is not
+    // a link. Leaving the cursor alone keeps those characters as prose.
+    if (href.length <= match[0].indexOf("//") + 2) continue;
+    pushText(text.slice(cursor, match.index));
+    parts.push({ kind: "link", text: href, href });
+    cursor = match.index + href.length;
+  }
+  pushText(text.slice(cursor));
+  return parts;
+}
+
 export function replyBody(message: Message, accounts: readonly Account[], locale: string, t: Translate, safeHtml: string): string {
   const signature = accounts.find((account) => account.id === message.accountId)?.signature ?? "";
   const body = message.textBody || textFromSanitizedMailHtml(safeHtml) || message.snippet;

@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { z } from "zod";
 import {
   AgentService,
   AgentServiceError,
@@ -8,6 +9,7 @@ import {
   type AgentProviderInput,
 } from "../agent-service.js";
 import { EncryptedAgentMemoryStore } from "../agent/memory.js";
+import { MAX_POLISH_TEXT_LENGTH } from "../agent/writing-polish.js";
 import { getAutoReplyEngine } from "../agent/auto-reply.js";
 import { autoReplyDecisionReasons, type AutoReplyDecisionReason } from "../agent/auto-reply-decisions.js";
 import { agentMemoryPatchSchema } from "@nami/agent-contracts";
@@ -50,6 +52,18 @@ function agentFailure(reply: { code: (statusCode: number) => { send: (body: unkn
   }
   return reply.code(500).send({ ok: false, code: ROUTE_ERROR_CODES.agent_internal, message: "Agent 本地服务未能完成请求，请稍后重试。", retryable: true });
 }
+
+/**
+ * Declared next to its route, as `routes/translation.ts` does for its own
+ * bodies: this shape exists for one endpoint and its cap is the one that
+ * endpoint enforces, so keeping the two together is what stops them drifting.
+ * Over-long bodies fail here (400 `invalid_argument`) and never reach the
+ * model call.
+ */
+const polishBodySchema = z.object({
+  text: z.string().trim().min(1).max(MAX_POLISH_TEXT_LENGTH, "正文过长，无法润色。"),
+  locale: z.string().trim().min(2).max(32).optional(),
+}).strict();
 
 export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps): void {
   const { context, agentService, memoryStore } = deps;
@@ -171,6 +185,39 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
     if (!agentService) return reply.code(503).send({ ok: false, code: ROUTE_ERROR_CODES.agent_unavailable, message: "Agent 服务当前不可用。" });
     try {
       return agentService.verifyRag();
+    } catch (error) {
+      return agentFailure(reply, error);
+    }
+  });
+
+  /**
+   * Language-only polish of the body the user is composing. A host-initiated
+   * model call with no conversation and no tools: `polishDraft` reaches the
+   * default provider through the same runtime seam every other auxiliary chat
+   * uses, so this route opens no connection of its own.
+   *
+   * "No model configured" is answered here rather than from the service
+   * because it is the one outcome the renderer must be able to tell apart from
+   * a real failure: the compose window uses it to offer configuration advice
+   * instead of an error toast. `providerList()` already reports a null
+   * `defaultProviderId` unless that provider is fully configured, so this test
+   * is the same question the service asks a moment later.
+   */
+  app.post("/api/agent/polish", async (request, reply) => {
+    if (!agentService) return reply.code(503).send({ ok: false, code: ROUTE_ERROR_CODES.agent_unavailable, message: "Agent 服务当前不可用。" });
+    const parsed = polishBodySchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
+    if (!agentService.providerList().defaultProviderId) {
+      return reply.code(409).send({ ok: false, code: ROUTE_ERROR_CODES.no_model_configured, message: "该功能需要配置模型。" });
+    }
+    const controller = new AbortController();
+    request.raw.once("aborted", () => controller.abort());
+    try {
+      const result = await agentService.polishDraft({
+        text: parsed.data.text,
+        ...(parsed.data.locale ? { locale: parsed.data.locale } : {}),
+      }, { signal: controller.signal });
+      return { ok: true as const, text: result.text };
     } catch (error) {
       return agentFailure(reply, error);
     }

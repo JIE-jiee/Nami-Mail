@@ -337,6 +337,40 @@ describe("row quick actions reveal", () => {
   });
 });
 
+describe("conversation count badge", () => {
+  it("does not count the folder copies of one message twice", () => {
+    // The store keeps a row per (account, mailbox, uid), so a mail filed in the
+    // inbox *and* a label is two rows sharing one Message-ID. groupMessagesByThread
+    // unions them into one thread of two, and the badge used to read that row
+    // count — claiming a conversation of 2 for a single message.
+    const copies = [
+      message({ id: "inbox-row", mailbox: "INBOX", messageId: "<plan@example.com>" }),
+      message({ id: "label-row", mailbox: "Projects", messageId: "<plan@example.com>" }),
+    ];
+    const threadById = new Map(copies.map((row) => [row.id, copies]));
+
+    const html = renderList({ messages: copies, threadById });
+
+    // One message, so the badge has nothing to add.
+    expect(html.querySelectorAll(".thread-count-badge")).toHaveLength(0);
+  });
+
+  it("still shows the badge for a conversation that really holds two messages", () => {
+    const conversation = [
+      message({ id: "root", messageId: "<plan@example.com>", sentAt: "2026-08-10T09:00:00.000Z" }),
+      message({ id: "reply", messageId: "<re-plan@example.com>", inReplyTo: "<plan@example.com>", sentAt: "2026-08-10T09:05:00.000Z" }),
+    ];
+    const threadById = new Map(conversation.map((row) => [row.id, conversation]));
+
+    const html = renderList({ messages: conversation, threadById });
+
+    const badges = html.querySelectorAll(".thread-count-badge");
+    expect(badges).toHaveLength(2);
+    expect(badges[0]!.textContent).toContain("2");
+    expect(badges[0]!.getAttribute("aria-label")).toBe(zh("mail.thread.count", { count: 2 }));
+  });
+});
+
 describe("mail reader title wrapping", () => {
   const stylesheet = readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8").replace(/\r\n/g, "\n");
 
@@ -366,6 +400,16 @@ describe("mail reader title wrapping", () => {
     }
     const prose = stylesheet.match(/\.mail-text\n\{[^}]*\}/)?.[0] ?? "";
     expect(prose, ".mail-text").toContain("max-width:var(--measure)");
+    // Reading-grade type. The measure stays a token derived from the 16px body
+    // face (designTokens.test.ts guards that pairing), so the room this batch
+    // bought for long-form prose is the leading: the shared 1.7 is tuned for
+    // mixed HTML prose and reads cramped across a full text column.
+    expect(prose, ".mail-text").toContain("line-height:1.75");
+    const shared = stylesheet.match(/\.mail-text,\.mail-html\n\{[^}]*\}/)?.[0] ?? "";
+    expect(shared, ".mail-text,.mail-html").toContain("font-size:16px");
+    // The extra leading must stay on the plain-text path, so a provider's HTML
+    // mail — which brings its own layout — is untouched.
+    expect(shared, ".mail-text,.mail-html").toContain("line-height:1.7");
   });
 
   it("keeps the recipient line ellipsized instead of wrapping", () => {

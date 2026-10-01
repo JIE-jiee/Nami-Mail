@@ -19,6 +19,7 @@ import {
   type MailErrorCode,
 } from "./mail.js";
 import { detectProvider, loginUsername, resolveProvider, type DetectedProvider } from "./providers.js";
+import { serverLog } from "./logging.js";
 import type { AccountRecord } from "./types.js";
 
 export type OAuthProviderId = "google" | "microsoft";
@@ -477,7 +478,14 @@ export class OAuthService implements AccountAccessTokenProvider {
       const configured = providerConfig(provider);
       const { tokens } = await this.callbackTokens(configured, attempt, callbackUrl);
       const refreshToken = typeof tokens.refresh_token === "string" ? tokens.refresh_token : undefined;
-      if (!refreshToken) throw new OAuthError("oauth_failed", "服务商没有提供离线刷新授权，请重新授权并允许长期访问。" );
+      if (!refreshToken) {
+        // A first authorization that returns no refresh token is the usual root
+        // cause of "signed in, then signed out later": the account is created
+        // without a renewable credential. Only the provider id is logged; no
+        // token material ever reaches the log line.
+        serverLog.warn({ provider }, "OAuth token response contained no refresh token");
+        throw new OAuthError("oauth_failed", "服务商没有提供离线刷新授权，请重新授权并允许长期访问。" );
+      }
       const identity = this.identityFromTokens(provider, tokens);
       const account = await this.persistAccount(provider, identity, refreshToken);
       const expiresIn = typeof tokens.expires_in === "number" ? tokens.expires_in : 3600;
@@ -590,6 +598,13 @@ export class OAuthService implements AccountAccessTokenProvider {
             account.id,
           );
         this.refreshTokenCache.delete(account.id);
+      } else {
+        // Microsoft normally keeps the existing refresh token valid instead of
+        // rotating it, so this is expected rather than a failure: the stored
+        // credential stays in use. Logged at info so a provider that stops
+        // rotating is still visible without a warn storm on every refresh.
+        // Only the provider id is logged; no token material reaches the line.
+        serverLog.info({ provider: provider.id }, "OAuth refresh response contained no new refresh token");
       }
       return tokens.access_token;
     } catch (error) {

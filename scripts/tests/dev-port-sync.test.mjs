@@ -25,9 +25,26 @@ test("dev ports stay pinned to the server's canonical PORT default", async () =>
   const serverPort = Number(serverPortMatch[1]);
 
   const viteConfig = await read("apps/web/vite.config.ts");
-  const proxyMatch = viteConfig.match(/"\/api":\s*"https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)"/);
+  // Both proxy shapes are in use: the bare string shorthand and an object
+  // (which the object form is required for, see the changeOrigin assertion
+  // below). Capture the port out of whichever one is present.
+  const proxyMatch = viteConfig.match(
+    /"\/api":\s*(?:"https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)"|\{\s*target:\s*"https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)")/,
+  );
   assert.ok(proxyMatch, "apps/web/vite.config.ts must proxy /api to the local API port.");
-  assert.equal(Number(proxyMatch[1]), serverPort, "The vite /api proxy must target the server's PORT default.");
+  const proxiedPort = Number(proxyMatch[1] ?? proxyMatch[2]);
+  assert.equal(proxiedPort, serverPort, "The vite /api proxy must target the server's PORT default.");
+
+  // The local API's token-less Host allowlist only accepts its own loopback
+  // authorities on the configured port. http-proxy forwards the browser's Host
+  // untouched by default, so without changeOrigin every /api request during
+  // `npm run dev` is answered with 403 local_api_forbidden_host — the proxy
+  // must rewrite Host to the target origin.
+  assert.match(
+    viteConfig,
+    /changeOrigin:\s*true/,
+    "apps/web/vite.config.ts must set changeOrigin: true on the /api proxy, or dev API calls are rejected as a foreign Host.",
+  );
 
   const stressRunner = await read("scripts/ui-stress/run-stress.mjs");
   const stressPortMatch = stressRunner.match(/const PORT = (\d+);/);

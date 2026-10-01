@@ -440,6 +440,25 @@ describe("AgentWorkspace conversation switching", () => {
     expect(h.onOpenMessage).toHaveBeenCalledWith("msg-ref-1");
   });
 
+  it("names the configured model by its display name and keeps the model id on hover", async () => {
+    await renderWorkspace();
+    // The fixture's provider label ("Local") and model id ("m") differ on
+    // purpose: the composer must present the name the user configured, not
+    // the raw model id it happens to be pointed at.
+    const modelButton = container.querySelector<HTMLButtonElement>(".agent-composer-model");
+    expect(modelButton).not.toBeNull();
+    const name = modelButton?.querySelector("span");
+    expect(name?.textContent).toBe("Local");
+    expect(name?.getAttribute("title")).toBe("m");
+
+    act(() => {
+      modelButton!.click();
+    });
+    const options = Array.from(container.querySelectorAll<HTMLElement>(".agent-model-option-name"));
+    expect(options.map((option) => option.textContent)).toContain("Local");
+    expect(options.every((option) => option.getAttribute("title") === "m")).toBe(true);
+  });
+
   it("types /@ to reveal the mention menu and introduces a mail as a reference chip", async () => {
     await renderWorkspace(h.bootstrap, referenceMessage, [accountOne, accountTwo]);
 

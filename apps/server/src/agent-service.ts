@@ -68,6 +68,7 @@ import { ImmutableGuiConfirmationStore, type TrustedDesktopConfirmationVerifier 
 import { AgentConfirmationLifecycle, type AgentConfirmationResolution } from "./agent/confirmation-lifecycle.js";
 import type { AutoReplyEvaluationInput, AutoReplyEvaluationResult } from "./agent/auto-reply.js";
 import { collectAuxiliaryChatText } from "./agent/auxiliary-chat.js";
+import { polishDraftWithProvider, type PolishDraftInput, type PolishDraftResult } from "./agent/writing-polish.js";
 import type { SupportedLocale } from "./localization.js";
 // 会话/运行域已抽至 agent/run-engine.ts；类型在此再导出以保持公共面不变。
 export type {
@@ -1003,6 +1004,11 @@ export class AgentService {
       throw new AgentServiceError("PROVIDER_ERROR", "The model returned an empty translation.", 502, true);
     }
     return { translatedText: trimmed };
+  }
+
+  /** Language-only polish of a compose body. The prompt, the consent boundary and the size cap all live in agent/writing-polish.ts. */
+  polishDraft(input: PolishDraftInput, options: { signal?: AbortSignal } = {}): Promise<PolishDraftResult> {
+    return polishDraftWithProvider({ runtime: this.runtime, providerService: this.providerService, ...input, ...options });
   }
 
   /**

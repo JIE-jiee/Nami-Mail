@@ -12,6 +12,7 @@ import { useDialogFocus } from "./hooks/useDialogFocus";
 import { usePopupExitTransition } from "./hooks/usePopupExitTransition";
 import { useDismissTransition } from "./hooks/useDismissTransition";
 import { useI18n } from "./i18n";
+import { ComposePolishControls, useComposePolish } from "./composePolish";
 import type { Account, Contact, MailTemplate, OutboundAttachment } from "./types";
 import { AttachmentFileIcon, formatFileSize, datetimeLocalFromDate, isoFromDatetimeLocal, IconButton, type ComposeDraft, type PendingAttachmentUpload, type ToastKind } from "./mailUi";
 
@@ -48,6 +49,7 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
   const [error, setError] = useState("");
   const [deliveryNotice, setDeliveryNotice] = useState("");
   const [sendAtLocal, setSendAtLocal] = useState("");
+  const polish = useComposePolish({ text, applyText: setText, notify: onSent, t });
   const [toSuggestions, setToSuggestions] = useState<Contact[]>([]);
   const [toSuggestionsOpen, setToSuggestionsOpen] = useState(false);
   const { mounted: toSuggestionsMounted, closing: toSuggestionsClosing, beginClose: beginToSuggestionsClose } = usePopupExitTransition(toSuggestionsOpen, () => setToSuggestionsOpen(false));
@@ -657,7 +659,7 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
           </div>
           <label className="compose-row" htmlFor="compose-subject"><span>{t("compose.subject")}</span><input id="compose-subject" type="text" value={subject} onChange={(event) => setSubject(event.target.value)} placeholder={t("compose.subjectPlaceholder")} disabled={busy || discarding} /></label>
           <label className="visually-hidden" htmlFor="compose-body">{t("compose.body")}</label>
-          <textarea id="compose-body" className="compose-body" value={text} onChange={(event) => setText(event.target.value)} placeholder={t("compose.bodyPlaceholder")} disabled={busy || discarding} />
+          <textarea id="compose-body" className={`compose-body${polish.polishing ? " is-polishing" : ""}`} value={text} onChange={(event) => setText(event.target.value)} placeholder={t("compose.bodyPlaceholder")} disabled={busy || discarding || polish.polishing} aria-busy={polish.polishing || undefined} />
           <section className="compose-attachments" aria-label={t("compose.attachment.aria", { count: attachmentSummary.attachedCount, status: attachmentStatus })}>
             <div className="compose-attachments-heading"><span><Paperclip size={16} />{t("compose.attachments")}</span><small aria-live="polite">{attachmentSummary.attachedCount} / 10{t("common.dotSeparator")}{formatFileSize(attachmentSummary.attachedBytes)}{attachmentStatus ? `${t("common.dotSeparator")}${attachmentStatus}` : ""}</small><button className="compose-attachment-add" type="button" onClick={chooseFiles} disabled={busy || uploading || discarding || !accountId}>{uploading ? <LoaderCircle className="spin" size={15} /> : <Paperclip size={15} />}{uploading ? t("compose.attachment.uploading") : t("compose.attachment.add")}</button></div>
             <input ref={fileInputRef} className="visually-hidden" type="file" tabIndex={-1} multiple onChange={(event) => void addFiles(event)} />
@@ -677,6 +679,7 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
           {error && <div id="compose-error" className="form-status error" role="alert"><X size={17} />{error}</div>}
           <footer className="compose-footer">
             <div className="compose-footer-tools">
+              <ComposePolishControls polish={polish} t={t} />
               <button className="secondary-button" type="button" disabled={busy || uploading || discarding || hasPendingUploads || !accountId} onClick={() => void saveDraft()}>{busy ? <LoaderCircle className="spin" size={17} /> : <FilePenLine size={17} />}{t("compose.saveDraft")}</button>
               <div className="compose-template-wrap">
                 <button className="secondary-button compose-template-toggle" type="button" disabled={busy || discarding} onClick={toggleTemplatePicker} aria-expanded={templatePickerOpen} aria-controls={templatePickerOpen ? "compose-template-picker" : undefined} aria-haspopup="listbox"><LayoutTemplate size={15} />{t("compose.templates")}</button>

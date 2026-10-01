@@ -2286,7 +2286,7 @@ export default function AgentWorkspace({ accounts, currentMessage, onClose, onOp
                 {hasConfiguredProvider && (
                   <div className="agent-composer-model-wrap" ref={modelPickerRef}>
                     <button type="button" className="agent-composer-model" onClick={() => setModelPickerOpen((open) => !open)} aria-expanded={modelPickerOpen} aria-haspopup="menu" aria-controls="agent-model-picker" aria-label={t("agent.provider.label")} disabled={streaming}>
-                      <span>{selectedProvider ? selectedProvider.model : ""}</span>
+                      <span title={selectedProvider?.model}>{selectedProvider ? selectedProvider.label : ""}</span>
                       <ChevronDown size={11} className={`agent-model-chevron${modelPickerOpen ? " open" : ""}`} aria-hidden="true" />
                     </button>
                     {modelPopover.mounted && (
@@ -2302,7 +2302,7 @@ export default function AgentWorkspace({ accounts, currentMessage, onClose, onOp
                               if (!isCurrent && active) setConversationProviders((prev) => ({ ...prev, [active.id]: provider.id }));
                               setModelPickerOpen(false);
                             }}>
-                              <span className="agent-model-option-name">{provider.model}</span>
+                              <span className="agent-model-option-name" title={provider.model}>{provider.label}</span>
                               {isCurrent && <Check size={13} className="agent-popover-option-check" />}
                             </button>
                           );

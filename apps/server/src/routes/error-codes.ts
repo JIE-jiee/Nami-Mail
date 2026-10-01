@@ -85,6 +85,12 @@ export const ROUTE_ERROR_CODE_DEFINITIONS = {
   // Agent.
   agent_unavailable: { status: 503, meaning: "No Agent service instance is present in this process." },
   agent_internal: { status: 500, meaning: "The Agent service failed outside its own error contract." },
+  // A model-backed feature the host offers on its own initiative (compose
+  // polish) asked for a call with no configured default model. It is a 409 and
+  // not a 404 because nothing is missing at the addressed URL: the user's
+  // configuration is in the wrong state for this request, and the renderer
+  // branches on this code to explain that instead of reporting a failure.
+  no_model_configured: { status: 409, meaning: "A model-backed feature was requested with no configured default model." },
   auto_reply_unavailable: { status: 503, meaning: "No auto-reply engine is present in this process." },
   confirmation_expired: { status: 409, meaning: "The auto-reply confirmation has expired." },
   confirmation_record_failed: { status: 409, meaning: "The auto-reply decision could not be recorded." },
