@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type CompositionEvent, type FormEvent, type RefObject } from "react";
 import {
-  BookOpen,
   Check,
   ChevronDown,
   ChevronRight,
@@ -15,24 +14,21 @@ import {
   Mailbox,
   Plus,
   ShieldCheck,
-  Wand2,
   X,
 } from "lucide-react";
 import { api } from "./api";
 import { desktopBridge } from "./desktop";
 import { mailErrorMessage, presentMailError } from "./errorPresentation";
 import { type Translate, useI18n } from "./i18n";
+import { oauthProviderFor, providerAuthMethods, resolveOAuthEntry, validEmail } from "./oauth-entry";
 import {
   CUSTOM_IMAP_PROVIDER_ID,
   fullCatalogProviders,
   localizedProviderOnboarding,
-  orderedProviderCatalog,
-  providerAuthLabel,
   providerDisplayName,
   providerIconUrl,
   providerMonogram,
   providerServerConfiguration,
-  quickProviderCatalog,
   serverEndpointLabel,
 } from "./providerOnboarding";
 import ThemedSelect from "./ThemedSelect";
@@ -41,7 +37,6 @@ import type {
   AccountDiscoveryResult,
   ManualAccountConfig,
   MailTransport,
-  OAuthProvider,
   ProviderDiscovery,
   ProviderInfo,
 } from "./types";
@@ -63,12 +58,7 @@ type AddAccountModalProps = {
   demoMode?: boolean;
 };
 
-const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DISCOVERY_DEBOUNCE_MS = 600;
-
-function validEmail(value: string): boolean {
-  return emailPattern.test(value.trim());
-}
 
 /**
  * Gmail-style plus addressing (`user+tag@gmail.com`) delivers into the same
@@ -129,19 +119,6 @@ export function computeEmailAfterProviderSelect(
 
 function emailDomain(value: string): string {
   return value.trim().toLowerCase().split("@")[1] ?? "";
-}
-
-function providerAuthMethods(provider?: ProviderInfo): string[] {
-  if (provider?.authMethods?.length) return provider.authMethods;
-  if (provider?.id === "gmail") return ["app-password", "oauth2"];
-  if (provider?.id === "microsoft") return ["oauth2"];
-  return ["app-password"];
-}
-
-function oauthProviderFor(provider: Pick<ProviderDiscovery, "id" | "family">): OAuthProvider | undefined {
-  if (provider.id === "gmail" || provider.family === "google") return "google";
-  if (provider.id === "microsoft" || provider.family === "microsoft") return "microsoft";
-  return undefined;
 }
 
 function providerFallback(provider: ProviderInfo | undefined, domain: string, t: Translate): ProviderDiscovery | undefined {
@@ -218,6 +195,38 @@ function friendlyError(error: unknown, t: Translate): string {
 
 function serverModeLabel(transport: MailTransport): string {
   return transport === "tls" ? "TLS/SSL" : "STARTTLS";
+}
+
+/** Netease family portals: yeah/188/VIP users must not be dropped on the 163/126 hubs. */
+export function neteasePortalUrl(domain: string): string {
+  const value = domain.toLowerCase();
+  if (value.includes("yeah")) return "https://www.yeah.net/";
+  if (value.includes("188")) return "https://www.188.com/";
+  if (value.includes("vip.126")) return "https://vip.126.com/";
+  if (value.includes("vip.163")) return "https://vip.163.com/";
+  return value.includes("126") ? "https://mail.126.com" : "https://mail.163.com";
+}
+
+/**
+ * App passwords (Gmail/iCloud) are commonly pasted in grouped form
+ * ("abcd efgh ijkl mnop" or the officially shown "abcd-efgh-ijkl-mnop"), so
+ * strip the group separators before the 16-char check; a dashed iCloud paste
+ * must not trigger the "incomplete paste" warning.
+ */
+export function normalizeAppPassword(raw: string): string {
+  return raw.replace(/[\s-]+/g, "");
+}
+
+/**
+ * Whether the collapsed quick-pick strip must keep the selected tile visible:
+ * extra tiles (index ≥ 6 and custom IMAP) hide when the catalog closes.
+ */
+export function surfacesExtraProvider(
+  allProviders: ReadonlyArray<{ id: string }>,
+  selectedProviderId: string,
+): boolean {
+  if (selectedProviderId === CUSTOM_IMAP_PROVIDER_ID) return true;
+  return allProviders.some((provider, index) => index >= 6 && provider.id === selectedProviderId);
 }
 
 function isServerConfigValid(config: ManualAccountConfig): boolean {
@@ -356,10 +365,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
     () => guideProvider ? localizedProviderOnboarding(guideProvider, locale, t) : undefined,
     [guideProvider, locale, t],
   );
-  const activeProviderName = activeOnboarding?.name ?? activeDiscovery?.name ?? "";
   const guideProviderName = guideOnboarding?.name ?? guideProvider?.name ?? "";
-  const orderedProviders = useMemo(() => orderedProviderCatalog(providers, locale), [locale, providers]);
-  const quickProviders = useMemo(() => quickProviderCatalog(providers, locale), [locale, providers]);
   const allProviders = useMemo(() => fullCatalogProviders(providers, locale), [locale, providers]);
 
   const targetProviderId = guideProvider?.id || activeDiscovery?.id || matchedProvider?.id || selectedProviderId;
@@ -463,7 +469,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
           name: guideProviderName || "网易邮箱",
           badge: t("account.provider.badge.neteaseCode"),
           summary: t("account.actionCard.netease.summary"),
-          actionHref: domain.includes("126") ? "https://mail.126.com" : "https://mail.163.com",
+          actionHref: neteasePortalUrl(domain),
           actionLabel: t("account.actionCard.netease.openSettings"),
           actionTitle: t("account.actionCard.netease.openSettings"),
           howToEnable: t("account.actionCard.netease.howToEnable"),
@@ -508,32 +514,28 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
     }
   }, [domain, guideOnboarding?.helpLabel, guideProvider, guideProviderName, providerKind, t]);
 
-  const activeOAuthProvider = discoveryEmail === normalizedEmail && discovery
-    ? discovery.oauthProvider
-    : activeDiscovery ? oauthProviderFor(activeDiscovery) : undefined;
-  const oauthAvailable = discoveryEmail === normalizedEmail && discovery
-    ? discovery.oauthAvailable
-    : matchedProvider?.oauthAvailable ?? true;
-  const discoveryRequired = validEmail(normalizedEmail) && !matchedProvider && discoveryEmail !== normalizedEmail;
-  const needsProviderDiscovery = discoveryRequired;
-  const authMethods = activeDiscovery?.authMethods ?? providerAuthMethods(matchedProvider);
-  const oauthOnly = Boolean(activeOAuthProvider) && authMethods.length > 0 && authMethods.every((method) => method === "oauth2");
-  const passwordLooksLikeAppCredential = !manualOpen
-    && authMethods.some((method) => method === "app-password" || method === "client-authorization-code");
-  const canUsePassword = !oauthOnly;
-  const providerPrefersOAuth = Boolean(
-    activeOAuthProvider && oauthAvailable && activeDiscovery?.recommendedAuthMethod !== "app-password" && !isGmail
-  );
-  const showOAuthPanel = Boolean(
-    activeOAuthProvider && !manualOpen && (explicitAuthMode === "oauth" || (explicitAuthMode === null && providerPrefersOAuth))
-  );
+  const {
+    activeOAuthProvider,
+    oauthAvailable,
+    canUsePassword,
+    showOAuthPanel,
+    usingPassword,
+    needsProviderDiscovery,
+  } = resolveOAuthEntry({
+    discoveryEmail,
+    normalizedEmail,
+    discovery,
+    activeDiscovery,
+    matchedProvider,
+    selectedProvider,
+    selectedProviderId,
+    explicitAuthMode,
+    manualOpen,
+    isGmail,
+  });
   const busy = busyAction !== "idle";
   const blockingBusy = busyAction === "password" || busyAction === "manual" || busyAction === "oauth";
   const isOAuthWaiting = busyAction === "oauth" && Boolean(oauthAttemptId);
-  const usingPassword = (validEmail(normalizedEmail) || Boolean(selectedProviderId) || Boolean(matchedProvider))
-    && !needsProviderDiscovery
-    && canUsePassword
-    && (manualOpen || !showOAuthPanel);
 
   const [showPassword, setShowPassword] = useState(false);
   const pendingCursorRef = useRef<number | null>(null);
@@ -741,12 +743,12 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
   }, [demoMode, discovery, discoveryEmail, providers, t]);
 
   useEffect(() => {
-    if (!discoveryRequired || emailFocused || busy || accountAdded) return;
+    if (!needsProviderDiscovery || emailFocused || busy || accountAdded) return;
     const timer = window.setTimeout(() => {
       void discoverProvider();
     }, DISCOVERY_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [accountAdded, busy, discoverProvider, discoveryRequired, emailFocused]);
+  }, [accountAdded, busy, discoverProvider, needsProviderDiscovery, emailFocused]);
 
   const updateEmail = (event: ChangeEvent<HTMLInputElement>) => {
     // The browser's isComposing flag is authoritative. If it reports no active
@@ -924,7 +926,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
       return;
     }
     const rawPassword = password.trim();
-    const cleanPassword = credentialDetails.is16CharAppPassword ? rawPassword.replace(/\s+/g, "") : rawPassword;
+    const cleanPassword = credentialDetails.is16CharAppPassword ? normalizeAppPassword(rawPassword) : rawPassword;
     if (!cleanPassword) {
       showError(t("account.error.credential_required", { credential: credentialDetails.label }), "password");
       return;
@@ -978,17 +980,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
     }
   };
 
-  const credentialName = activeOnboarding?.credentialName
-    ?? activeOnboarding?.credentialLabel
-    ?? t("account.credential.fallback");
   const passwordFallbackName = activeOnboarding?.credentialName ?? t("account.credential.oauth_fallback");
-  const setupSteps = guideOnboarding?.setupSteps ?? [];
-  const guideIsPreview = !activeDiscovery && Boolean(selectedProviderGuide);
-  const sourceNote = guideProvider?.isCustom
-    ? guideIsPreview
-      ? t("account.guide.custom_preview")
-      : t("account.guide.custom_discovered")
-    : guideOnboarding?.caveat;
   const guideAvailable = Boolean(guideProvider) && (!needsProviderDiscovery || Boolean(selectedProviderId));
   const serverConfiguration = guideProvider && !guideProvider.isCustom
     ? providerServerConfiguration(guideOnboarding?.name ?? guideProvider.name, guideProvider.imap, guideProvider.smtp, t)
@@ -1062,7 +1054,6 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
   const displayIsOAuthWaiting = isFlowActive ? isOAuthWaiting : Boolean(activeSnapshot?.isOAuthWaiting);
   const displayCredentialDetails = isFlowActive ? credentialDetails : (activeSnapshot?.credentialDetails ?? credentialDetails);
   const displayManualOpen = isFlowActive ? manualOpen : Boolean(activeSnapshot?.manualOpen);
-  const hasFlowDetails = isFlowActive || activeSnapshot !== null;
 
   const copyServerConfiguration = async () => {
     if (!serverConfiguration) return;
@@ -1129,18 +1120,19 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
                 <ChevronDown className={providerCatalogOpen ? "open" : ""} size={14} />
               </button>
             </div>
-            <div ref={gridRef} className={`provider-quick-grid${providerCatalogOpen ? " catalog-expanded" : ""}`}>
+            <div ref={gridRef} className={`provider-quick-grid${providerCatalogOpen ? " catalog-expanded" : ""}${!providerCatalogOpen && surfacesExtraProvider(allProviders, selectedProviderId) ? " has-surfaced" : ""}`}>
               {allProviders.map((provider, index) => {
                 const isCore = index < 6;
                 const iconUrl = providerIconUrl(provider.id);
                 const isSelected = selectedProviderId === provider.id;
+                const surfaced = !isCore && isSelected && !providerCatalogOpen;
                 return (
                   <button
                     key={provider.id}
-                    className={`provider-choice${isCore ? "" : " extra-choice"}${isSelected ? " selected" : ""}`}
+                    className={`provider-choice${isCore ? "" : " extra-choice"}${isSelected ? " selected" : ""}${surfaced ? " surfaced" : ""}`}
                     type="button"
-                    tabIndex={isCore || providerCatalogOpen ? 0 : -1}
-                    aria-hidden={!isCore && !providerCatalogOpen}
+                    tabIndex={isCore || providerCatalogOpen || isSelected ? 0 : -1}
+                    aria-hidden={!isCore && !providerCatalogOpen && !isSelected}
                     aria-pressed={isSelected}
                     aria-label={t("account.provider.select_aria", { provider: providerDisplayName(provider, locale, t) })}
                     onClick={() => selectProvider(provider.id)}
@@ -1153,19 +1145,17 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
                       <strong>{providerDisplayName(provider, locale, t)}</strong>
                       <small className="provider-choice-domain">@{provider.domains[0]}</small>
                     </span>
-                    {isSelected && (
-                      <span className="provider-choice-check" aria-hidden="true">
-                        <Check size={11} strokeWidth={2.6} />
-                      </span>
-                    )}
+                    <span className="provider-choice-check" aria-hidden="true">
+                      <Check size={11} strokeWidth={2.6} />
+                    </span>
                   </button>
                 );
               })}
               <button
-                className={`provider-choice provider-choice-custom extra-choice${selectedProviderId === CUSTOM_IMAP_PROVIDER_ID ? " selected" : ""}`}
+                className={`provider-choice provider-choice-custom extra-choice${selectedProviderId === CUSTOM_IMAP_PROVIDER_ID ? " selected" : ""}${!providerCatalogOpen && selectedProviderId === CUSTOM_IMAP_PROVIDER_ID ? " surfaced" : ""}`}
                 type="button"
-                tabIndex={providerCatalogOpen ? 0 : -1}
-                aria-hidden={!providerCatalogOpen}
+                tabIndex={providerCatalogOpen || selectedProviderId === CUSTOM_IMAP_PROVIDER_ID ? 0 : -1}
+                aria-hidden={!providerCatalogOpen && selectedProviderId !== CUSTOM_IMAP_PROVIDER_ID}
                 aria-pressed={selectedProviderId === CUSTOM_IMAP_PROVIDER_ID}
                 onClick={() => selectProvider(CUSTOM_IMAP_PROVIDER_ID)}
                 disabled={busy || accountAdded}
@@ -1175,11 +1165,9 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
                   <strong>{t("account.provider.custom_name")}</strong>
                   <small>{t("account.provider.custom_description")}</small>
                 </span>
-                {selectedProviderId === CUSTOM_IMAP_PROVIDER_ID && (
-                  <span className="provider-choice-check" aria-hidden="true">
-                    <Check size={11} strokeWidth={2.6} />
-                  </span>
-                )}
+                <span className="provider-choice-check" aria-hidden="true">
+                  <Check size={11} strokeWidth={2.6} />
+                </span>
               </button>
             </div>
             <small className="provider-picker-note">{t("account.provider.picker_note")}</small>
@@ -1309,7 +1297,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
                 <strong id="oauth-login-title">{t("account.oauth.title", { provider: activeOAuthProvider === "google" ? "Google" : "Microsoft" })}</strong>
                 <p>{t("account.oauth.description")}</p>
               </div>
-              {!oauthAvailable && <small className="oauth-config-note">{t("account.oauth.config_unavailable", { provider: activeOAuthProvider === "google" ? "Google" : "Microsoft" })}</small>}
+              {!oauthAvailable && <small className="oauth-config-note">{t(activeOAuthProvider === "microsoft" ? "account.oauth.config_unavailable_microsoft" : "account.oauth.config_unavailable", { provider: activeOAuthProvider === "google" ? "Google" : "Microsoft" })}</small>}
               <button className="primary-button large oauth-button" type="button" onClick={() => void startOAuth()} disabled={busy || !oauthAvailable || Boolean(existingAccountMatch) || !isFlowActive}>
                 {busyAction === "oauth" ? <LoaderCircle className="spin" size={18} /> : <ShieldCheck size={18} />}
                 {busyAction === "oauth"
@@ -1655,7 +1643,7 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
                       </div>
                       <p className="drawer-step-desc">{t("account.drawer.netease.step1Desc")}</p>
                       <a
-                        href={domain.includes("126") ? "https://mail.126.com" : "https://mail.163.com"}
+                        href={neteasePortalUrl(domain)}
                         target="_blank"
                         rel="noreferrer"
                         className="drawer-action-link"
@@ -1776,6 +1764,13 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
 
                     <div className="drawer-step-card">
                       <div className="drawer-step-header">
+                        <strong>{t("account.drawer.microsoft.configTitle")}</strong>
+                      </div>
+                      <p className="drawer-step-desc">{t("account.drawer.microsoft.configDesc")}</p>
+                    </div>
+
+                    <div className="drawer-step-card">
+                      <div className="drawer-step-header">
                         <span className="drawer-step-badge">01</span>
                         <strong>{t("account.drawer.microsoft.step1Title")}</strong>
                       </div>
@@ -1788,15 +1783,6 @@ export default function AddAccountModal({ providers, existingAccounts, onClose, 
                         <strong>{t("account.drawer.microsoft.step2Title")}</strong>
                       </div>
                       <p className="drawer-step-desc">{t("account.drawer.microsoft.step2Desc")}</p>
-                      <a
-                        href="https://account.live.com/proofs/manage/additional"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="drawer-action-link"
-                      >
-                        <ExternalLink size={13} />
-                        <span>{t("account.actionCard.microsoft.openSettings")}</span>
-                      </a>
                     </div>
 
                     <div className="drawer-step-card">

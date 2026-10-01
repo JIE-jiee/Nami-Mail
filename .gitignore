@@ -58,6 +58,7 @@ tmp-pw-out*/
 # One-off diagnostics from the window-bar / icon investigation — kept on disk,
 # intentionally not version-controlled.
 scripts/*.err
+tmp-baseline/
 scripts/probe*.mjs
 scripts/diag-fixed.mjs
 scripts/reload-page.mjs

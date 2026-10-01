@@ -29,7 +29,8 @@ import {
 // The tray icon, badge, menu and visibility flag live here now (see tray.mts).
 import { createTrayController, loadDesktopIcon } from "./tray.mjs";
 import { loadOrCreateDesktopMasterKey } from "./secure-master-key.mjs";
-import { DesktopDiagnostics, formatConsoleArgs, serializeRuntimeError } from "./desktop-diagnostics.mjs";
+import { DesktopDiagnostics, serializeRuntimeError } from "./desktop-diagnostics.mjs";
+import { installDesktopRuntimeDiagnostics } from "./desktop-runtime-diagnostics.mjs";
 import { openInBrowser as openExternalUrl, isHttpUrl } from "./desktop-external-open.mjs";
 import { playCustomNotificationSound, warmUpNotificationSoundPlayer } from "./desktop-notification-sound.mjs";
 import {
@@ -79,6 +80,8 @@ import {
   type ServerStartParams,
 } from "./server-bridge.mjs";
 import { forkServerProcess, type ServerProcessHandle } from "./server-process.mjs";
+import { startLocalServiceAndRestoreDesktop, type ServiceStartupPlan } from "./local-service-startup.mjs";
+import { createServiceRestartCoordinator, serviceGiveUpDialogOptions } from "./service-restart-policy.mjs";
 
 type ExternalConfirmationRuntimeOptions = Readonly<{
   request: (input: {
@@ -432,59 +435,7 @@ const desktopUpdateCloseTimeoutMs = 30_000;
 // isolated data directory and cannot reveal where a real launch spends its
 // time, and a field failure must leave evidence without ever breaking boot.
 const desktopDiagnostics = new DesktopDiagnostics();
-let desktopDiagnosticsInstalled = false;
 
-/**
- * Crash and log capture for the packaged app. Installed once per boot; console
- * output is mirrored because that is how the in-process service reports errors.
- */
-function installDesktopRuntimeDiagnostics(): void {
-  if (desktopDiagnosticsInstalled) return;
-  desktopDiagnosticsInstalled = true;
-
-  const originalError = console.error.bind(console);
-  const originalWarn = console.warn.bind(console);
-  console.error = (...args: unknown[]) => {
-    desktopDiagnostics.appendRuntimeLog("console.error", { message: formatConsoleArgs(args) });
-    originalError(...args);
-  };
-  console.warn = (...args: unknown[]) => {
-    desktopDiagnostics.appendRuntimeLog("console.warn", { message: formatConsoleArgs(args) });
-    originalWarn(...args);
-  };
-
-  process.on("uncaughtException", (error) => {
-    desktopDiagnostics.appendRuntimeLog("uncaught-exception", serializeRuntimeError(error));
-    originalError("Uncaught exception:", error);
-    // Process state is unknown after an uncaught exception: stop deliberately
-    // rather than keep syncing and sending mail from a half-built runtime.
-    try {
-      dialog.showErrorBox(
-        "Nami Mail stopped unexpectedly",
-        "Nami Mail hit an unrecoverable error and will close. Details were written to runtime-log.jsonl in the Nami Mail user data folder.",
-      );
-    } catch {
-      // A dialog must never block shutdown.
-    }
-    app.quit();
-  });
-
-  process.on("unhandledRejection", (reason) => {
-    desktopDiagnostics.appendRuntimeLog("unhandled-rejection", serializeRuntimeError(reason));
-  });
-
-  app.on("render-process-gone", (_event, _contents, details) => {
-    desktopDiagnostics.appendRuntimeLog("render-process-gone", { reason: details.reason, exitCode: details.exitCode });
-  });
-
-  app.on("child-process-gone", (_event, details) => {
-    desktopDiagnostics.appendRuntimeLog("child-process-gone", {
-      type: details.type,
-      reason: details.reason,
-      exitCode: details.exitCode,
-    });
-  });
-}
 async function loadDesktopLocalConfiguration(): Promise<void> {
   // The installed app cannot rely on a project-root .env. Restrict the
   // user-data file to public OAuth settings and non-secret translation
@@ -1426,66 +1377,112 @@ function forwardServerProcessOutput(stream: "stdout" | "stderr", chunk: string):
   }
 }
 
+// Crash recovery for the local-service utility process: decision/backoff state
+// lives in service-restart-policy.mjs; the recovery itself is the shared
+// startup sequence below, so a step boot gains is not silently missed here.
+const serviceRestartCoordinator = createServiceRestartCoordinator({
+  log: (event, detail) => desktopDiagnostics.appendRuntimeLog(event, detail),
+  isShuttingDown: () => isQuitting || shutdownPromise !== undefined || serverProcessExpectedExit,
+  isServiceRunning: () => localServer !== undefined,
+  restart: restartLocalServiceAfterCrash,
+  // A falsy first argument is Electron's "no parent" form, so a destroyed main
+  // window degrades to it; parenting keeps the notice off other displays.
+  giveUp: () => void dialog.showMessageBox((mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined) as BrowserWindow, serviceGiveUpDialogOptions()).finally(() => app.quit()),
+});
+async function restartLocalServiceAfterCrash(): Promise<void> {
+  const dataDirectory = path.join(app.getPath("userData"), "data");
+  await startLocalServiceAndRestoreDesktop({
+    ...localServiceStartupEffects(dataDirectory),
+    restoreWindow: mainWindow && !mainWindow.isDestroyed() ? loadMainWindowApp : undefined,
+    restoreBroker: () => closeDesktopAgentBroker().then(startDesktopAgentBroker)
+      .catch((error) => { desktopDiagnostics.appendRuntimeLog("agent-broker-restore-failed", serializeRuntimeError(error)); }),
+    // A packaged install has no console, so a window that stays dead after the
+    // service came back must say so instead of failing into the void. The app
+    // keeps running: the service is healthy and the tray is still there.
+    onWindowRestoreFailure: (error) => dialog.showErrorBox(
+      "Nami Mail could not restore the window",
+      `The local mail service is running again, but the app window did not come back. Restart Nami Mail to continue.\n\n${error instanceof Error ? error.message : String(error)}`,
+    ),
+    // The surfaces come back on their own; the handshake must not wait on a
+    // renderer that may never finish loading.
+    awaitRestores: false,
+  });
+}
+
 /**
  * Boots the local mail service in its own utility process and returns the
- * bridge handle main talks to. Call sites keep the shape they had when the
- * service ran in-process; only settings reads are served from a snapshot the
- * service pushes, because native menus and dialogs are synchronous.
+ * bridge handle main talks to. The caller's master-key copy is zeroed on every
+ * exit here — success, failed start, or a throw from forkServerProcess.
  */
 async function startLocalServiceInUtilityProcess(options: {
   dataDirectory: string;
   masterKey: Buffer;
 }): Promise<ServerBridgeHandle> {
-  const forked = forkServerProcess({
-    modulePath: serverHostModulePath(),
-    env: { WEB_DIST_PATH: path.join(app.getAppPath(), "apps", "web", "dist") },
-    onOutput: forwardServerProcessOutput,
-    onExit: (code) => {
-      if (!serverProcessExpectedExit) {
-        desktopDiagnostics.appendRuntimeLog("server-process-exited", { code });
-      }
-    },
-  });
-  serverProcess = forked;
-  serverProcessExpectedExit = false;
-
-  const bridge = createServerBridgeClient(forked.transport, {
-    onNewInboxMessages: notifyNewMail,
-    onAutoReplyEvent: (event) => notifyAutoReplyEvent(event as DesktopAutoReplyEvent),
-    onStartupTiming: (stage, elapsedMs) => {
-      desktopDiagnostics.appendStartupLog(stage, elapsedMs, "server");
-      desktopDiagnostics.recordStartupTiming(stage, elapsedMs);
-    },
-    // The service persisted settings (settings page or Agent tool); re-apply
-    // the desktop-only bits that main owns.
-    onSettingsChanged: () => applyDesktopSettingsFromServer(),
-    listExternalPairings: () => (desktopAgentBroker ? desktopAgentBroker.describePairings() : Promise.resolve([])),
-    requestExternalConfirmation: (input) => createExternalConfirmationBridge().request(input as ExternalConfirmationInput),
-  });
-
-  const startParams: ServerStartParams = {
-    host: "127.0.0.1",
-    port: desktopLoopbackPort,
-    databasePath: path.join(options.dataDirectory, "nami-mail.db"),
-    masterKey: new Uint8Array(options.masterKey),
-    localApiAccessToken,
-    userDataPath: app.getPath("userData"),
-    env: {},
-  };
   try {
+    const forked = forkServerProcess({
+      modulePath: serverHostModulePath(),
+      env: { WEB_DIST_PATH: path.join(app.getAppPath(), "apps", "web", "dist") },
+      onOutput: forwardServerProcessOutput,
+      onExit: (code) => serviceRestartCoordinator.onServiceProcessExit(code),
+    });
+    serverProcess = forked;
+    serverProcessExpectedExit = false;
+
+    const bridge = createServerBridgeClient(forked.transport, {
+      onNewInboxMessages: notifyNewMail,
+      onAutoReplyEvent: (event) => notifyAutoReplyEvent(event as DesktopAutoReplyEvent),
+      onStartupTiming: (stage, elapsedMs) => {
+        desktopDiagnostics.appendStartupLog(stage, elapsedMs, "server");
+        desktopDiagnostics.recordStartupTiming(stage, elapsedMs);
+      },
+      // The service persisted settings (settings page or Agent tool); re-apply
+      // the desktop-only bits that main owns.
+      onSettingsChanged: () => applyDesktopSettingsFromServer(),
+      listExternalPairings: () => (desktopAgentBroker ? desktopAgentBroker.describePairings() : Promise.resolve([])),
+      requestExternalConfirmation: (input) => createExternalConfirmationBridge().request(input as ExternalConfirmationInput),
+    });
+
+    const startParams: ServerStartParams = {
+      host: "127.0.0.1",
+      port: desktopLoopbackPort,
+      databasePath: path.join(options.dataDirectory, "nami-mail.db"),
+      masterKey: new Uint8Array(options.masterKey),
+      localApiAccessToken,
+      userDataPath: app.getPath("userData"),
+      env: {},
+    };
     await bridge.start(startParams);
+    return bridge.handle;
   } catch (error) {
-    // A service that failed to start must not linger as an orphan process.
+    // A service that failed to start must not linger as an orphan process;
+    // its key copy is zeroed by the finally below.
     stopLocalServerProcess();
     throw error;
+  } finally {
+    options.masterKey.fill(0);
   }
-  return bridge.handle;
+}
+
+/**
+ * The effects the first launch and the crash-recovery path share. Both build
+ * the service the same way and apply the same desktop-owned settings, so those
+ * steps are wired once here; only the observation and failure policy differ
+ * per call site (see local-service-startup.mjs).
+ */
+function localServiceStartupEffects(dataDirectory: string): Pick<ServiceStartupPlan<ServerBridgeHandle>, "loadMasterKey" | "startService" | "installService" | "applySettings" | "log"> {
+  return {
+    loadMasterKey: () => loadOrCreateDesktopMasterKey(dataDirectory, safeStorage).then((desktopMasterKey) => desktopMasterKey.key),
+    startService: (masterKey) => startLocalServiceInUtilityProcess({ dataDirectory, masterKey }),
+    installService: (service) => { localServer = service; },
+    applySettings: applyDesktopSettingsFromServer,
+    log: (event, detail) => desktopDiagnostics.appendRuntimeLog(event, detail),
+  };
 }
 
 async function boot(): Promise<void> {
   desktopAgentBrokerRecoveryGate = "accepting";
   desktopDiagnostics.initialize(app.getPath("userData"));
-  installDesktopRuntimeDiagnostics();
+  installDesktopRuntimeDiagnostics((event, detail) => desktopDiagnostics.appendRuntimeLog(event, detail));
   desktopDiagnostics.recordStartupTiming("boot-start");
   await writeDesktopSmokeProgress("waiting-for-electron-ready");
   await app.whenReady();
@@ -1561,38 +1558,40 @@ async function boot(): Promise<void> {
     rendererCacheCleanup = rendererCacheCleanupResult;
     desktopDiagnostics.recordStartupTiming("renderer-cache-cleared");
     await writeDesktopSmokeProgress("renderer-cache-cleared");
-    try {
-      localServer = await startLocalServiceInUtilityProcess({
-        dataDirectory,
-        masterKey: desktopMasterKey.key,
-      });
-      desktopDiagnostics.recordStartupTiming("local-service-ready");
-      await writeDesktopSmokeProgress("local-service-ready");
-      applyDesktopSettingsFromServer();
-    } finally {
-      // The key copy exists only to cross the process boundary into the
-      // service; the service holds its own copy for its lifetime.
-      desktopMasterKey.key.fill(0);
-    }
-    if (desktopHostMode === "gui") {
+    await startLocalServiceAndRestoreDesktop({
+      ...localServiceStartupEffects(dataDirectory),
+      // The key resolved above alongside the cache clear; hand that copy over
+      // instead of loading (and DPAPI-unwrapping) it twice.
+      loadMasterKey: () => Promise.resolve(desktopMasterKey.key),
+      onServiceStarted: async () => {
+        desktopDiagnostics.recordStartupTiming("local-service-ready");
+        await writeDesktopSmokeProgress("local-service-ready");
+      },
+      restoreWindow: desktopHostMode === "gui" ? loadMainWindowApp : undefined,
       // The external Agent broker only serves pairing and CLI/MCP bridges,
       // none of which the first paint needs: start it alongside the window
       // instead of blocking the startup path on its PowerShell handshake.
-      // GUI mode tolerates failure (diagnostic only); the initial pairing
-      // requests below still wait for the broker either way.
-      const brokerReady = startDesktopAgentBroker().catch((error) => {
-        noteDesktopSmokeDiagnostic(`Desktop Agent Broker unavailable: ${error instanceof Error ? error.message : String(error)}`);
-      });
-      await loadMainWindowApp();
-      desktopDiagnostics.recordStartupTiming("window-loaded");
-      await writeDesktopSmokeProgress("window-loaded");
-      observeSplashDismissal();
-      await brokerReady;
-      scheduleAgentPairingRequests(initialPairingRequestIds);
-      void warnExternalPairingScopeDrift().catch(() => undefined);
-    } else {
-      await startDesktopAgentBroker();
-    }
+      // GUI mode tolerates failure (diagnostic only); the headless service
+      // host has no window and cannot run without a broker. Either way the
+      // initial pairing requests wait for the broker.
+      restoreBroker: desktopHostMode === "gui"
+        ? () => startDesktopAgentBroker().catch((error) => {
+            noteDesktopSmokeDiagnostic(`Desktop Agent Broker unavailable: ${error instanceof Error ? error.message : String(error)}`);
+          })
+        : startDesktopAgentBroker,
+      onWindowRestored: async () => {
+        desktopDiagnostics.recordStartupTiming("window-loaded");
+        await writeDesktopSmokeProgress("window-loaded");
+        observeSplashDismissal();
+      },
+      onBrokerRestored: () => {
+        scheduleAgentPairingRequests(initialPairingRequestIds);
+        void warnExternalPairingScopeDrift().catch(() => undefined);
+      },
+      // A failed first load is fatal: boot's own catch tears the process down,
+      // shows the startup failure and exits.
+      windowRestoreFailure: "throw",
+    });
     if (desktopHostMode === "gui") {
       const desktopUpdate = await startDesktopUpdaterIfNeeded();
       if (smokeResultPath) await writeDesktopSmokeProgress("notification-probe");

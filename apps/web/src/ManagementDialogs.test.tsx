@@ -11,6 +11,7 @@ const demoAccount: Account = {
   id: "acc-1",
   email: "nami@example.com",
   provider: "demo",
+  authMethod: "password",
   providerName: "Demo",
   status: "connected",
   lastError: null,

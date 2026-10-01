@@ -20,7 +20,7 @@ import {
   updateFilterRule,
 } from "../src/filter-rules.js";
 import type { MessagePayload } from "../src/message-storage.js";
-import { applyFilterRulesToNewMessages } from "../src/sync.js";
+import { applyFilterRulesToNewMessages } from "../src/sync-filter-rules.js";
 
 function demoPayload(overrides: Partial<MessagePayload> = {}): MessagePayload {
   return {

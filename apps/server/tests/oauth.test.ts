@@ -184,8 +184,13 @@ describe("OAuthService authorization-code flow", () => {
       callbackTokens: () => Promise<{ tokens: { access_token: string; refresh_token: string; expires_in: number } }>;
       identityFromTokens: () => { email: string; subject: string; scopes: string[] };
     };
+    // Generated per run so the fixture carries no credential literal; the
+    // values only have to prove that the mocked transport's tokens flow
+    // through storage, refresh rotation and the encrypted-secret guard.
+    const transportAccessToken = `access-transport-${randomBytes(12).toString("hex")}`;
+    const transportRefreshToken = `refresh-transport-${randomBytes(12).toString("hex")}`;
     vi.spyOn(internals, "callbackTokens").mockResolvedValue({
-      tokens: { access_token: "access-token-for-transport-check", refresh_token: "refresh-token-for-transport-check", expires_in: 3600 },
+      tokens: { access_token: transportAccessToken, refresh_token: transportRefreshToken, expires_in: 3600 },
     });
     vi.spyOn(internals, "identityFromTokens").mockReturnValue({
       email: "transport-failure@gmail.com",
@@ -225,6 +230,11 @@ describe("OAuthService authorization-code flow", () => {
 
 describe("OAuthService refresh tokens", () => {
   it("deduplicates concurrent refreshes and keeps a rotated token bound to the account endpoints", async () => {
+    // Generated per run so the fixture carries no credential literal; the
+    // values only have to prove rotation lands in storage and the old
+    // refresh token no longer appears in the encrypted secret.
+    const rotatedAccessToken = `access-rotated-${randomBytes(12).toString("hex")}`;
+    const rotatedRefreshToken = `refresh-rotated-${randomBytes(12).toString("hex")}`;
     const { OAuthService } = await loadOAuthModule();
     const masterKey = randomBytes(32);
     const { account, db } = createGoogleOAuthAccount(masterKey);
@@ -234,8 +244,8 @@ describe("OAuthService refresh tokens", () => {
       expect(body.get("grant_type")).toBe("refresh_token");
       expect(body.get("refresh_token")).toBe("refresh-original");
       return new Response(JSON.stringify({
-        access_token: "access-token-after-refresh",
-        refresh_token: "refresh-rotated",
+        access_token: rotatedAccessToken,
+        refresh_token: rotatedRefreshToken,
         token_type: "Bearer",
         expires_in: 3600,
       }), {
@@ -247,15 +257,15 @@ describe("OAuthService refresh tokens", () => {
     const service = new OAuthService(db, masterKey);
 
     await expect(Promise.all([service.getAccessToken(account), service.getAccessToken(account)])).resolves.toEqual([
-      "access-token-after-refresh",
-      "access-token-after-refresh",
+      rotatedAccessToken,
+      rotatedAccessToken,
     ]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     const stored = db.prepare("SELECT encrypted_secret, crypto_version FROM account_credentials WHERE account_id = ?").get(account.id) as { encrypted_secret: string; crypto_version: number };
-    expect(stored.encrypted_secret).not.toContain("refresh-rotated");
+    expect(stored.encrypted_secret).not.toContain(rotatedRefreshToken);
     expect(stored.crypto_version).toBe(ACCOUNT_CREDENTIAL_CRYPTO_VERSION);
-    expect(decryptOAuthRefreshToken(account, stored.encrypted_secret, masterKey)).toBe("refresh-rotated");
+    expect(decryptOAuthRefreshToken(account, stored.encrypted_secret, masterKey)).toBe(rotatedRefreshToken);
 
     db.prepare("UPDATE accounts SET smtp_host = ? WHERE id = ?").run("attacker.invalid", account.id);
     const tampered = db.prepare("SELECT * FROM accounts WHERE id = ?").get(account.id) as AccountRecord;

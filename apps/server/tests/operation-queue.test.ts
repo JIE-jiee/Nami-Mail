@@ -7,8 +7,8 @@ const { moveMessage, batchMoveMessages } = vi.hoisted(() => ({
 
 // The operation queue serializes through the real sync write locks, so only
 // the executor entry points are replaced.
-vi.mock("../src/sync.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/sync.js")>();
+vi.mock("../src/sync-moves.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sync-moves.js")>();
   return { ...actual, moveMessage, batchMoveMessages };
 });
 
@@ -16,6 +16,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { openDatabase, type DatabaseHandle } from "../src/db.js";
 import { createOperationQueue } from "../src/operation-queue.js";
+import { acquireAccountWriteSlots } from "../src/sync-locks.js";
 
 function insertAccount(db: DatabaseHandle, id = "account-1"): void {
   db.prepare(`
@@ -204,8 +205,83 @@ describe("operation queue", () => {
     const response = await app.inject({ method: "POST", url: "/api/messages/message-1/move", payload: { target: "trash" } });
 
     expect(response.statusCode).toBe(422);
-    expect(response.json()).toEqual({ ok: false, message: "Message not found." });
+    expect(response.json()).toEqual({ ok: false, code: "unprocessable", message: "Message not found." });
     const row = db.prepare("SELECT status FROM operation_queue").get() as { status: string };
     expect(row.status).toBe("failed");
+  });
+
+  it("gives up a background operation that lost the account write slot instead of retrying into the same saturation", async () => {
+    vi.useFakeTimers();
+    try {
+      insertAccount(db);
+      const givenUp: Array<{ kind: string; payload: unknown }> = [];
+      const queue = createOperationQueue(db, {
+        onBackgroundPermanentFailure: (kind, payload) => { givenUp.push({ kind, payload }); },
+      });
+      // A second account whose slot is wedged. An executor that has to touch it
+      // (a batch move spanning accounts) can only end in a real write-slot
+      // timeout — not a stand-in error — and every attempt is countable.
+      const wedged = await acquireAccountWriteSlots(["account-wedged"]);
+      let attempts = 0;
+      queue.registerRunner("move", async () => {
+        attempts += 1;
+        const reached = await acquireAccountWriteSlots(["account-wedged"]);
+        for (const release of reached.reverse()) release();
+      });
+
+      try {
+        queue.enqueueBackground(["account-1"], "move", { messageId: "message-1", target: "trash" });
+        // Far past the slot-wait budget, and past the whole ~90s retry ladder a
+        // transient failure would still be climbing.
+        await vi.advanceTimersByTimeAsync(300_000);
+
+        // Exactly one attempt: a saturated account is not a transient fault, and
+        // re-queueing would only add another waiter to the queue that just
+        // rejected it.
+        expect(attempts).toBe(1);
+        expect(givenUp).toEqual([{ kind: "move", payload: { messageId: "message-1", target: "trash" } }]);
+        const row = db.prepare("SELECT status, error_message FROM operation_queue").get() as {
+          status: string;
+          error_message: string;
+        };
+        expect(row.status).toBe("failed");
+        expect(row.error_message).toMatch(/Timed out waiting for the account account-wedged write slot/);
+      } finally {
+        for (const release of [...wedged].reverse()) release();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still retries a background operation that failed for a transient reason", async () => {
+    vi.useFakeTimers();
+    try {
+      insertAccount(db);
+      const givenUp: unknown[] = [];
+      const queue = createOperationQueue(db, {
+        onBackgroundPermanentFailure: (_kind, payload) => { givenUp.push(payload); },
+      });
+      let attempts = 0;
+      queue.registerRunner("move", async () => {
+        attempts += 1;
+        if (attempts < 3) throw new Error("ECONNRESET");
+      });
+
+      queue.enqueueBackground(["account-1"], "move", { messageId: "message-1", target: "trash" });
+      // Backoff after the first two attempts is 1s then 2s.
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(attempts).toBe(3);
+      expect(givenUp).toEqual([]);
+      const row = db.prepare("SELECT status, error_message FROM operation_queue").get() as {
+        status: string;
+        error_message: string | null;
+      };
+      expect(row.status).toBe("completed");
+      expect(row.error_message).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

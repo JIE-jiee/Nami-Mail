@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { resetBimiCacheForTests } from "../src/avatars/bimi.js";
 import { openDatabase, type DatabaseHandle } from "../src/db.js";
-import { buildBimiPersistence } from "../src/routes/avatars.js";
+import { buildBimiPersistence } from "../src/avatars/bimi-cache-store.js";
 
 describe("GET /api/avatars/bimi/:domain", () => {
   let db: DatabaseHandle;

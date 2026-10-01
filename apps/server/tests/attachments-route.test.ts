@@ -134,9 +134,9 @@ describe("attachment download API", () => {
     const missing = await app.inject({ method: "GET", url: "/api/messages/message-1/attachments/3" });
 
     expect(invalid.statusCode).toBe(400);
-    expect(invalid.json()).toEqual({ ok: false, message: "Attachment part is invalid." });
+    expect(invalid.json()).toEqual({ ok: false, code: "invalid_argument", message: "Attachment part is invalid." });
     expect(missing.statusCode).toBe(404);
-    expect(missing.json()).toEqual({ ok: false, message: "Attachment not found. Sync this message again." });
+    expect(missing.json()).toEqual({ ok: false, code: "not_found", message: "Attachment not found. Sync this message again." });
     expect(client.connect).not.toHaveBeenCalled();
   });
 });

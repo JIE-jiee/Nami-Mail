@@ -8,6 +8,7 @@ import { SenderAvatar, accountTone } from "./SenderAvatar";
 import { contextMenuItemIndexForKey } from "./contextMenu";
 import { localizeMessageLinks } from "./app/app-utils";
 import { isOwnSentMessage } from "./mailActions";
+import { countThreadMessages } from "./threads";
 import type { Account, AppSettings, Message } from "./types";
 
 // `Intl.DateTimeFormat` construction is not free; per-row-per-frame allocation
@@ -418,7 +419,10 @@ function MessageList(props: MessageListProps): React.JSX.Element {
         >
           {rowVirtualizer.getVirtualItems().map((virtualItem) => {
             const message = activeMessages[virtualItem.index];
-            const threadSize = threadById.get(message.id)?.length ?? 1;
+            // The grouping unions the folder copies of one message, so the raw
+            // member count reads 2 for a single mail and the badge lies. Count
+            // the messages the thread actually holds instead.
+            const threadSize = countThreadMessages(threadById.get(message.id));
             return (
             <MessageListRow
               key={virtualItem.key}

@@ -2,14 +2,15 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseHandle } from "./db.js";
 import { buildMessageListSql, type MessageListFilterQuery } from "./message-filters.js";
 import { serverLog } from "./logging.js";
+import { syncAccount } from "./sync.js";
 import {
   batchMoveMessages,
   moveMessageToFolder,
   resolveMoveDestination,
-  syncAccount,
-  updateMessageFlagsBatch,
-  type MessageFlagsPatch,
-} from "./sync.js";
+} from "./sync-moves.js";
+import { imapClientForAccount, type AccountAccessTokenProvider } from "./mail.js";
+import { accountById } from "./account-store.js";
+import { updateMessageFlagsBatch, type MessageFlagsPatch } from "./sync-flags.js";
 import { AgentMailStateEvents } from "./agent/mail-state-events.js";
 import { OAuthService } from "./oauth.js";
 import { getSyncMessageLimit } from "./settings.js";
@@ -33,6 +34,17 @@ export type BatchJobCreateRequest = {
 
 export type BatchJobKind = BatchJobCreateRequest["kind"] | "undo";
 
+/**
+ * Progress view of a job — the entire `GET /api/batch-jobs/:id` contract.
+ *
+ * Deliberately carries progress numbers only. The undo scope (a flags job's
+ * `changedIds`, one entry per changed message) is NOT part of it: a 30 000-id
+ * selection serialized 1.3 MB per response, and the renderer polls this every
+ * 600ms for up to 10 minutes — 1.3 GB of never-read JSON. Nothing outside the
+ * server ever consumed it (`undoBatchJob` reads the in-memory record, not a
+ * snapshot), so the progress response and the undo scope are now disjoint: the
+ * list lives only in the `jobs` Map, where undo already reads it.
+ */
 export type BatchJobSnapshot = {
   id: string;
   kind: BatchJobKind;
@@ -42,8 +54,6 @@ export type BatchJobSnapshot = {
   updated: number;
   failed: number;
   createdAt: number;
-  /** Ids actually changed by a flags job (its undo scope). Always [] for moves. */
-  changedIds: string[];
   error?: string;
   undone?: boolean;
   undoWindowMs?: number;
@@ -65,6 +75,7 @@ type BatchJobRecord = {
   patch?: MessageFlagsPatch;
   target?: "archive" | "trash";
   query?: MessageListFilterQuery;
+  /** Undo scope of a flags job, server-side only: never leaves this process. */
   changedIds: string[];
   undoEntries: Array<{ id: string; fromMailbox: string }>;
   undone: boolean;
@@ -81,20 +92,168 @@ export type BatchJobDeps = {
 export const BATCH_JOB_UNDO_WINDOW_MS = 5 * 60_000;
 const BATCH_JOB_TTL_MS = 15 * 60_000;
 const FLAGS_CHUNK_SIZE = 100;
-// The batch move API caps one request at 100 ids; each batch call opens one
-// connection per account and issues one MOVE command per (account, mailbox)
-// group. A per-message loop would open a fresh IMAP connection for every
-// message (Gmail costs ~4s per connection), turning a 10 000-message selection
-// into hours of work.
+// One MOVE command per (account, source mailbox) group per chunk, issued on a
+// connection the job reuses for every chunk (see the session in `runJob`): a
+// chunk boundary used to cost a connect/logout round trip, and 40 000 ids at
+// 100 per chunk is 400 of them at ~4s each on Gmail — 27 minutes of pure
+// connection setup.
+//
+// 100 is still the right size, for reasons unrelated to the 100-id cap of the
+// HTTP batch move API — this call is in-process and is not bound by that cap.
+// It bounds how many messages one refused or lost MOVE command can fail at
+// once, it keeps the account write slot held briefly so a long job does not
+// starve concurrent user writes behind it, and it keeps the progress counter
+// advancing every 100 messages. Enlarging it would trade those three for fewer
+// provider round trips that, once the connection is shared, are no longer the
+// bottleneck.
 const MOVE_CHUNK_SIZE = 100;
+
+type MoveImapClient = Awaited<ReturnType<typeof imapClientForAccount>>;
+
+/**
+ * The IMAP connections one job's move and its undo run on, kept for the whole
+ * job instead of rebuilt per batch.
+ *
+ * `batchMoveMessages` owns a connection for the duration of one call and hangs
+ * up before returning, which is right for a single HTTP request and ruinous
+ * for a background job: a 40 000-message selection is 400 calls of 100 ids, so
+ * the per-call lifecycle meant 400 connect/logout round trips at ~4s per Gmail
+ * connection — roughly 27 minutes of pure connection setup, paid again by the
+ * undo, which dialled once per message. A job is the only caller that issues
+ * many batches in a row, so the job is what owns the sockets: one live
+ * connection per account, released in the job's `finally` whether it finished
+ * or threw.
+ *
+ * The cache is handed to each `batchMoveMessages` call, whose own get-or-dial
+ * block then finds the connection already there; nothing about that block
+ * changed. The job dials only for its undo, whose per-message moves are handed
+ * `clientFor`'s connection instead of opening one each. Single-consumer by
+ * construction: a job runs its chunks and its undo entries strictly in
+ * sequence, and imapflow takes and releases its per-mailbox lock per command.
+ */
+function createJobMoveConnections(db: DatabaseHandle, masterKey: Buffer, accessTokenProvider?: AccountAccessTokenProvider) {
+  const clients = new Map<string, MoveImapClient>();
+  return {
+    /** The connection cache `batchMoveMessages` reads and fills. */
+    cache: clients,
+    /**
+     * The account's live client: dialled on first use, and re-dialled once the
+     * cached one is no longer usable (a connection that outlived its idle
+     * timeout must not be handed to the next message).
+     */
+    async clientFor(accountId: string): Promise<MoveImapClient> {
+      const cached = clients.get(accountId);
+      if (cached?.usable) return cached;
+      const account = accountById(db, accountId);
+      if (!account) throw new Error("Account not found.");
+      if (cached) await cached.logout().catch(() => undefined);
+      // Drop the corpse before dialling: a connect() that throws would
+      // otherwise leave a connection known to be dead in the cache, and every
+      // remaining entry of the job would be handed it.
+      clients.delete(accountId);
+      const client = await imapClientForAccount(account, masterKey, accessTokenProvider);
+      await client.connect();
+      clients.set(accountId, client);
+      return client;
+    },
+    /**
+     * Drops the account's connection so the next move dials a fresh one. A
+     * caller that fails a move on a shared connection must call this: a socket
+     * that died mid-command can still look usable for a moment, and without it
+     * one dead connection fails every remaining entry of the job instead of
+     * only the one — which is exactly what the per-message connection it
+     * replaced cost.
+     */
+    async invalidate(accountId: string): Promise<void> {
+      const cached = clients.get(accountId);
+      if (!cached) return;
+      clients.delete(accountId);
+      if (cached.usable) await cached.logout().catch(() => undefined);
+    },
+    /** Logs out every connection the job opened. */
+    async release(): Promise<void> {
+      const open = [...clients.values()];
+      clients.clear();
+      for (const client of open) {
+        if (client.usable) await client.logout().catch(() => undefined);
+      }
+    },
+  };
+}
+// SQLite compiles one statement with a bound variable per `?`, and the driver
+// rejects a statement past its own parameter ceiling (measured: 32 766 ids
+// succeed, 40 000 throw "too many SQL variables"). A predicate-scoped
+// selection has no row cap — the 5000-id cap covers explicit id lists, not
+// "select all matching this view" — so the origin snapshot below must not put
+// the whole selection into one IN (...) list: a 40 000-message move failed the
+// entire job at 0% and echoed the raw SQL into the UI toast. 1000 keeps the
+// statement far below any driver ceiling at the same order of magnitude as
+// MOVE_CHUNK_SIZE, and chunked lookups of 40 000 rows measured at 60ms.
+const ORIGIN_LOOKUP_CHUNK_SIZE = 1000;
+
+/** The origin snapshot's statement for one chunk shape (text keyed by size). */
+function originLookupStatement(db: DatabaseHandle, chunk: readonly string[]) {
+  return db.prepare(`
+    SELECT id, mailbox FROM messages WHERE id IN (${chunk.map(() => "?").join(", ")})
+  `);
+}
+
+/**
+ * Original mailbox of each id, so undo can restore it.
+ *
+ * Every chunk asks the same question of the same SQL text — only the number of
+ * `?` placeholders varies, and only the *last* chunk can be shorter than the
+ * rest — so the compiled statement is kept for the lifetime of this lookup and
+ * reused by every chunk of the same size. A 40 000-id selection therefore
+ * compiles two statements instead of 40 identical ones (measured: the repeated
+ * compilation was 58.8% of that case's runtime). Only the placeholder count is
+ * reused; the ids are always passed as bound parameters and never
+ * interpolated into the statement text, so the driver's per-statement variable
+ * ceiling is still decided by the same SQL the uncached path issued.
+ *
+ * The cache is local to the call rather than module-level: a lookup runs once
+ * per job inside one database handle, so a local map can never outlive its
+ * handle (the failure mode a module-level cache would have to defend against
+ * with a WeakMap) and can never hand a statement compiled against one database
+ * to a query against another.
+ */
+function originMailboxesById(db: DatabaseHandle, ids: readonly string[]): Map<string, string> {
+  const byId = new Map<string, string>();
+  const statements = new Map<number, ReturnType<typeof originLookupStatement>>();
+  for (let offset = 0; offset < ids.length; offset += ORIGIN_LOOKUP_CHUNK_SIZE) {
+    const chunk = ids.slice(offset, offset + ORIGIN_LOOKUP_CHUNK_SIZE);
+    let statement = statements.get(chunk.length);
+    if (!statement) {
+      statement = originLookupStatement(db, chunk);
+      statements.set(chunk.length, statement);
+    }
+    const rows = statement.all(...chunk) as Array<{ id: string; mailbox: string }>;
+    for (const row of rows) byId.set(row.id, row.mailbox);
+  }
+  return byId;
+}
 
 const jobs = new Map<string, BatchJobRecord>();
 let queueTail: Promise<void> = Promise.resolve();
 
 function pruneJobs(): void {
-  const cutoff = Date.now() - BATCH_JOB_TTL_MS;
+  const now = Date.now();
+  const cutoff = now - BATCH_JOB_TTL_MS;
   for (const [id, job] of jobs) {
-    if (job.createdAt < cutoff) jobs.delete(id);
+    if (job.createdAt < cutoff) {
+      jobs.delete(id);
+      continue;
+    }
+    // The undo scope is the job's memory footprint (one id per changed message,
+    // plus one {id, mailbox} per moved message), and it is dead weight the
+    // moment the undo window closes — `undoBatchJob` already answers "expired"
+    // without ever reading these. The Map keeps a job for the full TTL, so a
+    // storm of batch operations would otherwise pin every settled job's arrays
+    // for another 10 minutes past the point where anything can read them.
+    if (job.completedAt !== undefined && now - job.completedAt > job.undoWindowMs) {
+      job.changedIds = [];
+      job.undoEntries = [];
+    }
   }
 }
 
@@ -114,7 +273,6 @@ function toSnapshot(job: BatchJobRecord): BatchJobSnapshot {
     createdAt: job.createdAt,
     ...(job.error ? { error: job.error } : {}),
     ...(job.undone ? { undone: true } : {}),
-    changedIds: job.changedIds,
     undoWindowMs: job.undoWindowMs,
   };
 }
@@ -172,35 +330,46 @@ async function runJob(record: BatchJobRecord, deps: BatchJobDeps): Promise<void>
       }
     } else if (record.kind === "move" && record.target) {
       // Snapshot every origin mailbox up front so undo can restore it. The
-      // per-chunk batch call aggregates the whole chunk into one connection
-      // per account and one MOVE command per (account, mailbox) group instead
-      // of opening a connection for every message.
-      const placeholders = ids.map(() => "?").join(", ");
-      const origins = deps.db.prepare(`
-        SELECT id, mailbox FROM messages WHERE id IN (${placeholders})
-      `).all(...ids) as Array<{ id: string; mailbox: string }>;
-      const originMailboxById = new Map(origins.map((row) => [row.id, row.mailbox]));
-      for (let offset = 0; offset < ids.length; offset += MOVE_CHUNK_SIZE) {
-        const chunk = ids.slice(offset, offset + MOVE_CHUNK_SIZE);
-        const outcome = await batchMoveMessages(deps.db, deps.masterKey, chunk, record.target, deps.oauthService, deps.agentMailEvents);
-        record.updated += outcome.updated;
-        record.failed += outcome.failures.length;
-        const failedIds = new Set(outcome.failures.map((failure) => failure.id));
-        for (const id of chunk) {
-          if (failedIds.has(id)) continue;
-          const fromMailbox = originMailboxById.get(id);
-          if (fromMailbox) record.undoEntries.push({ id, fromMailbox });
+      // lookup is chunked because the selection is unbounded (see
+      // ORIGIN_LOOKUP_CHUNK_SIZE); merging the chunks into one map keeps the
+      // single-IN semantics: one entry per id, and a row listed twice (the
+      // global-search join can repeat a message) still yields the one mailbox
+      // the id resolves to.
+      const originMailboxById = originMailboxesById(deps.db, ids);
+      // One connection per account for the whole job, handed back in the
+      // `finally` below. The job is the only caller that issues many batches
+      // in a row, and a per-batch connection cost 400 dials on a 40 000-id
+      // selection. Accounting is untouched: the per-chunk outcomes, the
+      // undoEntries order and the per-chunk background reconcile below all
+      // still run exactly as they did, once per chunk.
+      const session = createJobMoveConnections(deps.db, deps.masterKey, deps.oauthService);
+      try {
+        for (let offset = 0; offset < ids.length; offset += MOVE_CHUNK_SIZE) {
+          const chunk = ids.slice(offset, offset + MOVE_CHUNK_SIZE);
+          const outcome = await batchMoveMessages(deps.db, deps.masterKey, chunk, record.target, deps.oauthService, deps.agentMailEvents, session.cache);
+          record.updated += outcome.updated;
+          record.failed += outcome.failures.length;
+          const failedIds = new Set(outcome.failures.map((failure) => failure.id));
+          for (const id of chunk) {
+            if (failedIds.has(id)) continue;
+            const fromMailbox = originMailboxById.get(id);
+            if (fromMailbox) record.undoEntries.push({ id, fromMailbox });
+          }
+          for (const accountId of outcome.pendingAccounts) {
+            // The provider could not confirm a batch MOVE outcome (no UIDPLUS or
+            // a lost response). Reconcile in the background so the cache shows
+            // the verified destination instead of a stale local snapshot.
+            void syncAccount(deps.db, deps.masterKey, accountId, getSyncMessageLimit(deps.db), deps.oauthService, deps.agentMailEvents)
+              .catch((error) => {
+                serverLog.warn({ batchJobId: record.id, accountId }, "Background move reconciliation failed", error);
+              });
+          }
+          record.done += chunk.length;
         }
-        for (const accountId of outcome.pendingAccounts) {
-          // The provider could not confirm a batch MOVE outcome (no UIDPLUS or
-          // a lost response). Reconcile in the background so the cache shows
-          // the verified destination instead of a stale local snapshot.
-          void syncAccount(deps.db, deps.masterKey, accountId, getSyncMessageLimit(deps.db), deps.oauthService, deps.agentMailEvents)
-            .catch((error) => {
-              serverLog.warn({ batchJobId: record.id, accountId }, "Background move reconciliation failed", error);
-            });
-        }
-        record.done += chunk.length;
+      } finally {
+        // Every connection this job opened is closed when the job ends, on the
+        // success path and on the throw that marks the job failed alike.
+        await session.release();
       }
     }
     record.completedAt = Date.now();
@@ -274,37 +443,54 @@ async function runUndo(record: BatchJobRecord, parent: BatchJobRecord, deps: Bat
       // manually moved elsewhere after the job ran must not be dragged back
       // by the undo.
       const target = parent.target;
-      for (const entry of record.undoEntries) {
-        const current = deps.db
-          .prepare("SELECT account_id, mailbox FROM messages WHERE id = ?")
-          .get(entry.id) as { account_id: string; mailbox: string } | undefined;
-        if (!current) {
-          record.failed += 1;
-          record.done += 1;
-          continue;
-        }
-        if (current.mailbox === entry.fromMailbox) {
-          // Already restored (or the move was an idempotent no-op).
-          record.updated += 1;
-          record.done += 1;
-          continue;
-        }
-        if (target) {
-          const destination = resolveMoveDestination(deps.db, current.account_id, target);
-          if (!destination || current.mailbox !== destination.path) {
-            // The user re-moved the message after the job; leave it alone.
+      // One connection per account for the whole undo, on the same terms as
+      // the job's own move loop: the entries below still go one at a time —
+      // each has its own origin folder, its own "the user re-moved it" guard
+      // and its own intent to claim, so there is nothing to aggregate — but
+      // they no longer each dial a fresh IMAP connection. Every entry keeps
+      // its own updated/failed outcome and its own `done` step, including the
+      // two skip paths above, which never reach the connection at all.
+      const session = createJobMoveConnections(deps.db, deps.masterKey, deps.oauthService);
+      try {
+        for (const entry of record.undoEntries) {
+          const current = deps.db
+            .prepare("SELECT account_id, mailbox FROM messages WHERE id = ?")
+            .get(entry.id) as { account_id: string; mailbox: string } | undefined;
+          if (!current) {
+            record.failed += 1;
+            record.done += 1;
+            continue;
+          }
+          if (current.mailbox === entry.fromMailbox) {
+            // Already restored (or the move was an idempotent no-op).
             record.updated += 1;
             record.done += 1;
             continue;
           }
+          if (target) {
+            const destination = resolveMoveDestination(deps.db, current.account_id, target);
+            if (!destination || current.mailbox !== destination.path) {
+              // The user re-moved the message after the job; leave it alone.
+              record.updated += 1;
+              record.done += 1;
+              continue;
+            }
+          }
+          try {
+            const client = await session.clientFor(current.account_id);
+            await moveMessageToFolder(deps.db, deps.masterKey, entry.id, entry.fromMailbox, deps.oauthService, deps.agentMailEvents, { client });
+            record.updated += 1;
+          } catch {
+            record.failed += 1;
+            // A shared connection must not turn one dead connection into a
+            // failure per remaining entry: drop it so the next entry dials a
+            // fresh one, exactly as the per-message connection used to.
+            await session.invalidate(current.account_id);
+          }
+          record.done += 1;
         }
-        try {
-          await moveMessageToFolder(deps.db, deps.masterKey, entry.id, entry.fromMailbox, deps.oauthService, deps.agentMailEvents);
-          record.updated += 1;
-        } catch {
-          record.failed += 1;
-        }
-        record.done += 1;
+      } finally {
+        await session.release();
       }
     }
     record.completedAt = Date.now();

@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { isIP } from "node:net";
+import { isLoopbackHostname } from "../endpoint-guard.js";
 import {
   agentAccessLevelSchema,
   providerHealthSchema,
   autoReplyConfigPatchSchema,
   autoReplyConfigSchema,
+  type AgentProviderKind,
+  type AgentProviderSummary,
   type LlmProvider,
   type ProviderHealth,
 } from "@nami/agent-contracts";
@@ -19,7 +21,10 @@ import { AgentServiceError, now, requiredText } from "./agent-shared.js";
 export const providerConfigurationVersion = 1;
 const defaultProviderRecordId = "agent-provider-default";
 
-export type AgentProviderKind = "openai-compatible" | "ollama" | "anthropic" | "gemini" | "openai-responses";
+// The provider summary shape is single-sourced in @nami/agent-contracts
+// (the web consumes the same type); these re-exports keep the historical
+// local names for the rest of the server.
+export type { AgentProviderKind, AgentProviderSummary };
 
 export type AgentProviderInput = {
   label: string;
@@ -32,24 +37,6 @@ export type AgentProviderInput = {
   timeoutMs: number;
   allowCloudMailContent: boolean;
   makeDefault?: boolean;
-};
-
-export type AgentProviderSummary = {
-  id: string;
-  label: string;
-  kind: AgentProviderKind;
-  endpoint: string;
-  model: string;
-  embeddingModel?: string;
-  timeoutMs: number;
-  apiKeyConfigured: boolean;
-  configured: boolean;
-  cloud: boolean;
-  cloudContentConsent: boolean;
-  streaming: boolean;
-  /** Whether the configured model accepts image inputs; gates image attachments. */
-  vision: boolean;
-  health?: ProviderHealth;
 };
 
 export type AgentProviderList = {
@@ -85,12 +72,6 @@ export type DefaultProviderConfiguration = {
   defaultProviderId: string | null;
 };
 
-function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host === "::1") return true;
-  if (isIP(host) !== 4) return false;
-  return Number(host.split(".", 1)[0]) === 127;
-}
 
 function normalizeEndpoint(value: string): { endpoint: string; cloud: boolean } {
   let url: URL;
@@ -99,14 +80,14 @@ function normalizeEndpoint(value: string): { endpoint: string; cloud: boolean } 
   } catch {
     throw new AgentServiceError("INVALID_ARGUMENT", "模型服务地址不是有效 URL。", 400, false);
   }
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHost(url.hostname))) {
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHostname(url.hostname))) {
     throw new AgentServiceError("INVALID_ARGUMENT", "模型服务地址必须使用 HTTPS，或指向本机回环 HTTP 服务。", 400, false);
   }
   if (url.username || url.password || url.search || url.hash) {
     throw new AgentServiceError("INVALID_ARGUMENT", "模型服务地址不能包含账号、查询参数或片段。", 400, false);
   }
   if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
-  return { endpoint: url.toString(), cloud: !isLoopbackHost(url.hostname) };
+  return { endpoint: url.toString(), cloud: !isLoopbackHostname(url.hostname) };
 }
 
 function providerConfigRecordId(id: string): string {

@@ -26,8 +26,7 @@ import { ManagementDialogShell } from "./ManagementDialogs";
 import { useDialogFocus } from "./hooks/useDialogFocus";
 import { useDismissTransition } from "./hooks/useDismissTransition";
 import { calendarCache } from "./dialogPrefetch";
-
-type Notice = { kind: "success" | "error"; message: string } | null;
+import { FormNotice, type Notice } from "./FormNotice";
 
 type EventDraft = {
   title: string;
@@ -632,12 +631,7 @@ export default function CalendarDialog({ demoMode = false, onClose, fallbackFocu
         dialogClassName="calendar-management-dialog"
       >
         <section className="settings-section calendar-section">
-          {notice && (
-            <div className={`form-status ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>
-              {notice.kind === "success" ? <Check size={17} /> : <X size={17} />}
-              {notice.message}
-            </div>
-          )}
+          <FormNotice notice={notice} />
           {view === "month" ? (
             <>
               <div className="calendar-toolbar-wrap" ref={jumpWrapRef}>

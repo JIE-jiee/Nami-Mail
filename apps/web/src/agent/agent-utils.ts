@@ -18,6 +18,9 @@ import type { Translate } from "../i18n";
 
 export type AgentMode = "agent" | "chat";
 
+/** Default local Ollama endpoint offered by both the provider form and the quick-setup preset. */
+export const OLLAMA_DEFAULT_ENDPOINT = "http://127.0.0.1:11434/v1";
+
 // ---------------------------------------------------------------------------
 // Scrubber layout constants
 // ---------------------------------------------------------------------------

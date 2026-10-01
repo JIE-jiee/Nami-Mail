@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentSourceEvent, Citation } from "@nami/agent-contracts";
 import type { DatabaseHandle } from "./db.js";
+import { serverLog } from "./logging.js";
 import { messagePayloadById } from "./message-storage.js";
 import { chunkMailContent, cleanMailContent } from "./agent/index.js";
 import { CitationRevalidator, SqliteCitationAuthority, type StoredCitationReference } from "./agent/citations.js";
@@ -960,7 +961,22 @@ export class AgentRagWorker {
     if (this.stopped || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.drainOnce().finally(() => this.schedule(this.pollIntervalMs));
+      // queueInitialBackfill and claimPending run their SQL outside the
+      // per-claim try/catch in drain(), so a disk-full, lock or corruption
+      // error rejects the whole pass. Without this catch it would surface as
+      // an unhandled rejection and take the process down — the server has no
+      // global handler. Logged, the next tick simply retries.
+      void this.drainOnce()
+        .catch((error: unknown) => {
+          serverLog.warn({ workerId: this.workerId }, "RAG event drain failed", error);
+        })
+        .finally(() => {
+          // A closed database handle (shutdown) makes every future pass fail
+          // the same way; stop the poll loop instead of retrying forever,
+          // like the operation-queue background driver does.
+          if (this.stopped || !this.options.db.open) return;
+          this.schedule(this.pollIntervalMs);
+        });
     }, delay);
     this.timer.unref?.();
   }

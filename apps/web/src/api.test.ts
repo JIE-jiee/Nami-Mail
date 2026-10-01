@@ -78,6 +78,171 @@ describe("api transport errors", () => {
     );
   });
 
+  describe("binary endpoints", () => {
+    /** A fetch that only settles when the request's own signal aborts, the way
+     * a real fetch behaves: nothing arrives while the service is wedged. */
+    const stallingFetch = (makeResponse: () => Response = () => new Response(new Blob(["payload"]), { status: 200 })) => {
+      const state: { aborted: boolean; settle?: () => void } = { aborted: false };
+      const fetchMock = vi.fn().mockImplementation((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+        if (init?.signal?.aborted) {
+          reject(init.signal.reason);
+          return;
+        }
+        state.settle = () => resolve(makeResponse());
+        init?.signal?.addEventListener("abort", () => {
+          state.aborted = true;
+          reject(init.signal?.reason);
+        }, { once: true });
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      return { fetchMock, state };
+    };
+
+    const uploadedAttachmentResponse = () => new Response(JSON.stringify({ attachment: { token: "tok-1" } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+
+    // Only name/type/size matter to the transport, so a stub keeps the 10 MB
+    // budget assertions cheap. (Blob.size is getter-only, so it cannot be
+    // assigned onto a real Blob.)
+    const uploadFile = (size = 5) => ({ name: "report.pdf", type: "application/pdf", size }) as File;
+
+    it("rejects a download whose caller signal is already aborted as a cancellation, not a timeout", async () => {
+      const { fetchMock } = stallingFetch();
+      const controller = new AbortController();
+      controller.abort(new DOMException("the preview was closed", "AbortError"));
+
+      const error = await api.downloadAttachment("message-1", "part-1", { signal: controller.signal }).catch((reason: unknown) => reason);
+
+      // A cancellation stays a cancellation: the caller can tell it apart from
+      // a wedge, which is the whole point of forwarding the signal at all.
+      expect(error).toBeInstanceOf(DOMException);
+      expect((error as DOMException).name).toBe("AbortError");
+      // Not an ApiError, so no local_service_timeout code rode along on it.
+      expect(error).not.toBeInstanceOf(ApiError);
+      // The already-aborted caller's signal reached fetch, so the request never
+      // sat waiting for the binary budget to expire.
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(init.signal?.aborted).toBe(true);
+    });
+
+    it("keeps a signal-free download on today's behaviour, still outside the 30s JSON budget", async () => {
+      vi.useFakeTimers();
+      try {
+        const { fetchMock, state } = stallingFetch();
+        let settled = false;
+        const pending = api.downloadMessageEml("message-1").then((value) => {
+          settled = true;
+          return value;
+        });
+
+        await vi.advanceTimersByTimeAsync(30_000);
+        // The same request as before (no caller signal), but a download is no
+        // longer cut at the JSON budget.
+        expect(state.aborted).toBe(false);
+        expect(settled).toBe(false);
+
+        state.settle?.();
+        await expect(pending).resolves.toMatchObject({ filename: "message.eml" });
+        const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+        expect(path).toBe("/api/messages/message-1/eml");
+        expect(init.cache).toBe("no-store");
+        expect(init.signal?.aborted).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not cut a slow attachment upload at the 30s JSON budget", async () => {
+      vi.useFakeTimers();
+      try {
+        const { state } = stallingFetch(uploadedAttachmentResponse);
+        let settled = false;
+        const pending = api.uploadOutboundAttachment("account-1", uploadFile(10 * 1024 * 1024)).then((value) => {
+          settled = true;
+          return value;
+        });
+        // A 10 MB upload is a legal payload (ComposeModal caps one file at
+        // 10 MB) and outlasts 30s on a slow link; the JSON timer used to
+        // reject it as local_service_timeout with the bytes already delivered.
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(state.aborted).toBe(false);
+        expect(settled).toBe(false);
+
+        state.settle?.();
+        await expect(pending).resolves.toMatchObject({ token: "tok-1" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("still bounds a wedged upload with a payload-aware budget", async () => {
+      vi.useFakeTimers();
+      try {
+        const { state } = stallingFetch();
+        const pending = api.uploadOutboundAttachment("account-1", uploadFile(10 * 1024 * 1024));
+
+        const assertion = expect(pending).rejects.toMatchObject({
+          name: "ApiError",
+          code: "local_service_timeout",
+        });
+        // 60s of headroom + 20s per megabyte for 10 MB overshoots the 180s cap.
+        await vi.advanceTimersByTimeAsync(180_000);
+        await assertion;
+        expect(state.aborted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("reports the binary budget firing as local_service_timeout", async () => {
+      vi.useFakeTimers();
+      try {
+        const { state } = stallingFetch();
+        const pending = api.downloadAttachment("message-1", "part-1");
+
+        const assertion = expect(pending).rejects.toMatchObject({
+          name: "ApiError",
+          code: "local_service_timeout",
+        });
+        // A download's size is unknown up front, so it gets the whole cap.
+        await vi.advanceTimersByTimeAsync(180_000);
+        await assertion;
+        expect(state.aborted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("keeps a caller's custom abort reason instead of rewriting it as a timeout", async () => {
+      const { state } = stallingFetch();
+      const controller = new AbortController();
+      const pending = api.downloadAttachment("message-1", "part-1", { signal: controller.signal });
+
+      controller.abort(new DOMException("the user closed the drawer", "AbortError"));
+      const error = await pending.catch((reason: unknown) => reason);
+
+      expect(state.aborted).toBe(true);
+      expect((error as DOMException).name).toBe("AbortError");
+      expect((error as DOMException).message).toBe("the user closed the drawer");
+      expect(error).not.toBeInstanceOf(ApiError);
+    });
+
+    it("forwards a caller's signal to an upload and never reports that cancellation as a timeout", async () => {
+      const { state } = stallingFetch();
+      const controller = new AbortController();
+      const pending = api.uploadOutboundAttachment("account-1", uploadFile(), { signal: controller.signal });
+
+      controller.abort();
+      const error = await pending.catch((reason: unknown) => reason);
+
+      expect(state.aborted).toBe(true);
+      expect((error as DOMException).name).toBe("AbortError");
+      expect(error).not.toBeInstanceOf(ApiError);
+    });
+  });
+
   it("downloads an EML export with the server-provided UTF-8 filename", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(new Blob(["From: a@b.c\r\nSubject: 会议纪要\r\n\r\n内容"]), {
       status: 200,

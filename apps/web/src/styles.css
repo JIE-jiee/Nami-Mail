@@ -2854,10 +2854,12 @@ place-items:center;
 margin-right:auto;
 display:inline-grid
 }
+/* Opening a mail rises and fades in over 240ms — content-in, the app's own 7px rise; the article mounts with the selection, so this is pure CSS. */
 .mail-reader
 {
 flex:1;
 min-height:0;
+animation:content-in .24s cubic-bezier(.2,.8,.2,1) both;
 overflow-y:auto
 }
 .mail-title
@@ -3338,12 +3340,14 @@ font-family:Georgia,Songti SC,serif;
 font-size:16px;
 line-height:1.7
 }
-/* Plain text is prose with no layout of its own, so it is the one thing in the
-   reader that is kept to a comfortable line length. It starts at the column's
-   left padding, so its edge still lines up with the subject above it. */
+/* Plain text is prose with no layout of its own, so it is the one body the
+   reader typesets rather than renders: the prose measure and the longer leading
+   a full column of prose needs (paragraphs are the blank lines it already
+   carries). Its edge still lines up with the subject above it. */
 .mail-text
 {
-max-width:var(--measure)
+max-width:var(--measure);
+line-height:1.75
 }
 .mail-html
 {
@@ -3466,12 +3470,19 @@ color:#f5f5f6;
 --lightningcss-dark:initial;
 color-scheme:dark
 }
-.mail-html a
+/* A link must read as actionable and `color:inherit` flattened it into the
+   prose; --info is the reader's own steel blue, legible on both themes. */
+.mail-html a,.mail-text a
 {
-color:inherit;
+color:var(--info);
 text-underline-offset:3px;
 text-decoration-line:underline;
 text-decoration-thickness:1px
+}
+.mail-html a:hover,.mail-text a:hover
+{
+color:color-mix(in srgb, var(--info) 72%, var(--text));
+text-decoration-thickness:2px
 }
 .mail-html img
 {
@@ -4261,6 +4272,11 @@ animation:none;
 transform:rotate(-4deg)
 }
 
+.mail-reader
+{
+animation:none
+}
+
 }
 .error-state>svg
 {
@@ -4891,6 +4907,10 @@ padding:2px;
 transition:max-height .26s cubic-bezier(.2,.8,.2,1);
 display:grid
 }
+.provider-quick-grid.has-surfaced
+{
+max-height:168px
+}
 .provider-quick-grid.catalog-expanded
 {
 max-height:min(304px,46vh);
@@ -4917,16 +4937,31 @@ background:var(--text-faint)
 {
 background:transparent
 }
-.provider-choice.extra-choice
+.provider-quick-grid:not(.catalog-expanded) .provider-choice.extra-choice
 {
-opacity:0;
-transform:translateY(6px);
-transition:opacity .20s ease,transform .26s cubic-bezier(.2,.8,.2,1)
+display:none
+}
+.provider-quick-grid:not(.catalog-expanded) .provider-choice.extra-choice.surfaced
+{
+display:flex;
+animation:provider-extra-in .22s cubic-bezier(.2,.8,.2,1) both
 }
 .provider-quick-grid.catalog-expanded .provider-choice.extra-choice
 {
+animation:provider-extra-in .20s ease both
+}
+@keyframes provider-extra-in
+{
+from
+{
+opacity:0;
+transform:translateY(6px)
+}
+to
+{
 opacity:1;
 transform:translateY(0)
+}
 }
 .provider-choice
 {
@@ -4974,7 +5009,27 @@ border-radius:50%;
 background:var(--accent);
 color:#fff;
 place-items:center;
-display:grid
+display:grid;
+opacity:0;
+transform:scale(.5);
+transition:opacity .16s ease,transform .18s cubic-bezier(.2,.8,.2,1)
+}
+.provider-choice.selected .provider-choice-check
+{
+opacity:1;
+transform:scale(1)
+}
+@media (prefers-reduced-motion:reduce)
+{
+.provider-choice.extra-choice
+{
+animation:none
+}
+
+.provider-choice-check
+{
+transition:none
+}
 }
 .provider-choice-domain
 {
@@ -5234,7 +5289,7 @@ padding-right:32px
 position:absolute;
 right:6px;
 top:50%;
-transform:translateY(-50%);
+translate:0 -50%;
 width:24px;
 height:24px;
 place-items:center;
@@ -6750,6 +6805,10 @@ transition:background .15s ease,border-color .15s ease
 background:color-mix(in srgb, var(--panel-muted) 60%, transparent);
 border-color:transparent;
 box-shadow:none
+}
+.compose-body.is-polishing
+{
+animation:.9s search-pulse infinite
 }
 .visually-hidden
 {
@@ -8473,7 +8532,7 @@ height:30px;
 position:absolute;
 top:50%;
 right:4px;
-transform:translateY(-50%)
+translate:0 -50%
 }
 .translation-configuration-meta
 {
@@ -10979,6 +11038,10 @@ transform:none
 .provider-quick-grid
 {
 grid-template-columns:repeat(2,minmax(0,1fr))
+}
+.provider-quick-grid.has-surfaced
+{
+max-height:224px
 }
 .setup-guide-endpoints>div
 {
@@ -14974,6 +15037,9 @@ position:relative
 {
 padding-right:41px
 }
+/* Overlay buttons centred inside an input (this eye and its two siblings) must centre
+   with `translate`, never `transform`: `.icon-button:active{transform:scale(.88)}`
+   REPLACES the matrix instead of composing, dropping the button half its height out. */
 .agent-provider-secret .icon-button
 {
 width:29px;
@@ -14981,7 +15047,7 @@ height:29px;
 position:absolute;
 top:50%;
 right:4px;
-transform:translateY(-50%)
+translate:0 -50%
 }
 .agent-provider-inline-toggle
 {

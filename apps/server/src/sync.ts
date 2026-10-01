@@ -1,11 +1,10 @@
 import { createHash, createHmac } from "node:crypto";
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { ListResponse } from "imapflow";
 import { simpleParser, type AddressObject } from "mailparser";
 import { attachmentMetadataFromParsedMail } from "./attachments.js";
 import { attachmentKindsJson } from "./attachment-kind.js";
 import type { AgentMailEventSink } from "./agent/mail-state-events.js";
-import type { DatabaseHandle } from "./db.js";
+import { deleteMessagesWithBatchFtsCleanup, type DatabaseHandle } from "./db.js";
 import { deriveEncryptionKey } from "./crypto.js";
 import { friendlyMailError, imapClientForAccount, mailErrorCode, type AccountAccessTokenProvider } from "./mail.js";
 import {
@@ -19,12 +18,18 @@ import { serverLog } from "./logging.js";
 import {
   confirmSubmissionsInSent,
 } from "./outbox.js";
-import type { AccountRecord } from "./types.js";
 import { getAppSettings } from "./settings.js";
 import { getAutoReplyEngine } from "./agent/auto-reply.js";
-
-const running = new Set<string>();
-const movingAccounts = new Set<string>();
+import {
+  isAccountMoving,
+  isAccountSyncing,
+  markAccountSyncing,
+  unmarkAccountSyncing,
+} from "./sync-locks.js";
+import { accountById } from "./account-store.js";
+import { applyFilterRulesToNewMessages } from "./sync-filter-rules.js";
+import { limitStoredHtmlBody, limitStoredTextBody } from "./message-body-limits.js";
+import { REMOTE_DELETION_PROBE_BATCH_SIZE, defaultRemoteDeletionProbeState, remoteDeletionProbeCursorKey, type RemoteDeletionProbeState } from "./sync-deletion-probe.js";
 
 /**
  * How many newly fetched messages are written (and their bodies downloaded)
@@ -36,32 +41,6 @@ const movingAccounts = new Set<string>();
  */
 const INITIAL_SYNC_BATCH = 100;
 
-/** True when the account is mid-sync. Used by move operations to block concurrent intents. */
-export function isAccountSyncing(accountId: string): boolean {
-  return running.has(accountId);
-}
-
-/** True when a move operation is in flight for the account. */
-export function isAccountMoving(accountId: string): boolean {
-  return movingAccounts.has(accountId);
-}
-
-/** Mark an account as mid-move. Call from sync-moves.ts only. */
-export function markAccountMoving(accountId: string): void {
-  movingAccounts.add(accountId);
-}
-
-/** Clear the mid-move flag for an account. Call from sync-moves.ts only. */
-export function unmarkAccountMoving(accountId: string): void {
-  movingAccounts.delete(accountId);
-}
-
-/** Clears in-flight sync and move tracking when an account is deleted. */
-export function clearAccountSyncState(accountId: string): void {
-  running.delete(accountId);
-  movingAccounts.delete(accountId);
-}
-
 // Raised when a sync pass is aborted by its caller (client disconnect or the
 // route-level runtime cap). Distinguished from provider failures so the
 // account status is left untouched instead of being marked error/reauth.
@@ -71,142 +50,10 @@ class SyncAbortedError extends Error {
     this.name = "SyncAbortedError";
   }
 }
-// Per-account FIFO write lock chains. A second write operation on the same
-// account (another move, a flag update) waits in line instead of failing with
-// a busy error, so a burst of deletes or moves is processed in order rather
-// than rejected. A full sync pass (`running`) intentionally stays an
-// immediate failure: queued writes must never block a sync cycle.
-const accountWriteChains = new Map<string, Promise<void>>();
-
-// Tracks which accounts the current async execution context already holds a
-// write slot for. Nested acquisitions — the operation queue takes the slot
-// before invoking an executor that also takes it, and batch moves fall back to
-// single-message moves that take it again — must be no-ops instead of waiting
-// on their own gate forever (a self-deadlock).
-const heldWriteSlots = new AsyncLocalStorage<Set<string>>();
-
-/** Longest an operation may wait for the account write slot it is queued
- * behind. A predecessor whose provider command hangs (and whose executor is
- * later abandoned) must not block this operation forever; on timeout the
- * operation fails and its place in the chain is released so operations behind
- * it still proceed. Generous relative to a normal operation (seconds) but far
- * shorter than the queue's executor run timeout. */
-const ACCOUNT_WRITE_SLOT_TIMEOUT_MS = 30_000;
-
-/** Rejects with `message` after `milliseconds`, without keeping the process
- * alive for a run that may never settle on its own during shutdown. */
-export function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), milliseconds);
-    timer.unref?.();
-    promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      (error) => { clearTimeout(timer); reject(error); },
-    );
-  });
-}
-
-/** Longest a write lets an in-flight sync pass finish before giving up. Kept
- * well below the renderer's 30s request budget so the caller still gets the
- * real outcome instead of a client-side timeout. */
-export const ACCOUNT_SYNC_WAIT_MS = 15_000;
-
-/** Polls `predicate` until it holds or `timeoutMs` elapses. */
-export async function waitUntil(predicate: () => boolean, timeoutMs: number, intervalMs = 150): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return true;
-}
-
-/**
- * Resolves true once no sync pass is in flight for the account, false when the
- * budget ran out.
- *
- * A write must never *block* a sync cycle (see the write-chain note above), but
- * it must also not be rejected just because a pass happens to be running. The
- * caller claims the account for moving first, which makes `syncAccount` skip
- * it, so no new pass can start here — only the pass already underway has to
- * finish.
- */
-export function waitForAccountSyncIdle(accountId: string, timeoutMs = ACCOUNT_SYNC_WAIT_MS): Promise<boolean> {
-  return waitUntil(() => !running.has(accountId), timeoutMs);
-}
-
-/**
- * Acquires write slots for every account in a deterministic order (sorted, so
- * concurrent multi-account batches can never deadlock). The returned release
- * functions must be called in reverse order.
- */
-export async function acquireAccountWriteSlots(accountIds: readonly string[]): Promise<Array<() => void>> {
-  const sorted = [...new Set(accountIds)].sort();
-  const releases: Array<() => void> = [];
-  const held = heldWriteSlots.getStore();
-  try {
-    for (const accountId of sorted) {
-      // A nested acquisition within the same execution context already holds
-      // this account's slot: do not wait on our own gate (self-deadlock).
-      if (held?.has(accountId)) continue;
-      const prev = accountWriteChains.get(accountId) ?? Promise.resolve();
-      let release!: () => void;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      accountWriteChains.set(accountId, prev.then(() => gate));
-      try {
-        await withTimeout(prev, ACCOUNT_WRITE_SLOT_TIMEOUT_MS, `Timed out waiting for the account ${accountId} write slot.`);
-      } catch (error) {
-        // Give up our place instead of leaving an unresolved gate that would
-        // block every operation queued behind us.
-        release();
-        throw error;
-      }
-      held?.add(accountId);
-      releases.push(() => {
-        release();
-        held?.delete(accountId);
-      });
-    }
-    return releases;
-  } catch (error) {
-    for (const release of releases.reverse()) release();
-    throw error;
-  }
-}
-
-/** Runs `fn` while holding write slots for every named account. */
-export async function withAccountWriteLocks<T>(accountIds: readonly string[], fn: () => Promise<T>): Promise<T> {
-  return heldWriteSlots.run(heldWriteSlots.getStore() ?? new Set<string>(), async () => {
-    const releases = await acquireAccountWriteSlots(accountIds);
-    try {
-      return await fn();
-    } finally {
-      for (const release of releases.reverse()) release();
-    }
-  });
-}
-
-/**
- * Runs `fn` in a context that considers every named account's write slot as
- * already held, so the executor's own nested `withAccountWriteLocks` calls are
- * reentrant no-ops. Used by the operation queue, which acquires the slot
- * itself (to release it on timeout) before invoking an executor that would
- * otherwise acquire it again and deadlock.
- */
-export function withHeldWriteSlots<T>(accountIds: readonly string[], fn: () => Promise<T>): Promise<T> {
-  const parent = heldWriteSlots.getStore();
-  const held = new Set(accountIds);
-  if (parent) for (const accountId of parent) held.add(accountId);
-  return heldWriteSlots.run(held, fn);
-}
 
 // Probe old cached UIDs in small, rotating batches. This only verifies remote
-// absence after a folder has stayed in the same UIDVALIDITY epoch.
-const remoteDeletionProbeBatchSize = 64;
-const remoteDeletionProbeCursorLimit = 1_024;
-const remoteDeletionProbeCursors = new Map<string, number>();
+// absence after a folder has stayed in the same UIDVALIDITY epoch. The rotating
+// cursor itself lives in sync-deletion-probe.ts.
 
 export type NewInboxMessage = {
   id: string;
@@ -225,10 +72,6 @@ export type SyncProgress = {
   /** Best-effort count of new messages in this folder's window. */
   totalEstimate: number;
 };
-
-export function accountById(db: DatabaseHandle, id: string): AccountRecord | undefined {
-  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRecord | undefined;
-}
 
 function autoReplyActiveForAccount(db: DatabaseHandle, accountId: string): boolean {
   const autoReply = getAppSettings(db).autoReply;
@@ -340,20 +183,6 @@ function messageKey(accountId: string, mailbox: string, uid: number): string {
   return createHash("sha256").update(`${accountId}\0${mailbox}\0${uid}`).digest("hex").slice(0, 32);
 }
 
-function remoteDeletionProbeCursorKey(accountId: string, mailbox: string, uidValidity: string): string {
-  return `${accountId}\0${mailbox}\0${uidValidity}`;
-}
-
-function advanceRemoteDeletionProbeCursor(key: string, uid: number): void {
-  remoteDeletionProbeCursors.delete(key);
-  remoteDeletionProbeCursors.set(key, uid);
-  while (remoteDeletionProbeCursors.size > remoteDeletionProbeCursorLimit) {
-    const oldestKey = remoteDeletionProbeCursors.keys().next().value;
-    if (typeof oldestKey !== "string") return;
-    remoteDeletionProbeCursors.delete(oldestKey);
-  }
-}
-
 const remoteIdLookupKeyPurpose = "message-remote-id-lookup-v1";
 
 // The HKDF derivation dominates remoteIdLookup's cost and its output depends
@@ -416,10 +245,6 @@ function uidValidityValue(value: unknown): string | undefined {
   return undefined;
 }
 
-// Sent verification is in sync-sent-verify.ts; re-export for backward compatibility.
-import { scheduleSentSubmissionVerification } from "./sync-sent-verify.js";
-export { scheduleSentSubmissionVerification, verifySubmissionInSentMailbox } from "./sync-sent-verify.js";
-
 export async function syncAccount(
   db: DatabaseHandle,
   masterKey: Buffer,
@@ -429,14 +254,15 @@ export async function syncAccount(
   agentEvents?: AgentMailEventSink,
   signal?: AbortSignal,
   onProgress?: (progress: SyncProgress) => void,
+  deletionProbeState?: RemoteDeletionProbeState,
 ): Promise<{ synced: number; folders: number; failedFolders: number; limitReached: boolean; newInboxMessages: NewInboxMessage[] }> {
-  if (running.has(accountId) || movingAccounts.has(accountId)) {
+  if (isAccountSyncing(accountId) || isAccountMoving(accountId)) {
     return { synced: 0, folders: 0, failedFolders: 0, limitReached: false, newInboxMessages: [] };
   }
   const account = accountById(db, accountId);
   if (!account) throw new Error("Account not found.");
   const agentLease = agentEvents?.acquireLease(accountId);
-  running.add(accountId);
+  markAccountSyncing(accountId);
 let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
   // New inbox messages from a successful pass are handed to the filter-rule
   // automation only after the sync guard below is released.
@@ -445,6 +271,9 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
   // Gmail category labels are fetched for every folder only while this
   // account is actively participating in the auto-reply feature.
   const autoReplyActive = autoReplyActiveForAccount(db, accountId);
+  // A caller that injects nothing keeps the rotation shared across passes; one
+  // that owns a state gets an isolated sweep (see sync-deletion-probe.ts).
+  const deletionProbe = deletionProbeState ?? defaultRemoteDeletionProbeState();
 
   try {
     client = await imapClientForAccount(account, masterKey, accessTokenProvider);
@@ -538,7 +367,17 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
           accountId,
           ...activeFolderPaths,
         ) as RemovedMessage[];
-        deleteMessagesInRemovedFolders.run(accountId, ...activeFolderPaths);
+        // The removed-folder scope matches the DELETE statement below exactly:
+        // the per-row FTS trigger is pre-cleared in one batch and suspended for
+        // the bulk delete instead of full-scanning the index once per row.
+        deleteMessagesWithBatchFtsCleanup(
+          db,
+          `account_id = ?${inactiveFolderClause} AND COALESCE(pending_move_destination, '') = ''`,
+          [accountId, ...activeFolderPaths],
+          () => {
+            deleteMessagesInRemovedFolders.run(accountId, ...activeFolderPaths);
+          },
+        );
         if (agentEvents && agentLease) {
           for (const removed of removedMessages) {
             agentEvents.messageDeletedWithinTransaction(agentLease, removed.id, {
@@ -704,22 +543,22 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
     `);
     const reconcileRemoteDeletionBatch = async (folder: ListResponse, uidValidity: string): Promise<void> => {
       const cursorKey = remoteDeletionProbeCursorKey(accountId, folder.path, uidValidity);
-      const cursor = remoteDeletionProbeCursors.get(cursorKey);
+      const cursor = deletionProbe.get(cursorKey);
       let candidates = listRemoteDeletionCandidatesAfterCursor.all(
         accountId,
         folder.path,
         cursor ?? 0,
-        remoteDeletionProbeBatchSize,
+        REMOTE_DELETION_PROBE_BATCH_SIZE,
       ) as RemoteDeletionCandidate[];
       if (!candidates.length && cursor !== undefined) {
         candidates = listRemoteDeletionCandidatesFromStart.all(
           accountId,
           folder.path,
-          remoteDeletionProbeBatchSize,
+          REMOTE_DELETION_PROBE_BATCH_SIZE,
         ) as RemoteDeletionCandidate[];
       }
       if (!candidates.length) {
-        remoteDeletionProbeCursors.delete(cursorKey);
+        deletionProbe.delete(cursorKey);
         return;
       }
 
@@ -730,6 +569,7 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
       // partial iterator or mailbox error therefore cannot turn a timeout into
       // a local deletion decision.
       for await (const message of connectedClient.fetch(candidateUids, { uid: true }, { uid: true })) {
+        if (signal?.aborted) throw new SyncAbortedError();
         if (message.uid && candidateUidSet.has(message.uid)) observedUids.add(message.uid);
       }
 
@@ -753,7 +593,7 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
           });
         }
       })();
-      advanceRemoteDeletionProbeCursor(cursorKey, candidates[candidates.length - 1]!.uid);
+      deletionProbe.advance(cursorKey, candidates[candidates.length - 1]!.uid);
     };
     let synced = 0;
     let failedFolders = 0;
@@ -973,7 +813,17 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
                 flags_json: string;
                 all_mail_archived: number | null;
               }>;
-              deleteFolderMessages.run(accountId, folder.path);
+              // Same folder-reset scope as deleteFolderMessages below: the FTS
+              // mirror is batch-cleared and the per-row trigger suspended for
+              // the bulk delete instead of full-scanning the index once per row.
+              deleteMessagesWithBatchFtsCleanup(
+                db,
+                "account_id = ? AND mailbox = ? AND COALESCE(pending_move_destination, '') = ''",
+                [accountId, folder.path],
+                () => {
+                  deleteFolderMessages.run(accountId, folder.path);
+                },
+              );
               updateFolderUidValidity.run(currentUidValidity, accountId, folder.path);
               if (agentEvents && agentLease) {
                 for (const removed of [...resetRows, ...resetIntentRows]) {
@@ -1165,8 +1015,10 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
           const messageId = messageIdValues(parsed?.messageId ?? message.envelope?.messageId)[0] ?? null;
           const inReplyTo = messageIdValues(parsed?.inReplyTo)[0] ?? null;
           const references = messageIdValues(parsed?.references);
-          const text = parsed?.text ?? "";
-          const html = typeof parsed?.html === "string" ? parsed.html : "";
+          // The body is stored whole and re-decrypted on every read, so an
+          // oversized part is bounded here — with a marker, not a drop.
+          const text = limitStoredTextBody(parsed?.text ?? "");
+          const html = limitStoredHtmlBody(typeof parsed?.html === "string" ? parsed.html : "");
           const sentAtValue = parsed?.date ?? message.envelope?.date ?? message.internalDate ?? new Date();
           const sentAt = sentAtValue instanceof Date ? sentAtValue : new Date(sentAtValue);
           const id = hydratedMessageIds.get(message.uid) ?? messageKey(accountId, folder.path, message.uid);
@@ -1354,7 +1206,7 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
     db.prepare("UPDATE accounts SET status = ?, last_error = ?, last_error_code = ? WHERE id = ?").run(status, message, code, accountId);
     throw error;
   } finally {
-    running.delete(accountId);
+    unmarkAccountSyncing(accountId);
     if (client?.usable) await client.logout().catch(() => undefined);
     if (pendingRuleTargets.length > 0) {
       const targets = pendingRuleTargets;
@@ -1379,21 +1231,3 @@ let client: Awaited<ReturnType<typeof imapClientForAccount>> | undefined;
   }
 }
 
-// Filter-rule application is in sync-filter-rules.ts; re-export for backward compatibility.
-import { applyFilterRulesToNewMessages } from "./sync-filter-rules.js";
-export { applyFilterRulesToNewMessages } from "./sync-filter-rules.js";
-
-// Flag operations are in sync-flags.ts; re-export for backward compatibility.
-import { updateMessageFlags, updateMessageFlagsBatch, markMessageSeen, type MessageFlagsPatch } from "./sync-flags.js";
-export { type MessageFlagsPatch, updateMessageFlags, updateMessageFlagsBatch, markMessageSeen } from "./sync-flags.js";
-
-// Move operations are in sync-moves.ts; re-export for backward compatibility.
-export {
-  type BatchMessageMoveOutcome,
-  type MessageMoveResult,
-  type MessageMoveTarget,
-  batchMoveMessages,
-  moveMessage,
-  moveMessageToFolder,
-  resolveMoveDestination,
-} from "./sync-moves.js";

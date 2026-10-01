@@ -53,30 +53,29 @@ const priorityWeight: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
 const defaultTranslate: Translate = (key, values) => translate("zh-CN", key, values);
 const defaultLocale = "zh-CN";
 
-export function orderedProviderCatalog(providers: ProviderInfo[], locale = defaultLocale): ProviderInfo[] {
-  return [...providers].sort((left, right) => {
+/**
+ * The full provider catalog for the manual list: the pinned quick providers
+ * first (in their curated order, topped up with any other P0 preset), then
+ * everything else by priority and display name. Returns a fresh array; the
+ * API result is never mutated.
+ */
+export function fullCatalogProviders(providers: ProviderInfo[], locale = defaultLocale): ProviderInfo[] {
+  const ordered = [...providers].sort((left, right) => {
     const priorityDelta = (priorityWeight[left.priority ?? ""] ?? 3) - (priorityWeight[right.priority ?? ""] ?? 3);
     if (priorityDelta !== 0) return priorityDelta;
     return left.name.localeCompare(right.name, locale);
   });
-}
-
-export function quickProviderCatalog(providers: ProviderInfo[], locale = defaultLocale): ProviderInfo[] {
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
   const preferred = QUICK_PROVIDER_IDS.flatMap((id) => {
     const provider = byId.get(id);
     return provider ? [provider] : [];
   });
-  const fallback = orderedProviderCatalog(providers, locale).filter((provider) => (
+  const fallback = ordered.filter((provider) => (
     provider.priority === "P0" && !QUICK_PROVIDER_IDS.includes(provider.id)
   ));
-  return [...preferred, ...fallback].slice(0, QUICK_PROVIDER_IDS.length);
-}
-
-export function fullCatalogProviders(providers: ProviderInfo[], locale = defaultLocale): ProviderInfo[] {
-  const quick = quickProviderCatalog(providers, locale);
-  const quickIds = new Set(quick.map((p) => p.id));
-  const remaining = orderedProviderCatalog(providers, locale).filter((p) => !quickIds.has(p.id));
+  const quick = [...preferred, ...fallback].slice(0, QUICK_PROVIDER_IDS.length);
+  const quickIds = new Set(quick.map((provider) => provider.id));
+  const remaining = ordered.filter((provider) => !quickIds.has(provider.id));
   return [...quick, ...remaining];
 }
 

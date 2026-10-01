@@ -1,15 +1,32 @@
 import { randomBytes } from "node:crypto";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentRagWorker } from "../src/agent-rag-worker.js";
 import { AgentService } from "../src/agent-service.js";
 import { AccountLifecycleStore } from "../src/agent/lifecycle.js";
 import { applyAgentStoreSchema } from "../src/agent/schema.js";
 import { AgentSourceEventOutbox, type ClaimedSourceEvent } from "../src/agent/source-events.js";
 import { openDatabase, type DatabaseHandle } from "../src/db.js";
+import type { ProviderChatRequest } from "@nami/agent-contracts";
 
 // Assembled at runtime so secret scanners do not flag the synthetic test keys.
 const PROVIDER_SECRET_CANARY = ["provider", "secret", "canary"].join("-");
 const RAG_TEST_KEY = ["test", "key"].join("-");
+
+// Hermetic by construction: the cloud cases below point a provider at the
+// reserved `api.example.test` TLD, and the run engine's first-turn title
+// generator (its best-effort tail) is a provider call like any other — it goes
+// through the same `service.runtime.streamChat` seam these tests mock, so a
+// case that lets a reply produce text is intercepted instead of dialling out.
+// The tripwire stays regardless: it is the backstop for a future call that
+// forgets the seam, and it makes any such leak fail in microseconds rather
+// than in an unbounded DNS lookup.
+beforeEach(() => {
+  vi.stubGlobal("fetch", () => Promise.reject(new Error("outbound fetch is disabled in agent-service-rag tests")));
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 function insertAccount(db: DatabaseHandle, id = "account-1"): void {
   db.prepare(`
@@ -420,6 +437,74 @@ describe("Agent service lifecycle fence", () => {
       scope: conversation.scope,
     })) events.push(event);
 
+    // Every provider chat the host makes crosses this one seam, so "no stream
+    // was started" is a single assertion about the whole host — the turn, the
+    // second retrieval arm and the tail title call all count as one.
+    expect(providerStream).not.toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error",
+      error: expect.objectContaining({ code: "ACCOUNT_STALE" }),
+    }));
+    expect(events).toContainEqual({ type: "completed", reason: "cancelled" });
+    await service.close();
+  });
+
+  /**
+   * The same fence, one step earlier: the account is deleted while retrieval is
+   * still running rather than after it returned, so the second retrieval arm is
+   * the next thing that would have reached a provider. The worker's guard is the
+   * run's own abort signal (a deletion cancels it), and the guard that follows
+   * is the same `assertRunCurrent` the first case pins. Both are load-bearing:
+   * dropping either one lets a stream start after the deletion.
+   */
+  it("does not start the second retrieval arm after a scoped account is deleted during retrieval", async () => {
+    db = openDatabase(":memory:");
+    masterKey = randomBytes(32);
+    insertAccount(db);
+    insertMessage(db, "account-1");
+    applyAgentStoreSchema(db, "2026-07-27T10:00:00.000Z");
+    const lifecycle = new AccountLifecycleStore(db, masterKey);
+    const outbox = new AgentSourceEventOutbox(db, masterKey, lifecycle);
+    const service = new AgentService({ db, masterKey, lifecycle, sourceEvents: outbox });
+    const provider = service.createProvider({
+      label: "Cloud test",
+      kind: "openai-compatible",
+      endpoint: "https://api.example.test/v1",
+      model: "test-model",
+      apiKey: RAG_TEST_KEY,
+      timeoutMs: 30_000,
+      allowCloudMailContent: true,
+      makeDefault: true,
+    });
+    const conversation = service.createConversation({
+      providerId: provider.id,
+      scope: { mode: "selected_account", accountIds: ["account-1"], messageIds: [] },
+    });
+    const internals = service as unknown as {
+      rag: {
+        search: (...arguments_: unknown[]) => Promise<unknown[]>;
+        warmAccount: (lease: unknown) => Promise<void>;
+      };
+      runtime: { streamChat: () => AsyncIterable<{ type: "completed"; reason: "stop" }> };
+    };
+    // Real retrieval, real lifecycle: the deletion lands while the worker is
+    // still warming the account, which is before the lexical scan and well
+    // before the second arm would fire on an empty result.
+    vi.spyOn(internals.rag, "warmAccount").mockImplementation(async () => {
+      lifecycle.beginDeletion("account-1");
+    });
+    const providerStream = vi.spyOn(internals.runtime, "streamChat").mockImplementation(async function* () {
+      yield { type: "completed", reason: "stop" };
+    });
+
+    const events: Array<{ type: string; error?: { code: string } }> = [];
+    for await (const event of service.streamMessage(conversation.id, {
+      content: "Summarize this message",
+      providerId: provider.id,
+      mode: "agent",
+      scope: conversation.scope,
+    })) events.push(event);
+
     expect(providerStream).not.toHaveBeenCalled();
     expect(events).toContainEqual(expect.objectContaining({
       type: "error",
@@ -458,10 +543,12 @@ describe("Agent service lifecycle fence", () => {
     // in-flight streaming snapshot of the same id. getConversation must not
     // append it a second time.
     const internals = service as unknown as {
-      activeRuns: Map<string, { controller: AbortController; inFlight: unknown }>;
-      conversations: { append: (id: string, leases: unknown[], type: string, payload: unknown) => void };
+      engine: {
+        activeRuns: Map<string, { controller: AbortController; inFlight: unknown }>;
+        conversations: { append: (id: string, leases: unknown[], type: string, payload: unknown) => void };
+      };
     };
-    internals.activeRuns.set(conversation.id, {
+    internals.engine.activeRuns.set(conversation.id, {
       controller: new AbortController(),
       inFlight: {
         id: "message-x",
@@ -475,7 +562,7 @@ describe("Agent service lifecycle fence", () => {
     });
     // Simulate the append the run performs: it must use the conversation's
     // own leases, otherwise the scope fence rejects the write.
-    internals.conversations.append(conversation.id, [lifecycle.acquireLease("account-1")], "turn", {
+    internals.engine.conversations.append(conversation.id, [lifecycle.acquireLease("account-1")], "turn", {
       type: "conversation-turn",
       message: {
         id: "message-x",
@@ -578,5 +665,242 @@ describe("Agent service lifecycle fence", () => {
     }));
     expect(events).toContainEqual({ type: "completed", reason: "cancelled" });
     await service.close();
+  });
+});
+
+/**
+ * The second retrieval arm is a provider chat the host starts on its own
+ * initiative, so it belongs on the same seam as a conversation turn: these
+ * cases observe it there, and the file-level fetch tripwire is the backstop
+ * that turns a regression into a rejected request instead of a DNS lookup.
+ *
+ * The arm's budget is part of its contract rather than an implementation
+ * detail — it lands before the first streamed token — so the 800 ms/10 s split
+ * and the 4,000-character answer cap are pinned here too, along with the
+ * difference that matters most: a stream the model cut short returns nothing,
+ * while a stream this host cancelled keeps whatever already arrived.
+ */
+describe("Agent service second retrieval arm", () => {
+  let db: DatabaseHandle | undefined;
+  let masterKey: Buffer | undefined;
+  let lifecycle: AccountLifecycleStore | undefined;
+  let outbox: AgentSourceEventOutbox | undefined;
+  let service: AgentService | undefined;
+  let provider: { id: string } | undefined;
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    await service?.close();
+    masterKey?.fill(0);
+    db?.close();
+    db = undefined;
+    masterKey = undefined;
+    service = undefined;
+    lifecycle = undefined;
+    outbox = undefined;
+    provider = undefined;
+  });
+
+  function fixture(options: { allowCloudMailContent?: boolean } = {}): void {
+    db = openDatabase(":memory:");
+    masterKey = randomBytes(32);
+    insertAccount(db);
+    insertMessage(db, "account-1");
+    applyAgentStoreSchema(db, "2026-07-27T10:00:00.000Z");
+    lifecycle = new AccountLifecycleStore(db, masterKey);
+    outbox = new AgentSourceEventOutbox(db, masterKey, lifecycle);
+    service = new AgentService({ db, masterKey, lifecycle, sourceEvents: outbox });
+    provider = service.createProvider({
+      label: "Cloud test",
+      kind: "openai-compatible",
+      endpoint: "https://api.example.test/v1",
+      model: "test-model",
+      apiKey: RAG_TEST_KEY,
+      timeoutMs: 30_000,
+      allowCloudMailContent: options.allowCloudMailContent ?? true,
+      makeDefault: true,
+    });
+  }
+
+  /** Indexes the one stored message so the lexical arm has a real corpus to miss against. */
+  async function indexStoredMail(): Promise<void> {
+    const lease = lifecycle!.acquireLease("account-1");
+    outbox!.enqueue({
+      lease,
+      event: {
+        eventId: "source-upsert-1",
+        type: "message-upserted",
+        accountId: "account-1",
+        accountGeneration: lease.generation,
+        revision: "revision-1",
+        source: { kind: "message", messageId: "message-1" },
+        occurredAt: "2026-07-27T10:00:01.000Z",
+      },
+    });
+    await internals().rag.drainOnce();
+  }
+
+  type AuxiliaryEvent =
+    | { type: "text_delta"; delta: string }
+    | { type: "error"; error: { code: string; message: string; retryable: boolean } }
+    | { type: "completed"; reason: string };
+
+  function internals() {
+    return service! as unknown as {
+      rag: AgentRagWorker;
+      runtime: {
+        streamChat: (request: { requestId: string; signal?: AbortSignal; chat: ProviderChatRequest }) => AsyncIterable<AuxiliaryEvent>;
+      };
+      providerForConfiguration: (configuration: unknown) => unknown;
+      expandRagQuery: (
+        query: string,
+        signal: AbortSignal | undefined,
+        reason: "empty" | "weak",
+      ) => Promise<readonly string[]>;
+    };
+  }
+
+  it("asks for extra terms through the runtime seam and never builds a provider", async () => {
+    fixture();
+    await indexStoredMail();
+    const requests: Array<{ requestId: string; signal?: AbortSignal; chat: ProviderChatRequest }> = [];
+    const streamChat = vi.spyOn(internals().runtime, "streamChat").mockImplementation(async function* (request) {
+      requests.push(request);
+      yield { type: "text_delta", delta: '["expense", "reimbursement"]' };
+      yield { type: "completed", reason: "stop" };
+    });
+    const providerFactory = vi.spyOn(internals(), "providerForConfiguration");
+
+    // A question whose words appear nowhere in the mailbox: the keyword arm
+    // comes back empty, which is the one condition that consults the second arm.
+    await internals().rag.search(["account-1"], "zeppelin quokka", 6);
+
+    expect(streamChat).toHaveBeenCalledTimes(1);
+    const request = requests[0]!;
+    expect(request.requestId).toMatch(/^rag-expansion-/);
+    // The request shape is the arm's whole contract: the user's own question
+    // only, no tools, and a zero temperature that keeps the answer a term list.
+    expect(request.chat).toMatchObject({
+      providerId: provider!.id,
+      model: "test-model",
+      tools: [],
+      allowToolCalls: false,
+      responseFormat: "text",
+      temperature: 0,
+    });
+    expect(request.chat.messages).toHaveLength(2);
+    expect(request.chat.messages[0]).toEqual({
+      role: "system",
+      content: "Expand this mail-search query into up to 6 comma-separated keywords, including English synonyms.",
+    });
+    expect(request.chat.messages[1]).toEqual({ role: "user", content: "zeppelin quokka" });
+    expect(request.signal).toBeInstanceOf(AbortSignal);
+    // Constructing a provider is the step that precedes any outbound request,
+    // so an untouched spy is the direct proof that none was built.
+    expect(providerFactory).not.toHaveBeenCalled();
+  });
+
+  it("sends nothing to a cloud provider that was not authorized to see the mailbox", async () => {
+    fixture({ allowCloudMailContent: false });
+    await indexStoredMail();
+    const streamChat = vi.spyOn(internals().runtime, "streamChat").mockImplementation(async function* () {
+      yield { type: "text_delta", delta: '["expense"]' };
+      yield { type: "completed", reason: "stop" };
+    });
+
+    await internals().rag.search(["account-1"], "zeppelin quokka", 6);
+
+    // Same boundary as retrieval itself: the arm reads the mailbox, so a
+    // provider without consent is refused before any request is built.
+    expect(streamChat).not.toHaveBeenCalled();
+  });
+
+  it("stops reading the answer at 4,000 characters", async () => {
+    fixture();
+    let delivered = 0;
+    vi.spyOn(internals().runtime, "streamChat").mockImplementation(async function* () {
+      while (delivered < 4_000) {
+        delivered += 100;
+        yield { type: "text_delta", delta: "x".repeat(100) };
+      }
+      // Past the cap: a model that keeps talking must not be able to spend the
+      // rest of the budget, and whatever it says after the cap is never read.
+      yield { type: "text_delta", delta: ",tail-term" };
+      yield { type: "completed", reason: "stop" };
+    });
+
+    const terms = await internals().expandRagQuery("zeppelin quokka", undefined, "empty");
+
+    expect(delivered).toBe(4_000);
+    expect(terms).not.toContain("tail-term");
+    expect(terms).toHaveLength(1);
+  });
+
+  it("spends 800 ms on a weak recall and keeps the terms that already arrived", async () => {
+    fixture();
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const abortedAt: number[] = [];
+    vi.spyOn(internals().runtime, "streamChat").mockImplementation(async function* (request) {
+      yield { type: "text_delta", delta: "alpha, beta" };
+      // The runtime turns a cancelled stream into an error event rather than a
+      // throw, so the budget has to be recognised from this side.
+      await new Promise<void>((resolve) => {
+        request.signal?.addEventListener("abort", () => {
+          abortedAt.push(Date.now());
+          resolve();
+        }, { once: true });
+      });
+      yield { type: "error", error: { code: "CANCELLED", message: "The provider stream was cancelled.", retryable: false } };
+      yield { type: "completed", reason: "cancelled" };
+    });
+
+    const pending = internals().expandRagQuery("zeppelin quokka", undefined, "weak");
+    await vi.advanceTimersByTimeAsync(799);
+    expect(abortedAt).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(abortedAt).toEqual([startedAt + 800]);
+    // The turn already paid the latency; the terms it bought are still usable.
+    await expect(pending).resolves.toEqual(["alpha", "beta"]);
+  });
+
+  it("spends 10 s on an empty recall", async () => {
+    fixture();
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const abortedAt: number[] = [];
+    vi.spyOn(internals().runtime, "streamChat").mockImplementation(async function* (request) {
+      yield { type: "text_delta", delta: "alpha" };
+      await new Promise<void>((resolve) => {
+        request.signal?.addEventListener("abort", () => {
+          abortedAt.push(Date.now());
+          resolve();
+        }, { once: true });
+      });
+      yield { type: "error", error: { code: "CANCELLED", message: "The provider stream was cancelled.", retryable: false } };
+      yield { type: "completed", reason: "cancelled" };
+    });
+
+    const pending = internals().expandRagQuery("zeppelin quokka", undefined, "empty");
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(abortedAt).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(abortedAt).toEqual([startedAt + 10_000]);
+    await expect(pending).resolves.toEqual(["alpha"]);
+  });
+
+  it("returns no extra terms when the model stream reports an error", async () => {
+    fixture();
+    vi.spyOn(internals().runtime, "streamChat").mockImplementation(async function* () {
+      yield { type: "text_delta", delta: "alpha, beta" };
+      yield { type: "error", error: { code: "PROVIDER_ERROR", message: "model refused", retryable: false } };
+      yield { type: "completed", reason: "error" };
+    });
+
+    // Only this host cancelling the stream salvages a partial answer; an error
+    // the model reported leaves retrieval exactly as it was.
+    await expect(internals().expandRagQuery("zeppelin quokka", undefined, "empty")).resolves.toEqual([]);
   });
 });

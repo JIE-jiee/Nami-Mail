@@ -6,6 +6,7 @@ const account: Account = {
   id: "account-1",
   email: "mail@example.test",
   provider: "custom",
+  authMethod: "password",
   providerName: "Custom",
   status: "connected",
   lastError: null,

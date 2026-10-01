@@ -28,8 +28,9 @@ import type {
 } from "../agentTypes";
 import { useI18n } from "../i18n";
 import { AgentMcpServerPane } from "./AgentMcpServerPane";
+import { OLLAMA_DEFAULT_ENDPOINT } from "./agent-utils";
 
-const ollamaEndpointSuggestion = "http://127.0.0.1:11434/v1";
+const ollamaEndpointSuggestion = OLLAMA_DEFAULT_ENDPOINT;
 
 type ProviderKindMetadata = {
   endpointSuggestion: string;

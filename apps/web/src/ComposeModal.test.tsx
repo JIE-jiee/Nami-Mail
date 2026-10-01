@@ -16,30 +16,42 @@ import type { Account } from "./types";
 const h = vi.hoisted(() => ({
   contacts: vi.fn(),
   templates: vi.fn(),
+  agentProviders: vi.fn(),
+  fetch: vi.fn(),
 }));
 
-vi.mock("./api", () => ({
-  api: {
-    contacts: h.contacts,
-    templates: h.templates,
-    discardOutboundAttachments: vi.fn(async () => ({ ok: true })),
-    discardDraft: vi.fn(async () => ({ ok: true })),
-    uploadOutboundAttachment: vi.fn(async (_accountId: string, file: File) => ({
-      token: "mock-token-1",
-      filename: file.name,
-      contentType: file.type || "application/octet-stream",
-      size: file.size,
-    })),
-    send: vi.fn(async () => ({ ok: true })),
-    submission: vi.fn(async () => ({ submission: { status: "running" } })),
-    saveDraft: vi.fn(async () => ({ ok: true })),
-  },
-}));
+// `ApiError` is re-exported from ./api and `errorPresentation` matches on it
+// with `instanceof`, so the mock has to carry the real class or every failure
+// path throws "right-hand side of instanceof is not callable" instead of
+// reporting the failure it was given.
+vi.mock("./api", async () => {
+  const { ApiError } = await import("./apiTransport");
+  return {
+    ApiError,
+    api: {
+      contacts: h.contacts,
+      templates: h.templates,
+      agentProviders: h.agentProviders,
+      discardOutboundAttachments: vi.fn(async () => ({ ok: true })),
+      discardDraft: vi.fn(async () => ({ ok: true })),
+      uploadOutboundAttachment: vi.fn(async (_accountId: string, file: File) => ({
+        token: "mock-token-1",
+        filename: file.name,
+        contentType: file.type || "application/octet-stream",
+        size: file.size,
+      })),
+      send: vi.fn(async () => ({ ok: true })),
+      submission: vi.fn(async () => ({ submission: { status: "running" } })),
+      saveDraft: vi.fn(async () => ({ ok: true })),
+    },
+  };
+});
 
 const account: Account = {
   id: "account-1",
   email: "me@example.com",
   provider: "imap",
+  authMethod: "password",
   providerName: "Example Mail",
   status: "connected",
   lastError: null,
@@ -52,7 +64,7 @@ const account: Account = {
 let container: HTMLDivElement;
 let root: Root;
 
-function renderCompose() {
+function renderCompose(draftText = "") {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -62,7 +74,7 @@ function renderCompose() {
       <I18nProvider>
         <ComposeModal
           accounts={[account]}
-          draft={{ to: "", subject: "", text: "" }}
+          draft={{ to: "", subject: "", text: draftText }}
           onClose={() => undefined}
           onSent={onSent}
           onDraftSaved={() => undefined}
@@ -97,6 +109,24 @@ const flush = async () => {
   });
 };
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  } as unknown as Response;
+}
+
+const bodyInput = (): HTMLTextAreaElement => {
+  const textarea = container.querySelector<HTMLTextAreaElement>("#compose-body");
+  if (!textarea) throw new Error("compose-body textarea not found");
+  return textarea;
+};
+
+/** The first toolbar button is the polish affordance; the undo follows it. */
+const polishButtons = (): HTMLButtonElement[] =>
+  [...container.querySelectorAll<HTMLButtonElement>(".compose-polish-button")];
+
 // The contact lookup is debounced by 180ms before the api call fires.
 const settleContactDebounce = async () => {
   await flush();
@@ -115,6 +145,13 @@ const pressKey = (key: string) => {
 beforeEach(() => {
   h.contacts.mockReset();
   h.templates.mockReset();
+  h.agentProviders.mockReset();
+  h.fetch.mockReset();
+  // Configured by default so the pre-existing cases keep a live toolbar; the
+  // polish cases below override this to drive each state.
+  h.agentProviders.mockResolvedValue({ items: [{ id: "provider-1", configured: true }], defaultProviderId: "provider-1" });
+  h.fetch.mockResolvedValue(jsonResponse({ ok: true, text: "润色后的正文。" }));
+  vi.stubGlobal("fetch", h.fetch);
   h.contacts.mockResolvedValue({
     ok: true,
     items: [
@@ -125,6 +162,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   act(() => {
     root.unmount();
   });
@@ -267,5 +305,114 @@ describe("compose drag-and-drop and clipboard paste", () => {
       card.dispatchEvent(pasteEvent);
     });
     await flush();
+  });
+});
+
+describe("compose body polish", () => {
+  const ORIGINAL = "Kindly revert back at your earliest convenience.";
+
+  it("explains the unavailable affordance on hover and refuses the click when no model is configured", async () => {
+    h.agentProviders.mockResolvedValue({ items: [], defaultProviderId: null });
+    const { onSent } = renderCompose(ORIGINAL);
+    await flush();
+
+    const button = polishButtons()[0];
+    expect(button).toBeDefined();
+    // A natively disabled button swallows pointer events, so the affordance is
+    // aria-disabled instead: it stays hoverable, which is the whole point.
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.getAttribute("data-tooltip")).toBe("该功能需要配置模型。");
+
+    act(() => button.click());
+    await flush();
+
+    expect(h.fetch).not.toHaveBeenCalled();
+    expect(bodyInput().value).toBe(ORIGINAL);
+    expect(onSent).not.toHaveBeenCalled();
+  });
+
+  it("locks and animates the body while the model works, then replaces it and offers an undo", async () => {
+    let release: (() => void) | undefined;
+    h.fetch.mockImplementation(() => new Promise((resolve) => {
+      release = () => resolve(jsonResponse({ ok: true, text: "Please revert at your earliest convenience." }));
+    }));
+    const { onSent } = renderCompose(ORIGINAL);
+    await flush();
+
+    act(() => polishButtons()[0]!.click());
+    await flush();
+
+    expect(h.fetch).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(h.fetch.mock.calls[0]?.[1]?.body))).toEqual({ text: ORIGINAL, locale: "zh-CN" });
+    expect(bodyInput().disabled).toBe(true);
+    expect(bodyInput().className).toContain("is-polishing");
+    expect(bodyInput().getAttribute("aria-busy")).toBe("true");
+
+    await act(async () => {
+      release?.();
+      await flush();
+    });
+
+    expect(bodyInput().value).toBe("Please revert at your earliest convenience.");
+    expect(bodyInput().className).not.toContain("is-polishing");
+    expect(onSent).toHaveBeenCalledWith("已润色正文。", "success");
+
+    const undo = polishButtons()[1];
+    expect(undo?.textContent).toContain("撤销润色");
+    act(() => undo!.click());
+    expect(bodyInput().value).toBe(ORIGINAL);
+    expect(polishButtons()).toHaveLength(1);
+  });
+
+  it("keeps the original body and reports the failure when the model call does not complete", async () => {
+    h.fetch.mockResolvedValue(jsonResponse({ ok: false, code: "PROVIDER_ERROR", message: "Polish failed." }, 502));
+    const { onSent } = renderCompose(ORIGINAL);
+    await flush();
+
+    act(() => polishButtons()[0]!.click());
+    await flush();
+
+    expect(bodyInput().value).toBe(ORIGINAL);
+    expect(bodyInput().className).not.toContain("is-polishing");
+    // No undo is offered: nothing was replaced.
+    expect(polishButtons()).toHaveLength(1);
+    expect(onSent).toHaveBeenCalledTimes(1);
+    expect(onSent.mock.calls[0]?.[1]).toBe("error");
+  });
+
+  it("blocks an over-long body without calling the endpoint", async () => {
+    const oversized = "a".repeat(50_001);
+    renderCompose(oversized);
+    await flush();
+
+    const button = polishButtons()[0]!;
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.getAttribute("data-tooltip")).toBe("正文过长，暂时无法润色。");
+
+    act(() => button.click());
+    await flush();
+
+    expect(h.fetch).not.toHaveBeenCalled();
+    expect(bodyInput().value).toBe(oversized);
+  });
+
+  it("reads the endpoint's no_model_configured refusal as configuration advice, not a failure", async () => {
+    // The compose window's cached "a model is configured" read can go stale
+    // between mount and click (the model was deleted in another window). The
+    // 409 is what tells it so, and it has to become the same affordance the
+    // hover state would have shown rather than an error toast.
+    const { onSent } = renderCompose(ORIGINAL);
+    await flush();
+    expect(polishButtons()[0]!.getAttribute("aria-disabled")).toBe("false");
+
+    h.fetch.mockResolvedValue(jsonResponse({ ok: false, code: "no_model_configured", message: "该功能需要配置模型。" }, 409));
+    act(() => polishButtons()[0]!.click());
+    await flush();
+
+    expect(onSent).toHaveBeenCalledWith("该功能需要配置模型。", "error");
+    expect(bodyInput().value).toBe(ORIGINAL);
+    expect(polishButtons()[0]!.getAttribute("aria-disabled")).toBe("true");
+    expect(polishButtons()[0]!.getAttribute("data-tooltip")).toBe("该功能需要配置模型。");
   });
 });

@@ -1,5 +1,5 @@
 import { createAgentError, type AgentError } from "@nami/agent-contracts";
-import { isIP } from "node:net";
+import { isLoopbackHostname } from "../endpoint-guard.js";
 
 /** Shared upper bound for a single SSE line/frame across provider adapters. */
 export const maximumSseLineBytes = 512 * 1024;
@@ -48,12 +48,6 @@ export function awaitAbortable<T>(operation: Promise<T>, signal: AbortSignal): P
   });
 }
 
-function isLoopbackHost(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (normalized === "localhost" || normalized === "::1") return true;
-  if (isIP(normalized) !== 4) return false;
-  return Number(normalized.split(".", 1)[0]) === 127;
-}
 
 export function endpointUrl(value: string): URL {
   let endpoint: URL;
@@ -62,7 +56,7 @@ export function endpointUrl(value: string): URL {
   } catch {
     throw new Error("The provider endpoint is invalid.");
   }
-  if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && isLoopbackHost(endpoint.hostname))) {
+  if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && isLoopbackHostname(endpoint.hostname))) {
     throw new Error("The provider endpoint must use HTTPS or local loopback HTTP.");
   }
   if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {

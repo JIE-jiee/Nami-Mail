@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { acquireAccountWriteSlots, withAccountWriteLocks, withHeldWriteSlots } from "../src/sync.js";
+import { acquireAccountWriteSlots, withAccountWriteLocks, withHeldWriteSlots } from "../src/sync-locks.js";
 
 describe("account write locks", () => {
   it("nested acquisition of the same account is a reentrant no-op (no self-deadlock)", async () => {
@@ -52,6 +52,37 @@ describe("account write locks", () => {
     release();
     await Promise.all([first, second]);
     expect(order).toEqual(["first", "second"]);
+  });
+
+  it("keeps an inner run's acquired slots out of the outer context that spawned it", async () => {
+    let releaseInner!: () => void;
+    const innerGate = new Promise<void>((resolve) => { releaseInner = resolve; });
+    let outerOutcome: "queued-behind-inner" | "rode-the-leaked-slot" | undefined;
+
+    await withAccountWriteLocks(["account-1"], async () => {
+      // The outer context now holds a real held-slots set (containing
+      // account-1). Spawn an inner run for a different account without
+      // awaiting it, so the outer context keeps running while the inner run
+      // holds account-2.
+      const inner = withAccountWriteLocks(["account-2"], async () => {
+        await innerGate;
+      });
+      // Let the inner run acquire account-2.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Acquiring account-2 from the outer context must queue behind the
+      // inner run. A shared held-slots set would make this a reentrant no-op
+      // while account-2 is genuinely held by the inner run.
+      const outerForAccount2 = withAccountWriteLocks(["account-2"], async () => undefined);
+      const raced = await Promise.race([
+        outerForAccount2.then(() => "acquired" as const),
+        new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 50)),
+      ]);
+      outerOutcome = raced === "acquired" ? "rode-the-leaked-slot" : "queued-behind-inner";
+      releaseInner();
+      await inner;
+      await outerForAccount2;
+    });
+    expect(outerOutcome).toBe("queued-behind-inner");
   });
 
   it("times out waiting for a hung holder instead of blocking forever", async () => {

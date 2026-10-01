@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { autoReplyConfigPatchSchema, autoReplyConfigSchema } from "./auto-reply.js";
+import { autoReplyConfigDefaults, autoReplyConfigPatchSchema, autoReplyConfigSchema } from "./auto-reply.js";
 import { agentAccessLevelSchema } from "./caller.js";
 
 /**
@@ -99,13 +99,5 @@ export const appSettingsCoreDefaults: AppSettingsCore = {
   agentAccessLevel: "send-confirmed",
   agentCliAccessLevel: "read-only",
   agentMcpAccessLevel: "read-only",
-  autoReply: {
-    enabled: false,
-    accountIds: [],
-    mode: "llm",
-    template: { text: "", skipConfirmation: false },
-    scope: { contactsOnly: false, threadOnce: true, rules: [] },
-    requireConfirmation: true,
-    dailyLimitPerAccount: 30,
-  },
+  autoReply: autoReplyConfigDefaults,
 };

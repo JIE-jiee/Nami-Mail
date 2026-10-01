@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { sha256Digest } from "./agent-shared.js";
 
 export const MAIL_CHUNKER_VERSION = "nami-mail-chunker-v1";
 
@@ -28,10 +28,6 @@ type SemanticBlock = {
 
 const defaultTargetTokens = 360;
 const defaultMaximumTokens = 520;
-
-function digest(value: string): string {
-  return `sha256.${createHash("sha256").update(value, "utf8").digest("base64url")}`;
-}
 
 function validIdentifier(value: string, name: string): void {
   if (!value || value.length > 512) throw new Error(`${name} is invalid.`);
@@ -186,9 +182,9 @@ export function chunkMailContent(input: MailChunkInput): MailChunk[] {
   if (!chunks.length && subject) chunks.push({ content: prefix, kind: "subject" });
   return chunks.map((chunk, chunkIndex) => {
     const tokenEstimate = estimateMailTokens(chunk.content);
-    const contentHash = digest(chunk.content);
+    const contentHash = sha256Digest(chunk.content);
     return {
-      chunkId: digest(`${input.messageId}\0${input.sourceRevision}\0${chunkIndex}\0${contentHash}`),
+      chunkId: sha256Digest(`${input.messageId}\0${input.sourceRevision}\0${chunkIndex}\0${contentHash}`),
       chunkIndex,
       content: chunk.content,
       contentHash,

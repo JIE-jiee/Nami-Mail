@@ -5,7 +5,6 @@ import { translate, type Translate, useI18n } from "./i18n";
 import {
   newMessageDraftFromSubmission,
   recipientSummary,
-  submissionMessageIdSuffix,
   submissionStatusPresentation,
 } from "./sendingStatus";
 import type { Account, OutboundSubmission } from "./types";
@@ -268,9 +267,7 @@ export default function SendingStatusModal({
             {pageSubmissions.map((submission) => {
               const presentation = submissionStatusPresentation(submission.deliveryStatus, t);
               const recipients = recipientSummary(submission.recipients, 3, t);
-              const title = submission.subject === undefined || submission.subject === null
-                ? t("sending.modal.recordTitle", { id: submissionMessageIdSuffix(submission.messageId) })
-                : submission.subject || t("sending.modal.untitled");
+              const title = submission.subject || t("sending.modal.untitled");
               const canSync = submission.deliveryStatus === "unknown_delivery" || submission.deliveryStatus === "submitted";
               const canCreate = submission.deliveryStatus === "unknown_delivery" || submission.deliveryStatus === "failed";
               const isPendingScheduled = submission.deliveryStatus === "pending" && Boolean(submission.sendAt);
@@ -335,9 +332,7 @@ export default function SendingStatusModal({
                 <div>
                   <span className="eyebrow">{t("sending.modal.detailsEyebrow")}</span>
                   <h3 id="sending-status-details-title" className="contact-editor-title">
-                    {detailsSubmission.subject === undefined || detailsSubmission.subject === null
-                      ? t("sending.modal.recordTitle", { id: submissionMessageIdSuffix(detailsSubmission.messageId) })
-                      : detailsSubmission.subject || t("sending.modal.untitled")}
+                    {detailsSubmission.subject || t("sending.modal.untitled")}
                   </h3>
                   <small className="sending-status-details-account">{accountById.get(detailsSubmission.accountId)?.email ?? t("sending.modal.removedAccount")}</small>
                 </div>
@@ -353,7 +348,7 @@ export default function SendingStatusModal({
                     <>
                       <div><dt>{t("sending.modal.statusLabel")}</dt><dd><span className={`sending-status-badge tone-${detailsPresentation.tone}`}>{statusIcon(detailsSubmission.deliveryStatus)}{detailsPresentation.label}</span></dd></div>
                       <div><dt>{t("sending.modal.detailLabel")}</dt><dd>{detailsPresentation.detail}</dd></div>
-                      <div><dt>{t("sending.modal.subject")}</dt><dd>{detailsSubmission.subject === undefined || detailsSubmission.subject === null ? t("sending.modal.untitled") : detailsSubmission.subject}</dd></div>
+                      <div><dt>{t("sending.modal.subject")}</dt><dd>{detailsSubmission.subject || t("sending.modal.untitled")}</dd></div>
                       <div><dt>{t("sending.modal.recipientsLabel")}</dt><dd>{detailsRecipients}</dd></div>
                       <div><dt>{t("sending.modal.account")}</dt><dd>{accountById.get(detailsSubmission.accountId)?.email ?? t("sending.modal.removedAccount")}</dd></div>
                       <div><dt>{t("sending.modal.messageId")}</dt><dd><code>{detailsSubmission.messageId}</code></dd></div>

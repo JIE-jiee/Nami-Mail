@@ -4,7 +4,7 @@ import { listEnabledFilterRules, matchesFilterRuleConditions } from "./filter-ru
 import type { AccountAccessTokenProvider } from "./mail.js";
 import { messagePayloadById } from "./message-storage.js";
 import { moveMessage, moveMessageToFolder } from "./sync-moves.js";
-import { updateMessageFlags } from "./sync.js";
+import { updateMessageFlags } from "./sync-flags.js";
 
 /**
  * Applies enabled filter rules to newly arrived inbox messages after a sync

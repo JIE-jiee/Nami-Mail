@@ -4,11 +4,9 @@ import type { ProviderInfo } from "./types";
 import {
   CUSTOM_IMAP_PROVIDER_ID,
   fullCatalogProviders,
-  orderedProviderCatalog,
   providerAuthLabel,
   providerMonogram,
   providerServerConfiguration,
-  quickProviderCatalog,
   serverEndpointLabel,
 } from "./providerOnboarding";
 
@@ -40,15 +38,6 @@ describe("provider onboarding catalog", () => {
       provider("sina", "Sina", "P1"),
     ];
 
-    expect(quickProviderCatalog(catalog).map((item) => item.id)).toEqual([
-      "gmail",
-      "microsoft",
-      "qq",
-      "netease-163",
-      "netease-126",
-      "icloud",
-    ]);
-
     expect(fullCatalogProviders(catalog).map((item) => item.id)).toEqual([
       "gmail",
       "microsoft",
@@ -63,7 +52,7 @@ describe("provider onboarding catalog", () => {
 
   it("sorts the full catalog by priority without mutating the API result", () => {
     const source = [provider("p2", "Z", "P2"), provider("p0", "A", "P0"), provider("p1", "B", "P1")];
-    expect(orderedProviderCatalog(source).map((item) => item.id)).toEqual(["p0", "p1", "p2"]);
+    expect(fullCatalogProviders(source).map((item) => item.id)).toEqual(["p0", "p1", "p2"]);
     expect(source.map((item) => item.id)).toEqual(["p2", "p0", "p1"]);
   });
 

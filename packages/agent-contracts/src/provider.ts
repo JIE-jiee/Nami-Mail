@@ -97,6 +97,41 @@ export const providerHealthSchema = z.object({
   error: agentErrorSchema.optional(),
 }).strict();
 
+export const agentProviderKinds = [
+  "openai-compatible",
+  "ollama",
+  "anthropic",
+  "gemini",
+  "openai-responses",
+] as const;
+
+export const agentProviderKindSchema = z.enum(agentProviderKinds);
+export type AgentProviderKind = z.infer<typeof agentProviderKindSchema>;
+
+/**
+ * Non-secret provider details returned by the local Agent provider service
+ * (`providerSummary`). Secrets never appear here; health carries the shared
+ * `providerHealthSchema`.
+ */
+export const agentProviderSummarySchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  kind: agentProviderKindSchema,
+  endpoint: z.string(),
+  model: z.string(),
+  /** Tolerated for older records; retrieval no longer uses embeddings. */
+  embeddingModel: z.string().optional(),
+  timeoutMs: z.number(),
+  apiKeyConfigured: z.boolean(),
+  configured: z.boolean(),
+  cloud: z.boolean(),
+  cloudContentConsent: z.boolean(),
+  streaming: z.boolean(),
+  /** Whether the configured model accepts image inputs; gates image attachments. */
+  vision: z.boolean(),
+  health: providerHealthSchema.optional(),
+});
+
 export const embeddingRequestSchema = z.object({
   requestId: requestIdSchema,
   providerId: providerIdSchema,
@@ -118,6 +153,7 @@ export type ProviderChatRequest = z.infer<typeof providerChatRequestSchema>;
 export type ProviderChatResponse = z.infer<typeof providerChatResponseSchema>;
 export type ProviderStreamEvent = z.infer<typeof providerStreamEventSchema>;
 export type ProviderHealth = z.infer<typeof providerHealthSchema>;
+export type AgentProviderSummary = z.infer<typeof agentProviderSummarySchema>;
 export type EmbeddingRequest = z.infer<typeof embeddingRequestSchema>;
 export type EmbeddingResponse = z.infer<typeof embeddingResponseSchema>;
 

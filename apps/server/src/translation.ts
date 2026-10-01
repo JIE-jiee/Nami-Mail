@@ -1,4 +1,4 @@
-import { isIP } from "node:net";
+import { isLoopbackHostname } from "./endpoint-guard.js";
 import { mailErrorCode } from "./mail.js";
 
 export const MAX_TRANSLATION_TEXT_LENGTH = 50_000;
@@ -112,12 +112,6 @@ type TranslationResponse = {
   detectedLanguage?: { language?: unknown };
 };
 
-function isLoopbackHost(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (normalized === "localhost" || normalized === "::1") return true;
-  if (isIP(normalized) !== 4) return false;
-  return Number(normalized.split(".", 1)[0]) === 127;
-}
 
 function translationEndpoint(value: string): URL {
   let endpoint: URL;
@@ -126,7 +120,7 @@ function translationEndpoint(value: string): URL {
   } catch {
     throw new TranslationServiceError("translation_not_configured", "The translation endpoint is invalid.");
   }
-  if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && isLoopbackHost(endpoint.hostname))) {
+  if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && isLoopbackHostname(endpoint.hostname))) {
     throw new TranslationServiceError("translation_not_configured", "The translation endpoint must use HTTPS or local loopback HTTP.");
   }
   if (endpoint.username || endpoint.password || !endpoint.hostname || endpoint.pathname !== "/translate" || endpoint.search || endpoint.hash) {

@@ -9,6 +9,7 @@ import { syncAccount } from "../sync.js";
 import { emitAccountSynced } from "../events.js";
 import { getAppSettings, getSyncMessageLimit } from "../settings.js";
 import { emptyBodySchema } from "../schemas.js";
+import { ROUTE_ERROR_CODES } from "./error-codes.js";
 
 export type OAuthRouteDeps = {
   context: RuntimeContext;
@@ -59,6 +60,10 @@ function startOAuthInitialSync(app: FastifyInstance, context: RuntimeContext, ac
     getSyncMessageLimit(context.db),
     context.oauthService,
     context.agentMailEvents,
+    // Process shutdown stops this first pass; the callback page closing its
+    // own window must not — that close is the standard OAuth flow, not a
+    // cancellation.
+    context.syncShutdownSignal,
   )
     .then(() => emitAccountSynced(context.db, context.serverEvents, accountId))
     .catch((error) => {
@@ -72,13 +77,13 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRouteDeps):
 
   app.post<{ Params: { provider: string } }>("/api/oauth/:provider/start", async (request, reply) => {
     const body = emptyBodySchema.safeParse(request.body ?? {});
-    if (!body.success) return reply.code(400).send({ ok: false, code: "invalid_request", message: validationMessage(body.error) });
+    if (!body.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(body.error) });
     if (!isSupportedOAuthProvider(request.params.provider)) {
-      return reply.code(404).send({ ok: false, code: "oauth_provider_unsupported", message: "不支持该 OAuth 服务商。" });
+      return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.oauth_provider_unsupported, message: "不支持该 OAuth 服务商。" });
     }
     const oauthService = context.oauthService;
     if (!oauthService || !oauthService.isConfigured(request.params.provider)) {
-      return reply.code(503).send({ ok: false, code: "oauth_not_configured", message: "此安全登录尚未配置，请使用应用专用密码或联系管理员。" });
+      return reply.code(503).send({ ok: false, code: ROUTE_ERROR_CODES.oauth_not_configured, message: "此安全登录尚未配置，请使用应用专用密码或联系管理员。" });
     }
     try {
       const started = await oauthService.start(request.params.provider, oauthCallbackOrigin(app, context, request.params.provider));
@@ -117,9 +122,9 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRouteDeps):
 
   app.get<{ Params: { attemptId: string } }>("/api/oauth/attempts/:attemptId", async (request, reply) => {
     const attemptId = z.uuid().safeParse(request.params.attemptId);
-    if (!attemptId.success) return reply.code(400).send({ ok: false, code: "invalid_request", message: "授权请求标识无效。" });
+    if (!attemptId.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "授权请求标识无效。" });
     if (!context.oauthService) {
-      return reply.code(503).send({ ok: false, code: "oauth_not_configured", message: "安全登录尚未配置。" });
+      return reply.code(503).send({ ok: false, code: ROUTE_ERROR_CODES.oauth_not_configured, message: "安全登录尚未配置。" });
     }
     return { ok: true, attemptId: attemptId.data, ...context.oauthService.getAttempt(attemptId.data) };
   });

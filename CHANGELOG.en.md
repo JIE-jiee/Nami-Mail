@@ -2,21 +2,33 @@
 
 ### Added
 
+- Compose AI polish: refine the draft body with one click (meaning, facts, and addressee references preserved, same language) with inline undo; without a configured model the button shows an explanatory bubble, and cloud sends respect the existing content-consent gate.
+- Plain-text body linkification: http/https links in plain-text emails become clickable in the reader (opened in the system browser; character-faithful, idempotent, http/https only).
+- Microsoft add-account guidance: the drawer gains a "one-time setup" card (Azure registration: Mobile and desktop platform, loopback callback path, allow public client flows); when the button is unavailable the UI says so honestly and shows the steps.
+- Provider tile selection indicator: after picking a non-core provider from "more providers", the collapsed strip smoothly reveals the selected tile with its check mark (transitions respect reduced-motion).
 - Sidebar folder display mode: switch between focused (single-account view with a bottom folder list) and a multi-account tree mode (every account stays visible and folds its folders independently); the preference is stored locally. (#95, Issue #88)
 - Gmail sign-in guidance: defaults to the 16-digit app password with OAuth as an opt-in path, a direct shortcut to Google's app-passwords page, a side drawer covering the 2FA prerequisite and guided steps, and automatic whitespace stripping for credentials. (#95, Issue #86)
 
 ### Fixed
 
+- **Outlook / Hotmail add-account dead ends (Issue #116)**: with no OAuth client ID configured, the OAuth panel did not render at all, the action card referenced a nonexistent button, the footer submit stayed disabled forever, and the guide taught an impossible app-password path — the panel now honestly presents "not yet available in this build" plus one-time setup steps; partial outlook addresses no longer flash a misleading password field; the documented registration platform was corrected from Web to Mobile and desktop (the local callback port is dynamic, so the Web platform's exact-port match always fails).
+- Duplicate conversation cards: when one message exists in both the inbox and a labeled folder, the conversation strip rendered two identical cards — now collapsed by Message-ID with the opened row always winning.
+- Folder navigation: the spinner never disappeared after re-clicking the same folder (which also left the whole list translucent/unclickable and broke infinite scroll).
+- Press animations knocked centered icon buttons off-center (`transform` cascade replacement); fixed the model-provider secret toggle plus two identical latent cases (translation key, account password toggle).
+- Pasting iCloud app passwords in the official dashed format no longer triggers the "paste may be incomplete" warning; the Gmail FAQ no longer references a nonexistent in-app proxy setting; NetEase yeah/188/VIP users are routed to their own portals instead of mail.163.com/126.com; the QQ card label matches its target page.
 - Conversation strip resilience: server thread snapshots merge instead of replacing, the reader resolves members through a strip-membership witness, and background refreshes no longer evict messages opened from conversation chips — eliminating the "click a chip, back to the list" defect. Chips gained hover explanations and a member count.
 - External Agent channel: `messages search` (CLI) / `namimail_messages_search` (MCP) is available again through the Broker forwarding list.
 - The contributor-list auto-update workflow resumes automatic runs now that the repository allows GitHub Actions to create pull requests.
 
 ### Changed
 
+- Microsoft mailbox access is now labeled "not yet available in this build" (waiting on an embedded public client ID, see Issue #116 and the roadmap); advanced users can follow the guide for a one-time manual setup.
+- The server reserves built-in public client ID constants for Google/Microsoft (environment variables win); once embedded, users sign in with zero configuration.
 - Removed the automated wiki sync workflow: the default GITHUB_TOKEN cannot reach the wiki repository, so syncing is done manually with `scripts/wiki-sync.mjs`; the wiki home template gained a project overview. (#97/#98)
 
 ### Dependencies
 
+- Security bumps: nodemailer 9.1.1 → 10.0.13 (five high advisories incl. cross-tenant SMTP credential disclosure, synced across `@nami/server` and the root manifest), dompurify 3.4.16 (DOM XSS), fastify 5.12.5, brace-expansion 5.0.12, fast-uri 3.1.8 — the production `npm audit` high-level gate is now clean.
 - dompurify 3.4.15, @fastify/static 10.1.4 (with content-disposition 3.0.0), jszip 3.10.2.
 
 ## [0.4.2] - 2026-09-25

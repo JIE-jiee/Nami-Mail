@@ -22,7 +22,9 @@ import {
   submissionRequestForId,
   type OutboundSubmissionRequest,
 } from "../outbox.js";
-import { syncAccount, updateMessageFlags, moveMessage, moveMessageToFolder } from "../sync.js";
+import { syncAccount } from "../sync.js";
+import { updateMessageFlags } from "../sync-flags.js";
+import { moveMessage, moveMessageToFolder } from "../sync-moves.js";
 import { ftsLikeEscape, MESSAGE_FTS_TABLE } from "../message-search.js";
 import { redactUrls } from "../message-links.js";
 import type { AccountRecord } from "../types.js";

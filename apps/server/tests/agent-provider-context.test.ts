@@ -87,7 +87,7 @@ function fixture() {
 function internalRuntime(service: AgentService) {
   return service as unknown as {
     rag: { search: (...arguments_: unknown[]) => Promise<unknown[]> };
-    runtime: { streamChat: (input: { chat: ProviderChatRequest }) => AsyncIterable<unknown> };
+    runtime: { streamChat: (input: { requestId: string; chat: ProviderChatRequest }) => AsyncIterable<unknown> };
   };
 }
 
@@ -103,8 +103,14 @@ it("keeps the provider conversation user-led even after a long history", async (
     const internals = internalRuntime(value.service);
     vi.spyOn(internals.rag, "search").mockResolvedValue([]);
     const providerRequests: ProviderChatRequest[] = [];
-    vi.spyOn(internals.runtime, "streamChat").mockImplementation(async function* ({ chat }) {
-      providerRequests.push(chat);
+    vi.spyOn(internals.runtime, "streamChat").mockImplementation(async function* (request: { requestId: string; chat: ProviderChatRequest }) {
+      // The first-turn title generator shares this seam. What this case records
+      // is the eight conversation turns, so the tail is answered with nothing.
+      if (request.requestId.startsWith("title-")) {
+        yield { type: "completed", reason: "stop" };
+        return;
+      }
+      providerRequests.push(request.chat);
       yield { type: "text_delta", delta: "ok" };
       yield { type: "completed", reason: "stop" };
     });

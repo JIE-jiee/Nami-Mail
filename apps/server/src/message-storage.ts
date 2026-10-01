@@ -140,13 +140,21 @@ function payloadAad(id: string, accountId: string): string {
   return `messages\0${accountId}\0${id}\0payload-v1`;
 }
 
+// The HKDF derivation dominates bulk decrypt cost and its output depends only
+// on (masterKey, purpose) — crypto.ts mixes in a compile-time-constant salt —
+// so memoize it per master-key object (same pattern as sync.ts's
+// remoteIdLookupKeyCache). The cached key shares the master key's own lifetime
+// (both live for the whole process), which is why it is not zeroed after each
+// use unlike a single-shot key. Callers never mutate the key.
+const messageKeyCache = new WeakMap<Buffer, Buffer>();
+
 function withMessageKey<T>(masterKey: Buffer, callback: (key: Buffer) => T): T {
-  const key = deriveEncryptionKey(masterKey, messageKeyPurpose);
-  try {
-    return callback(key);
-  } finally {
-    key.fill(0);
+  let key = messageKeyCache.get(masterKey);
+  if (!key) {
+    key = deriveEncryptionKey(masterKey, messageKeyPurpose);
+    messageKeyCache.set(masterKey, key);
   }
+  return callback(key);
 }
 
 function asNullableString(value: unknown): string | null {
@@ -185,6 +193,22 @@ function attachments(value: unknown): StoredAttachmentMetadata[] {
     const item = entry as Record<string, unknown>;
     if (typeof item.partId !== "string") return [];
     const related = item.related === true;
+    // `contentId` is the whole mechanism behind inline images: the wire layer
+    // (message-wire.ts) builds the `cid:` rewrite map from it, and without an
+    // entry the reader gets a `cid:xxx` URL no browser can resolve — a broken
+    // image on every message that embeds one. Rebuilding the object
+    // field-by-field silently dropped it, so the reader never rendered inline
+    // images at all.
+    //
+    // Carried through verbatim (never trimmed or bracket-stripped) under the
+    // write path's own "present or absent" contract: attachmentMetadataFromParsedMail
+    // is the only producer of this field and already removes the `<>` that
+    // mailparser hands over, so no value this function can be given needs
+    // re-normalizing. Rows predating the encrypted payload carry the same
+    // producer's output in `attachments_json`, and rows older still predate the
+    // field entirely — an unbracketed value is therefore the only shape to
+    // expect, here or on the legacy path below.
+    const contentId = typeof item.contentId === "string" && item.contentId !== "" ? item.contentId : undefined;
     return [{
       partId: item.partId,
       filename: typeof item.filename === "string" ? item.filename : "",
@@ -192,6 +216,7 @@ function attachments(value: unknown): StoredAttachmentMetadata[] {
       size: typeof item.size === "number" && Number.isSafeInteger(item.size) && item.size >= 0 ? item.size : 0,
       related,
       disposition: item.disposition === "inline" || related ? "inline" : "attachment",
+      ...(contentId ? { contentId } : {}),
     }];
   });
 }
@@ -261,12 +286,74 @@ const PAYLOAD_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const payloadCache = new Map<string, { payload: MessagePayload; bytes: number }>();
 let payloadCacheBytes = 0;
 
-function payloadByteEstimate(payload: MessagePayload): number {
-  // The payload is a plain JSON-shaped object, so the UTF-8 byte length of
-  // its serialized form bounds retained memory closely enough for eviction.
-  // (A naive character-count sum would undercount CJK bodies by up to 2x and
-  // ignore Map/entry overhead.)
-  return Buffer.byteLength(JSON.stringify(payload), "utf8") + 64;
+// Per-entry allowances cover the JS object/array wrappers the estimate cannot
+// see: a V8 map slot plus the property names, ~64 bytes for an address entry
+// and ~192 for an attachment (part id, filename, content type, content id).
+// They are deliberately generous so the budget errs toward evicting.
+const PAYLOAD_STRUCTURE_BYTES = 256;
+const ADDRESS_METADATA_BYTES = 64;
+const ATTACHMENT_METADATA_BYTES = 192;
+
+function utf8Bytes(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function addressBytes(list: StoredAddress[]): number {
+  let total = 0;
+  for (const entry of list) total += ADDRESS_METADATA_BYTES + utf8Bytes(entry.name) + utf8Bytes(entry.address);
+  return total;
+}
+
+function attachmentBytes(list: StoredAttachmentMetadata[] | null): number {
+  let total = 0;
+  for (const entry of list ?? []) {
+    // `contentId` is a real retained string on the payload object, so it is
+    // counted like every other field. It used to be under-counted (the reader
+    // dropped it on the way out of storage, so the estimate matched what was
+    // handed back); now that the read path carries it, counting it is the
+    // accurate answer rather than a new cost.
+    total += ATTACHMENT_METADATA_BYTES
+      + utf8Bytes(entry.partId) + utf8Bytes(entry.filename) + utf8Bytes(entry.contentType)
+      + (entry.contentId ? utf8Bytes(entry.contentId) : 0);
+  }
+  return total;
+}
+
+/**
+ * Retained-memory estimate for one cached payload, measured from the fields
+ * the payload already holds instead of serializing it again.
+ *
+ * The whole point is to cost nothing on a big body: the previous
+ * `JSON.stringify` allocated a full serialized twin of every message being
+ * listed (a second multi-megabyte string per row on a page of oversized mail)
+ * purely to throw it away. Measuring each field with `Buffer.byteLength` is a
+ * native scan that copies nothing, so the cost is linear in bytes the row
+ * already occupies instead of linear in bytes allocated.
+ *
+ * Accuracy: the UTF-8 length of the raw fields closely tracks the retained
+ * strings — exact for Latin-1 (V8 one-byte strings) and ~1.5x conservative for
+ * CJK, which V8 keeps as two-byte code units. The only systematic deviation
+ * from the old exact number is JSON escaping, which can inflate the serialized
+ * form (every control byte becomes `\u00XX`); real mail escapes far less than
+ * the allowances above add back. A body made entirely of control bytes is
+ * therefore the one input the cache can under-count, and the consequence is
+ * bounded: a too-large entry evicts slightly late, never past the process's
+ * real budget by more than that row's own size.
+ */
+export function payloadByteEstimate(payload: MessagePayload): number {
+  return PAYLOAD_STRUCTURE_BYTES
+    + utf8Bytes(payload.subject)
+    + utf8Bytes(payload.fromName)
+    + utf8Bytes(payload.fromAddress)
+    + utf8Bytes(payload.snippet)
+    + utf8Bytes(payload.textBody)
+    + utf8Bytes(payload.htmlBody)
+    + (payload.messageId ? utf8Bytes(payload.messageId) : 0)
+    + (payload.inReplyTo ? utf8Bytes(payload.inReplyTo) : 0)
+    + (payload.references ?? []).reduce((total, value) => total + utf8Bytes(value), 0)
+    + addressBytes(payload.to)
+    + addressBytes(payload.cc ?? [])
+    + attachmentBytes(payload.attachments);
 }
 
 function cachePayload(key: string, payload: MessagePayload): void {
@@ -374,6 +461,50 @@ function clearPlaintextColumns(db: DatabaseHandle, row: MessageStorageRow, encry
   `).run(encryptedPayload, MESSAGE_PAYLOAD_VERSION, row.id);
 }
 
+// Pages of payloads verified per statement while streaming; sized so peak
+// memory stays at one page of ciphertext instead of the whole mailbox
+// (~115MB for 2400 x 48KB rows before this was paginated).
+const VERIFICATION_PAGE_SIZE = 200;
+
+/**
+ * Decrypts every stored payload in rowid-keyset pages and throws on the first
+ * undecryptable row. Runs only when the encryption migration's proof of
+ * decryptability can be stale: when the marker is still missing (first
+ * startup after the migration, or a marker cleared by an interrupted retry —
+ * a crash mid-migration can leave rows in either form, and a half-migrated
+ * corrupted row must not be silently accepted) and whenever rows were
+ * re-encrypted during this pass. Routine startups (marker present, nothing
+ * migrated) skip the sweep entirely: re-proving every row costs a full
+ * decrypt of the mailbox plus seconds of main-process block before listen,
+ * for a property the next real decrypt re-establishes anyway — a row
+ * corrupted after the sweep is skipped surfaces there instead. A
+ * fingerprint/sample hybrid was rejected because a sampled scheme still
+ * passes a corrupted row a full pass would catch, and the stored ciphertext
+ * length carries no authenticated fingerprint to compare against.
+ */
+function verifyEncryptedPayloads(db: DatabaseHandle, masterKey: Buffer): number {
+  // Keyset pagination over rowid (the physical scan order, never NULL): each
+  // page reads only its own ciphertexts, so peak memory is one page instead
+  // of the whole mailbox.
+  const page = db.prepare(`
+    SELECT rowid, id, account_id, encrypted_payload, payload_version FROM messages
+    WHERE rowid > ? ORDER BY rowid LIMIT ?
+  `);
+  let cursor = 0;
+  let verified = 0;
+  for (;;) {
+    const batch = page.all(cursor, VERIFICATION_PAGE_SIZE) as Array<MessageStorageRow & { rowid: number }>;
+    if (batch.length === 0) break;
+    for (const row of batch) {
+      messagePayloadForRow(row, masterKey);
+      verified += 1;
+    }
+    cursor = batch[batch.length - 1]!.rowid;
+    if (batch.length < VERIFICATION_PAGE_SIZE) break;
+  }
+  return verified;
+}
+
 /**
  * Encrypts legacy rows transactionally. Missing completion markers cause the
  * physical cleanup to be retried after an interrupted migration.
@@ -397,11 +528,14 @@ export function migrateMessageStorage(db: DatabaseHandle, masterKey: Buffer): { 
   });
   migrate();
 
-  const encryptedRows = db.prepare("SELECT id, account_id, encrypted_payload, payload_version FROM messages").all() as MessageStorageRow[];
-  for (const row of encryptedRows) messagePayloadForRow(row, masterKey);
+  // Previously this sweep decrypted the whole mailbox on every startup,
+  // before listen. It is now owed only when the decryptability proof can be
+  // stale: no marker yet (first startup after the migration, or a marker
+  // cleared by an interrupted retry) or rows migrated in this pass.
+  const encryptedRowCount = !marker || rows.length > 0 ? verifyEncryptedPayloads(db, masterKey) : 0;
 
   let vacuumed = false;
-  if (rows.length > 0 || (!marker && encryptedRows.length > 0)) {
+  if (rows.length > 0 || (!marker && encryptedRowCount > 0)) {
     db.pragma("wal_checkpoint(TRUNCATE)");
     db.exec("VACUUM");
     db.pragma("wal_checkpoint(TRUNCATE)");

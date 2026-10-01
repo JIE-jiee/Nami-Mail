@@ -11,6 +11,7 @@ const account: Account = {
   id: "account-1",
   email: "hello@example.com",
   provider: "gmail",
+  authMethod: "password",
   providerName: "Gmail",
   status: "connected",
   lastError: null,

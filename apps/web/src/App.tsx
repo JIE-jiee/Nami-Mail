@@ -54,9 +54,11 @@ import {
   UserRound,
 } from "lucide-react";
 import { AgentMark } from "./AgentMark";
+import { MailTextBody } from "./MailTextBody";
 import { CustomAvatar, SenderAvatar } from "./SenderAvatar";
 import { WindowBar } from "./WindowBar";
 import { ApiError, api, type BatchJobCreatePayload, type BatchJobQuery, type BatchJobSnapshot, type MoveTarget } from "./api";
+import { createBatchJobRunner, type BatchJobRunOptions } from "./batchJobRunner";
 import { calendarCache, contactsCache, templatesCache } from "./dialogPrefetch";
 import DatePicker from "./DatePicker";
 import { canPreviewAttachment } from "./attachmentPreview";
@@ -76,7 +78,7 @@ import { resolveScrollAnchor, type ScrollAnchorRow } from "./scrollAnchor";
 import { buildForwardDraft, buildReplyDraft, isOwnSentMessage } from "./mailActions";
 // ComposeModal loaded lazily below
 import { sortMessages } from "./mailImportance";
-import { groupMessagesByThread, mergeThreadMembers, mergeThreadSnapshot, shouldCollapseThread, sortThreadByTimeline, type ThreadSnapshot } from "./threads";
+import { collapseDuplicateMembers, groupMessagesByThread, mergeThreadMembers, mergeThreadSnapshot, shouldCollapseThread, sortThreadByTimeline, type ThreadSnapshot } from "./threads";
 import { ErrorBoundary } from "./ErrorBoundary";
 import {
   applyBatchSeenChange as applyBatchSeenChangeState,
@@ -84,6 +86,8 @@ import {
   applyMessageMoveConfirmation,
   applyMessageSeenChange,
   applyPinnedUnseenCorrections,
+  appendMessageCursorChain,
+  canLoadMoreMessagePage,
   isArchivedMessage,
   isInboxMessage,
   isSnoozedMessage,
@@ -112,6 +116,7 @@ import { playNotificationSound, primeNotificationSound } from "./sounds";
 import { saveLocalePreference } from "./localePreference";
 import { getAccountDisplayName, useAccountDisplayNames } from "./accountDisplayNameStore";
 import { loadFolderDisplayMode, saveFolderDisplayMode, type FolderDisplayMode } from "./folderDisplayMode";
+import { shouldShowLoading, type MailboxSelection } from "./folderNavigation";
 import { createSettingsLoadCoordinator } from "./settingsLoadCoordinator";
 import TranslationPanel, { type TranslationAvailability, type TranslationContent, type TranslationPanelState } from "./TranslationPanel";
 import { applyMailTranslation, extractMailTextSegments, isMailMatchingLocale } from "./mailDomTranslation";
@@ -152,6 +157,8 @@ import {
   type AttachmentDownloadState,
   localizeMessageLinks,
 } from "./app/app-utils";
+import { useMessageBody } from "./app/useMessageBody";
+import { copyVerificationCodeToClipboard } from "./app/verificationClipboard";
 
 const AgentWorkspace = lazy(() => import("./AgentWorkspace"));
 const AccountConnectionModal = lazy(() => import("./AddAccountModal"));
@@ -237,46 +244,6 @@ const desktopPlatform = new URLSearchParams(window.location.search).get("platfor
  * the top while the signature and quote sit beneath it.
  */
 
-async function copyVerificationCodeToClipboard(code: string): Promise<boolean> {
-  const bridge = desktopBridge();
-  if (bridge?.copyVerificationCode) {
-    try {
-      if ((await bridge.copyVerificationCode(code)).copied) return true;
-    } catch {
-      // Browser APIs below keep the web build usable when desktop clipboard
-      // access is unavailable for a particular session.
-    }
-  }
-
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(code);
-      return true;
-    }
-  } catch {
-    // Some browsers allow clipboard writes only over secure contexts. Use the
-    // short-lived selection fallback instead of retaining message content.
-  }
-
-  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  const textarea = document.createElement("textarea");
-  textarea.value = code;
-  textarea.setAttribute("readonly", "");
-  textarea.setAttribute("aria-hidden", "true");
-  textarea.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none;";
-  document.body.appendChild(textarea);
-  try {
-    textarea.focus({ preventScroll: true });
-    textarea.select();
-    return document.execCommand("copy");
-  } catch {
-    return false;
-  } finally {
-    textarea.remove();
-    activeElement?.focus({ preventScroll: true });
-  }
-}
-
 export default function App() {
   useAccountDisplayNames();
   const { locale, locales, setLocale, t } = useI18n();
@@ -298,18 +265,23 @@ export default function App() {
   const [pendingArchiveMoves, setPendingArchiveMoves] = useState<PendingArchiveMove[]>([]);
   const [pendingMoveVerifications, setPendingMoveVerifications] = useState<string[]>([]);
   const [messageTotal, setMessageTotal] = useState(0);
-  const [messagePage, setMessagePage] = useState(1);
+  // Where the loaded window ends in the server's list order. null means the
+  // list is exhausted — the server's own signal, not a comparison against a
+  // total that grows with every arriving message.
+  const [messageNextCursor, setMessageNextCursor] = useState<string | null>(null);
   const [stats, setStats] = useState<Stats>({ accounts: 0, messages: 0, unread: 0 });
   const [unreadViewRecentlyReadIds, setUnreadViewRecentlyReadIds] = useState<ReadonlySet<string>>(() => new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [translationSession, setTranslationSession] = useState<TranslationSession | null>(null);
   const [forceShowTranslationId, setForceShowTranslationId] = useState<string | null>(null);
   const [translationAvailability, setTranslationAvailability] = useState<TranslationAvailability>(isDemo ? "available" : "checking");
-  // The shell's modal/panel routing (nine dialogs, attachment preview, mobile
-  // sidebar, translation-terms gate) and the global keydown decisions live in
+  // The shell's modal/panel routing and the global keydown decisions live in
   // useDialogRouting; the update prompt, reader-domain, and agent-workspace
-  // routing stay here.
-  const { state, actions, translationTermsPendingRef } = useDialogRouting();
+  // routing stay here. The two modals App renders itself go in as arguments so
+  // they land in the hook's MODAL_KEYS registry instead of beside it.
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
+  const { state, actions, translationTermsPendingRef } = useDialogRouting({ batchDeleteOpen: pendingBatchDelete, agentOpen });
   const [view, setView] = useState<MailView>("inbox");
   const [selectedAccount, setSelectedAccount] = useState("all");
   // The bottom fade strip one-tap expands every account row (and hides the
@@ -418,7 +390,6 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [loading]);
   const [syncing, setSyncing] = useState(false);
-  const [agentOpen, setAgentOpen] = useState(false);
   const [agentPhase, setAgentPhase] = useState<AgentPhase>("idle");
   const [agentProviderSettingsRequestId, setAgentProviderSettingsRequestId] = useState(0);
   const [submissions, setSubmissions] = useState<OutboundSubmission[]>([]);
@@ -434,7 +405,6 @@ export default function App() {
   const keyboardSelectionAnchorIdRef = useRef<string | null>(null);
   const [batchJob, setBatchJob] = useState<BatchJobSnapshot | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
-  const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
   const { closing: batchDeleteConfirmClosing, requestClose: requestBatchDeleteConfirmClose, reset: resetBatchDeleteConfirmClosing } = useDismissTransition(
     useCallback(() => setPendingBatchDelete(false), []),
   );
@@ -538,7 +508,6 @@ export default function App() {
   // how far into that row the viewport top sits. Applied after the merged list
   // lands (or dropped when nothing is pinned).
   const scrollAnchorRef = useRef<{ id: string; offset: number; topCaptured: number } | null>(null);
-  const batchJobStartedAtRef = useRef(0);
   // The smoke runner's OS theme preference is whatever the CI image happens
   // to have; force dark so probes observe one deterministic palette.
   const theme = isDesktopSmoke ? "dark" : resolveTheme(settings.theme, systemTheme);
@@ -912,18 +881,20 @@ export default function App() {
           setAccounts(demo.createDemoAccounts(locale));
           setProviders(demo.demoProviders);
           setMessages(demo.demoMessages);
-          setMessagePage(1);
+          setMessageNextCursor(null);
           setStats(demo.demoStats);
         }
         setListSnapshotKey((value) => value + 1);
         setMessageTotal(demoTotal);
-        setMessagePage(1);
+        // The demo dataset is handed to the list whole, so there is nothing left
+        // to page: the chain starts already exhausted.
+        setMessageNextCursor(null);
         setSubmissions(sortSubmissions(demo.createDemoSubmissions(locale)));
         setSubmissionLoadError(null);
         setSubmissionLoading(false);
       } else {
         const messageQuery = buildMessageQuery({ accountId, folder, search, messageView, searchScope: scope, attachmentKind: attachmentKindFilter, after: dateBounds.after, before: dateBounds.before });
-        const [nextAccounts, nextProviders, messagePage, nextStats] = await Promise.all([
+        const [nextAccounts, nextProviders, firstPage, nextStats] = await Promise.all([
           api.accounts(),
           api.providers(),
           api.messages(messageQuery),
@@ -935,7 +906,7 @@ export default function App() {
         // full list commit. Network time is covered separately (slow-api).
         const finishMerge = beginSpan("list.merge");
         const pendingMerge = mergePendingArchiveMoves(
-          messagePage.items,
+          firstPage.items,
           pendingArchiveMovesRef.current,
           nextAccounts,
           { accountId, folder, search, messageView, searchScope: scope },
@@ -956,7 +927,7 @@ export default function App() {
         const counts = applyPinnedUnseenCorrections(
           nextAccounts,
           nextStats,
-          messagePage.items,
+          firstPage.items,
           nextMessages,
           pendingLocalStateRef.current,
         );
@@ -968,8 +939,10 @@ export default function App() {
         // here, so the fade-in plays on the arriving rows.
         setListSnapshotKey((value) => value + 1);
         if (!silent) messageListRef.current?.scrollTo({ top: 0 });
-        setMessageTotal(nextMessageTotalForSnapshot(messagePage.total, pendingMerge.items.length, messageView === "unread"));
-        setMessagePage(messagePage.page);
+        setMessageTotal(nextMessageTotalForSnapshot(firstPage.total, pendingMerge.items.length, messageView === "unread"));
+        // A full load restarts the chain at the head, so the cursor that
+        // continues the list is the one this page handed out.
+        setMessageNextCursor(firstPage.nextCursor);
         setStats(counts.stats);
         setSelectedId((current) => {
           if (!current) return null;
@@ -1607,11 +1580,15 @@ await refreshSubmissions(nextAccounts, { silent: true });
   }, [filteredMessages, selectedId]);
 
   const loadMore = async () => {
-    if (loading || loadingMoreRef.current || loadedServerMessageCount >= currentMessageTotal) return;
+    // The end of the list is the server's word, not a count: a message
+    // arriving while the user scrolls raises `currentMessageTotal` at the same
+    // moment it is prepended above the loaded window, so `loaded >= total`
+    // never became true and the old gate just kept paging past the end.
+    if (loading || loadingMoreRef.current || !canLoadMoreMessagePage({ items: messages, nextCursor: messageNextCursor })) return;
     loadingMoreRef.current = true;
     const requestId = loadRequestRef.current;
     try {
-      const nextQuery = buildMessageQuery({ ...serverQuery, page: messagePage + 1 });
+      const nextQuery = buildMessageQuery({ ...serverQuery, cursor: messageNextCursor ?? undefined });
       const nextPage = await api.messages(nextQuery);
       if (requestId !== loadRequestRef.current) return;
       const pendingMerge = mergePendingArchiveMoves(
@@ -1624,11 +1601,15 @@ await refreshSubmissions(nextAccounts, { silent: true });
         // Paging is another place a server snapshot meets the local list, so it
         // has to respect the same pending overrides: without this, scrolling
         // could re-add a row the user just deleted or flip a row back to unread.
-        const existingIds = new Set(items.map((item) => item.id));
+        // The chain then appends by id, so a row the local merge put back into
+        // the window is not rendered twice.
         const merged = mergePendingLocalState(pendingMerge.items, items, pendingLocalStateRef.current);
-        return [...items, ...merged.filter((item) => !existingIds.has(item.id))];
+        return appendMessageCursorChain(
+          { items, nextCursor: messageNextCursor },
+          { items: merged, nextCursor: nextPage.nextCursor },
+        ).items;
       });
-      setMessagePage(nextPage.page);
+      setMessageNextCursor(nextPage.nextCursor);
       setMessageTotal(nextMessageTotalForSnapshot(nextPage.total, pendingMerge.items.length, viewRef.current === "unread"));
     } catch (error) {
       if (requestId === loadRequestRef.current) showToast(mailErrorToastMessage(error, undefined, t), "error");
@@ -1654,7 +1635,9 @@ await refreshSubmissions(nextAccounts, { silent: true });
     el.addEventListener("scroll", maybeLoadMore, { passive: true });
     maybeLoadMore();
     return () => el.removeEventListener("scroll", maybeLoadMore);
-  }, [currentMessageTotal, filteredMessages.length, loadedServerMessageCount, loading]);
+    // The re-arm is driven by the server's own "there is more" flag, so a list
+    // that has run out stops being re-checked on every scroll event.
+  }, [filteredMessages.length, loading, messageNextCursor]);
 
   // Gmail-style conversation: the server resolves the thread across all
   // mailboxes of the account, so members outside the loaded view (the user's
@@ -1672,12 +1655,15 @@ await refreshSubmissions(nextAccounts, { silent: true });
       : threadExtras?.members.find((message) => message.id === selectedId)
         ?? (selectedId ? threadStripMembersRef.current.get(selectedId) : undefined)
         ?? null);
+  // The list carries no body, so the open message is loaded on demand and
+  // merged back into the row the reader resolves here.
+  useMessageBody(isDemo, selected, setMessages, setThreadExtras);
   const threadExtrasForSelected = threadExtras && selected
     && (threadExtras.anchorId === selected.id || threadExtras.members.some((member) => member.id === selected.id))
     ? threadExtras.members
     : [];
   const selectedThread = selected
-    ? sortThreadByTimeline(mergeThreadMembers(threadById.get(selected.id) ?? [], threadExtrasForSelected))
+    ? collapseDuplicateMembers(sortThreadByTimeline(mergeThreadMembers(threadById.get(selected.id) ?? [], threadExtrasForSelected)), selected.id)
     : null;
   useEffect(() => {
     if (!selectedThread) return;
@@ -1685,21 +1671,21 @@ await refreshSubmissions(nextAccounts, { silent: true });
     for (const member of selectedThread) members.set(member.id, member);
     threadStripMembersRef.current = members;
   }, [selectedThread]);
+  // Thread membership is a whole-account scan on the server, so a burst of
+  // selections (holding ↓ through a folder) coalesces into one request.
+  const THREAD_REFRESH_DEBOUNCE_MS = 150;
   useEffect(() => {
     if (isDemo || !selectedId) {
       setThreadExtras(null);
       return;
     }
     let cancelled = false;
-    void api.messageThread(selectedId).then((response) => {
-      // Merge instead of replace: the reader may be showing a member that
-      // only the previous snapshot contained, and a refetch must never drop
-      // it out from under the open message.
+    const timer = setTimeout(() => void api.messageThread(selectedId).then((response) => {
+      // Merge instead of replace: a refetch must never drop a member the open
+      // message still needs out from under the reader.
       if (!cancelled) setThreadExtras((current) => mergeThreadSnapshot(current, { anchorId: selectedId, members: response.items }));
-    }).catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
+    }).catch(() => undefined), THREAD_REFRESH_DEBOUNCE_MS);
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [selectedId, threadRefreshTick]);
   // Long conversations collapse to their first and last message in the strip;
   // the middle becomes one expand control. Collapsing never hides the open
@@ -2011,10 +1997,10 @@ const emptyMessageList = useMemo(() => (query.trim()
     const previous = retainedTranslationContent(translationState);
     // Mirror the server-side size guard so oversized messages fail fast
     // without ever sending their body to an LLM provider.
-    const bodyText = selected.textBody.trim();
+    const bodyText = selected.textBody?.trim() ?? "";
     const translatableLength = bodyText
       ? bodyText.length
-      : selected.htmlBody.trim()
+      : selected.htmlBody?.trim()
         ? selected.htmlBody.trim().replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").length
         : 0;
     if (translatableLength > MAX_LLM_TRANSLATION_TEXT_LENGTH) {
@@ -2140,31 +2126,40 @@ const emptyMessageList = useMemo(() => (query.trim()
   }, [accounts, stats]);
 
   const openMessage = useCallback(async (message: Message) => {
+    // The preview pane is rendered inside the reader, so it may only describe
+    // the message currently open there — never reuse a previous one's preview.
+    actions.pruneAttachmentPreviewFor(message.id);
     const account = accounts.find((item) => item.id === message.accountId);
     const isDraft = account?.folders.some((folder) => folder.path === message.mailbox && folder.specialUse === "\\Drafts");
     if (isDraft) {
       setSelectedId(null);
       setRecipientDetailsOpen(false);
+      // A list row only carries a text preview, and the composer must open on
+      // the whole draft — editing a truncated body would silently drop the
+      // rest of what the user wrote.
+      const draft = !isDemo && message.htmlBody === undefined
+        ? await api.message(message.id).catch(() => message)
+        : message;
       let attachments: OutboundAttachment[] = [];
       if (!isDemo) {
         try {
-          attachments = (await api.draftOutboundAttachments(message.id)).items;
-          if (!attachments.length && message.attachments.some((attachment) => !attachment.related)) {
-            attachments = (await api.importDraftOutboundAttachments(message.id)).items;
+          attachments = (await api.draftOutboundAttachments(draft.id)).items;
+          if (!attachments.length && draft.attachments.some((attachment) => !attachment.related)) {
+            attachments = (await api.importDraftOutboundAttachments(draft.id)).items;
           }
         } catch (error) {
           showToast(mailErrorToastMessage(error, t("mail.error.readDraftAttachments"), t), "error");
         }
       }
       actions.openCompose({
-        accountId: message.accountId,
-        to: message.to.map((recipient) => recipient.address).filter(Boolean).join(", "),
-        cc: message.cc.map((recipient) => recipient.address).filter(Boolean).join(", "),
-        subject: message.subject,
-        text: message.textBody || message.snippet,
-        inReplyTo: message.inReplyTo ?? undefined,
-        references: message.references,
-        sourceDraftId: message.id,
+        accountId: draft.accountId,
+        to: draft.to.map((recipient) => recipient.address).filter(Boolean).join(", "),
+        cc: draft.cc.map((recipient) => recipient.address).filter(Boolean).join(", "),
+        subject: draft.subject,
+        text: draft.textBody || draft.snippet,
+        inReplyTo: draft.inReplyTo ?? undefined,
+        references: draft.references,
+        sourceDraftId: draft.id,
         attachments,
       });
       return;
@@ -2206,9 +2201,18 @@ const emptyMessageList = useMemo(() => (query.trim()
     setSelectedId(null);
     setRecipientDetailsOpen(false);
     setReaderMoreOpen(false);
+    // The preview pane unmounts with the reader, so its state must not
+    // outlive it — same path the drawer takes from its own onClose.
+    actions.closeAttachmentPreview();
     if (!restoreFocus || !messageId) return;
     window.requestAnimationFrame(() => messageButtonRefs.current.get(messageId)?.focus());
-  }, []);
+  }, [actions]);
+
+  // Eleven routes close the reader without closeReader (archive, star, view
+  // and account switch, the draft branch, …); one effect covers them all.
+  useEffect(() => {
+    if (selectedId === null) actions.closeAttachmentPreview();
+  }, [selectedId, actions]);
 
   const accountEmails = useMemo(() => accounts.map((account) => account.email), [accounts]);
   // One conversation-strip entry. Own sent mail renders recipient-first
@@ -2614,90 +2618,20 @@ const emptyMessageList = useMemo(() => (query.trim()
     };
   }, [attachmentKindFilter, dateBounds, debouncedQuery, searchScope, selectAllPaged, selectedAccount, selectedFolder, view]);
 
-  // Polls a server-side batch job until it settles, then shows the real
-  // outcome with an undo action. The toolbar stays interactive throughout;
-  // only the poll loop and the final reconciliation reload run in the
-  // background. Guards against a vanished job (server restart) and runaway
-  // polling.
-  const pollBatchJob = useCallback((jobId: string, opts: {
-    successKey: string;
-    exitOnSuccess: boolean;
-    /** Runs after the job's reconciling reload has landed — pins must be
-     * cleared only here, or a refresh racing the job would still clobber. */
-    onSettled?: () => void;
-  }) => {
-    const startedAt = batchJobStartedAtRef.current;
-    const next = async (): Promise<void> => {
-      if (Date.now() - startedAt > 10 * 60_000) {
-        setBatchJob(null);
-        showToast(t("mail.selection.jobError"), "error");
-        opts.onSettled?.();
-        return;
-      }
-      try {
-        const { job } = await api.batchJobStatus(jobId);
-        if (job.status === "running") {
-          setBatchJob(job);
-          window.setTimeout(() => void next(), 600);
-          return;
-        }
-        if (job.status === "failed") {
-          setBatchJob(null);
-          showToast(job.error ?? t("mail.selection.jobError"), "error");
-          await loadRef.current({ silent: true });
-          opts.onSettled?.();
-          return;
-        }
-        setBatchJob(null);
-        const undoAction: ToastAction = {
-          label: t("mail.selection.undo"),
-          run: () => {
-            showToast(t("mail.selection.undoStarted"), "info");
-            void api.batchJobUndo(jobId).then(() => void loadRef.current({ silent: true })).catch(() => {
-              showToast(t("mail.selection.jobError"), "error");
-            });
-          },
-        };
-        if (job.updated > 0 && opts.exitOnSuccess) exitSelectionMode();
-        if (job.failed) {
-          showToast(
-            t("mail.selection.partialFailure", { done: job.updated, failed: job.failed }),
-            "error",
-            job.updated > 0 ? undoAction : undefined,
-          );
-        } else {
-          showToast(t(opts.successKey, { count: job.total }), "success", job.total > 0 ? undoAction : undefined);
-        }
-        await loadRef.current({ silent: true });
-        opts.onSettled?.();
-      } catch {
-        setBatchJob(null);
-        showToast(t("mail.selection.jobError"), "error");
-        opts.onSettled?.();
-      }
-    };
-    void next();
-  }, [exitSelectionMode, showToast, t]);
+  // Batch job state machine lives in batchJobRunner.ts (unit-tested there);
+  // App wires the React-side callbacks: snapshot/busy state, toasts, reload.
+  const batchJobRunner = useMemo(() => createBatchJobRunner({
+    showToast,
+    t,
+    reload: (opts) => loadRef.current(opts),
+    exitSelectionMode,
+    onSnapshot: setBatchJob,
+    onBusy: setBatchBusy,
+  }), [exitSelectionMode, showToast, t]);
 
-  const startBatchJob = useCallback((payload: BatchJobCreatePayload, opts: {
-    successKey: string;
-    exitOnSuccess: boolean;
-    onSettled?: () => void;
-  }) => {
-    setBatchBusy(true);
-    void api.batchJobCreate(payload).then(({ jobId }) => {
-      batchJobStartedAtRef.current = Date.now();
-      setBatchJob({ id: jobId, kind: payload.kind, status: "running", total: 0, done: 0, updated: 0, failed: 0, createdAt: Date.now() });
-      // The job runs server-side; release the toolbar (progress comes from
-      // the poll loop) so the list stays interactive.
-      setBatchBusy(false);
-      pollBatchJob(jobId, opts);
-    }).catch((error: unknown) => {
-      setBatchBusy(false);
-      opts.onSettled?.();
-      showToast(mailErrorToastMessage(error, t(payload.kind === "flags" ? "mail.error.batchUpdate" : "mail.error.move"), t), "error");
-    });
-  }, [pollBatchJob, showToast, t]);
+  const startBatchJob = useCallback((payload: BatchJobCreatePayload, opts: BatchJobRunOptions) => {
+    batchJobRunner.start(payload, opts);
+  }, [batchJobRunner]);
 
   const batchUpdateFlags = async (patch: { seen?: boolean; flagged?: boolean }, successKey: string) => {
     const ids = [...selectedMessageIds];
@@ -3498,16 +3432,25 @@ const emptyMessageList = useMemo(() => (query.trim()
     }
   }, [load, openMessage, showToast, t]);
 
+  /**
+   * Enter the loading phase for a sidebar navigation — but only when the target
+   * is a genuinely different list. One effect keyed on `load` drives the reload
+   * and only `load`'s finally clears the flag, so a click that does not move
+   * the selection raises one nothing can lower. See folderNavigation.ts. */
+  const beginNavigation = useCallback((next: MailboxSelection) => {
+    if (shouldShowLoading({ accountId: selectedAccount, folder: selectedFolder, view }, next)) setLoading(true);
+  }, [selectedAccount, selectedFolder, view]);
+
   const chooseView = useCallback((next: MailView) => {
     viewRef.current = next;
     clearUnreadViewRecentlyRead();
-    setLoading(true);
+    beginNavigation({ accountId: selectedAccount, folder: "", view: next });
     setView(next);
     setSelectedFolder("");
     setSelectedId(null);
     setRecipientDetailsOpen(false);
     actions.closeMobileSidebar();
-  }, [actions, clearUnreadViewRecentlyRead]);
+  }, [actions, beginNavigation, clearUnreadViewRecentlyRead, selectedAccount]);
 
   // Latest handlers for the desktop-bridge subscribers below, read at call time.
   // The subscriptions are installed once (their deps are effectively empty),
@@ -3739,6 +3682,8 @@ const emptyMessageList = useMemo(() => (query.trim()
         sendingStatusOpen: state.sendingStatusOpen,
         translationTermsOpen: state.translationTermsOpen,
         attachmentPreviewOpen: state.attachmentPreview !== null,
+        batchDeleteOpen: state.batchDeleteOpen,
+        agentOpen: state.agentOpen,
         selectedId,
         selected: Boolean(selected),
         keyboardSelectionAnchorId: keyboardSelectionAnchorIdRef.current,
@@ -3756,6 +3701,12 @@ const emptyMessageList = useMemo(() => (query.trim()
         case "close_accounts": actions.closeAccounts(); return;
         case "close_add_account": actions.closeAddAccount(); return;
         case "close_mobile_sidebar": actions.closeMobileSidebar(); return;
+        // Drives the same state as the preview's own onClose path (the X
+        // button / requestClose tail both end in closeAttachmentPreview →
+        // setAttachmentPreview(null)). Normally AttachmentPreviewModal's
+        // capture listener handles Escape first; this case is the shell
+        // fallback (e.g. while the lazy modal is still mounting).
+        case "close_attachment_preview": actions.closeAttachmentPreview(); return;
         case "close_reader": closeReader(true); return;
         case "focus_search": searchInputRef.current?.focus(); return;
         case "compose": actions.openCompose(); return;
@@ -3772,7 +3723,7 @@ const emptyMessageList = useMemo(() => (query.trim()
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [accounts.length, actions, state.addOpen, state.calendarOpen, closeReader, state.composeOpen, filteredMessages, state.mobileSidebar, openForward, openMessage, openReply, openReplyAll, selectMessageRange, selected, selectedId, state.contactsOpen, state.templatesOpen, state.accountsOpen, state.sendingStatusOpen, state.translationTermsOpen, state.attachmentPreview, state.settingsOpen, updatePromptOpen]);
+  }, [accounts.length, actions, state.addOpen, state.calendarOpen, closeReader, state.composeOpen, filteredMessages, state.mobileSidebar, openForward, openMessage, openReply, openReplyAll, selectMessageRange, selected, selectedId, state.contactsOpen, state.templatesOpen, state.accountsOpen, state.sendingStatusOpen, state.translationTermsOpen, state.attachmentPreview, state.settingsOpen, state.agentOpen, state.batchDeleteOpen, updatePromptOpen]);
 
   const sync = async () => {
     if (!accounts.length || syncing) return;
@@ -3833,7 +3784,7 @@ const emptyMessageList = useMemo(() => (query.trim()
   const chooseFolder = (path: string) => {
     viewRef.current = "inbox";
     clearUnreadViewRecentlyRead();
-    setLoading(true);
+    beginNavigation({ accountId: selectedAccount, folder: path, view: "inbox" });
     setSelectedFolder(path);
     setView("inbox");
     setSelectedId(null);
@@ -3899,7 +3850,7 @@ const emptyMessageList = useMemo(() => (query.trim()
 
           <div className="accounts-heading"><span>{t("mail.accounts")}</span><span className="accounts-heading-actions"><IconButton label={folderDisplayMode === "tree" ? t("mail.folderMode.switchToFocused") : t("mail.folderMode.switchToTree")} onClick={() => setFolderDisplayMode(folderDisplayMode === "tree" ? "focused" : "tree")}><span className="folder-mode-icon" data-mode={folderDisplayMode} aria-hidden="true"><FolderTree size={16} className="folder-mode-tree" /><Focus size={16} className="folder-mode-focused" /></span></IconButton><IconButton label={t("account.add")} onClick={() => { actions.closeMobileSidebar(); actions.openAddAccount(); }}><Plus size={16} /></IconButton></span></div>
           <div className="account-list" data-folder-mode={folderDisplayMode} ref={accountListRef}>
-            <button aria-pressed={selectedAccount === "all"} className={selectedAccount === "all" ? "active" : ""} onClick={() => { clearUnreadViewRecentlyRead(); setLoading(true); setSelectedAccount("all"); setAccountsExpanded(false); setSelectedFolder(""); setSelectedId(null); setRecipientDetailsOpen(false); actions.closeMobileSidebar(); }}><span className="account-avatar all"><Layers3 size={14} /></span><span className="account-copy"><strong>{t("mail.allAccounts")}</strong><small>{t("mail.accountCount", { count: accounts.length })}</small></span></button>
+            <button aria-pressed={selectedAccount === "all"} className={selectedAccount === "all" ? "active" : ""} onClick={() => { clearUnreadViewRecentlyRead(); beginNavigation({ accountId: "all", folder: "", view }); setSelectedAccount("all"); setAccountsExpanded(false); setSelectedFolder(""); setSelectedId(null); setRecipientDetailsOpen(false); actions.closeMobileSidebar(); }}><span className="account-avatar all"><Layers3 size={14} /></span><span className="account-copy"><strong>{t("mail.allAccounts")}</strong><small>{t("mail.accountCount", { count: accounts.length })}</small></span></button>
             {accounts.map((account) => {
               const issue = accountIssues.get(account.id);
               const providerName = localizedProviderName(account);
@@ -3914,7 +3865,7 @@ const emptyMessageList = useMemo(() => (query.trim()
               const foldersOpen = folderDisplayMode === "tree" && expandedAccountIds.has(account.id) && account.folders.length > 0;
               const selectAccount = () => {
                 clearUnreadViewRecentlyRead();
-                setLoading(true);
+                beginNavigation({ accountId: account.id, folder: "", view });
                 setSelectedAccount(account.id);
                 setAccountsExpanded(false);
                 setSelectedFolder("");
@@ -4279,10 +4230,9 @@ const emptyMessageList = useMemo(() => (query.trim()
                   onCancel={cancelTranslation}
                 />
                 )}
-                <div className="mail-content">
-                  {selected.htmlBody
-                    ? <div className="mail-html" dangerouslySetInnerHTML={{ __html: readerHtml }} />
-                    : <div className="mail-text">{readerTextParts.quote ? (<>{readerTextParts.body}<button type="button" className="mail-quote-toggle" onClick={() => setQuotedExpanded(true)}>{t("mail.reader.showQuoted")}</button></>) : readerTextSource}</div>}
+                <div className="mail-content">{selected.htmlBody
+                  ? <div className="mail-html" dangerouslySetInnerHTML={{ __html: readerHtml }} />
+                  : <div className="mail-text"><MailTextBody body={readerTextParts.quote ? readerTextParts.body : readerTextSource} suffix={readerTextParts.quote ? <button type="button" className="mail-quote-toggle" onClick={() => setQuotedExpanded(true)}>{t("mail.reader.showQuoted")}</button> : null} /></div>}
                 </div>
                 {visibleAttachments.length > 0 && (
                   <section className="attachment-list" aria-label={t("mail.attachment.aria", { count: visibleAttachments.length })}>

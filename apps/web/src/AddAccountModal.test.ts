@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { canonicalGmailEmail, computeEmailAfterProviderSelect } from "./AddAccountModal";
+import {
+  canonicalGmailEmail,
+  computeEmailAfterProviderSelect,
+  neteasePortalUrl,
+  normalizeAppPassword,
+  surfacesExtraProvider,
+} from "./AddAccountModal";
 
 describe("canonicalGmailEmail", () => {
   it("keeps a plain address unchanged", () => {
@@ -83,5 +89,69 @@ describe("computeEmailAfterProviderSelect", () => {
       nextEmail: "admin",
       cursorPos: 5,
     });
+  });
+});
+
+describe("neteasePortalUrl", () => {
+  it("routes 126 and 163 mail to their own hubs", () => {
+    expect(neteasePortalUrl("126.com")).toBe("https://mail.126.com");
+    expect(neteasePortalUrl("163.com")).toBe("https://mail.163.com");
+  });
+
+  it("routes yeah.net and 188.com to their own portals, not the 163/126 hubs", () => {
+    expect(neteasePortalUrl("yeah.net")).toBe("https://www.yeah.net/");
+    expect(neteasePortalUrl("188.com")).toBe("https://www.188.com/");
+  });
+
+  it("routes VIP domains to their VIP portals", () => {
+    expect(neteasePortalUrl("vip.163.com")).toBe("https://vip.163.com/");
+    expect(neteasePortalUrl("vip.126.com")).toBe("https://vip.126.com/");
+  });
+
+  it("is case-insensitive", () => {
+    expect(neteasePortalUrl("YEAH.NET")).toBe("https://www.yeah.net/");
+  });
+});
+
+describe("normalizeAppPassword", () => {
+  it("strips spaces from grouped pastes", () => {
+    expect(normalizeAppPassword("abcd efgh ijkl mnop")).toBe("abcdefghijklmnop");
+  });
+
+  it("strips dashes so the official iCloud format passes the 16-char check", () => {
+    expect(normalizeAppPassword("abcd-efgh-ijkl-mnop")).toBe("abcdefghijklmnop");
+  });
+
+  it("leaves a plain 16-char password unchanged", () => {
+    expect(normalizeAppPassword("abcdefghijklmnop")).toBe("abcdefghijklmnop");
+  });
+});
+
+describe("surfacesExtraProvider", () => {
+  const catalog = [
+    { id: "gmail" },
+    { id: "microsoft" },
+    { id: "qq" },
+    { id: "netease-163" },
+    { id: "netease-126" },
+    { id: "icloud" },
+    { id: "aol" },
+    { id: "netease-yeah" },
+    { id: "zoho" },
+  ];
+
+  it("keeps core selections inside the always-visible strip", () => {
+    expect(surfacesExtraProvider(catalog, "gmail")).toBe(false);
+    expect(surfacesExtraProvider(catalog, "icloud")).toBe(false);
+  });
+
+  it("surfaces non-core and custom selections that the collapsed strip would hide", () => {
+    expect(surfacesExtraProvider(catalog, "netease-yeah")).toBe(true);
+    expect(surfacesExtraProvider(catalog, "aol")).toBe(true);
+    expect(surfacesExtraProvider(catalog, "__custom_imap__")).toBe(true);
+  });
+
+  it("is quiet when nothing is selected", () => {
+    expect(surfacesExtraProvider(catalog, "")).toBe(false);
   });
 });

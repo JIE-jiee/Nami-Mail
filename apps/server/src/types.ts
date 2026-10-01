@@ -8,7 +8,7 @@ import type { TranslationResult } from "./translation.js";
 import type { TranslationServiceError } from "./translation.js";
 import type { AppSettings } from "./settings.js";
 import type { ServerEventBus } from "./events.js";
-import type { ExternalPairingSummary } from "@nami/agent-contracts";
+import type { AccountWire, ExternalPairingSummary } from "@nami/agent-contracts";
 
 /**
  * Structured translation service interface shared by external HTTP endpoints
@@ -94,6 +94,13 @@ export type RuntimeContext = {
   // Server-originated mail events fanned out to connected clients over the
   // `GET /api/events` SSE endpoint by the route layer.
   serverEvents?: ServerEventBus;
+  // The owning runtime aborts this signal while the process is shutting down.
+  // Route-triggered fire-and-forget syncs (account creation, OAuth first
+  // sync, move reconciliation) hand it to `syncAccount` so their IMAP work
+  // unwinds on shutdown. It is deliberately NOT a request signal: the client
+  // navigating away after the response must not cancel these process-scoped
+  // passes — only the process going down does.
+  syncShutdownSignal?: AbortSignal;
   // The owning runtime (re)starts or stops the live IMAP IDLE watcher after
   // the user toggles the realtime push setting.
   onRealtimePushChanged?: (enabled: boolean) => void;
@@ -101,7 +108,8 @@ export type RuntimeContext = {
   onAccountDeleted?: (accountId: string) => Promise<void> | void;
 };
 
-export function publicAccount(row: AccountRecord) {
+/** Serializes an account row for the wire. Shape authority: `AccountWire` in @nami/agent-contracts. */
+export function publicAccount(row: AccountRecord): AccountWire {
   return {
     id: row.id,
     email: row.email,
