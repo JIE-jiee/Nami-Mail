@@ -28,6 +28,7 @@
 
 ### Dependencies
 
+- Security bumps: nodemailer 9.1.1 → 10.0.13 (five high advisories incl. cross-tenant SMTP credential disclosure, synced across `@nami/server` and the root manifest), dompurify 3.4.16 (DOM XSS), fastify 5.12.5, brace-expansion 5.0.12, fast-uri 3.1.8 — the production `npm audit` high-level gate is now clean.
 - dompurify 3.4.15, @fastify/static 10.1.4 (with content-disposition 3.0.0), jszip 3.10.2.
 
 ## [0.4.2] - 2026-09-25

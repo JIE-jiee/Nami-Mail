@@ -28,6 +28,7 @@
 
 ### 依赖
 
+- 安全升级：nodemailer 9.1.1 → 10.0.13（跨租户 SMTP 凭据泄露等 5 项 high 公告，`@nami/server` 与根清单同步）、dompurify 3.4.16（DOM XSS）、fastify 5.12.5、brace-expansion 5.0.12、fast-uri 3.1.8——生产依赖 npm audit（high 级）清零。
 - dompurify 3.4.15、@fastify/static 10.1.4（含 content-disposition 3.0.0）、jszip 3.10.2。
 
 ## [0.4.2] - 2026-09-25
