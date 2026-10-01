@@ -93,10 +93,14 @@ const flood = process.env.MOCK_MCP_FLOOD === "1";
 const deepLevels = 5_000;
 const floodBytes = 9 * 1024 * 1024;
 
-function deepNestedResult() {
-  let nested = "leaf";
-  for (let level = 0; level < deepLevels; level += 1) nested = { nested };
-  return nested;
+// Built by string repetition, never JSON.stringify: V8's stringifier walks the
+// object recursively and overflows the native stack on ~5k levels under
+// narrower-stack runtimes (CI Node 22), killing this fixture before the
+// client's depth guard is ever exercised. The wire bytes match what
+// JSON.stringify would emit for the same shape.
+function deepNestedLine() {
+  const opening = '{"jsonrpc":"2.0","method":"notifications/deep","params":';
+  return `${opening}${'{"nested":'.repeat(deepLevels)}"leaf"${"}".repeat(deepLevels)}}`;
 }
 
 function writeFlood() {
@@ -153,7 +157,7 @@ for await (const line of lines) {
       // A hostile peer emitting a pathologically nested out-of-band frame, then
       // answering the very same request normally: the client has to drop the
       // frame without losing the connection or the pending response.
-      process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/deep", params: deepNestedResult() })}\n`);
+      process.stdout.write(`${deepNestedLine()}\n`);
       respond(id, { content: [{ type: "text", text: "deep" }], isError: false });
     } else if (name === "flood" && flood) {
       writeFlood();
