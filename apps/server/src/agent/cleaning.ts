@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { sha256Digest } from "./agent-shared.js";
 
 export const MAIL_CLEANER_VERSION = "nami-mail-cleaner-v1";
 export const DEFAULT_MAX_CLEANED_MAIL_CHARACTERS = 120_000;
@@ -184,10 +184,6 @@ function truncateAtBoundary(value: string, maximum: number): { text: string; tru
   return { text: `${value.slice(0, cut).trimEnd()}\n\n[Content truncated locally]`, truncated: true };
 }
 
-function contentHash(value: string): string {
-  return `sha256.${createHash("sha256").update(value, "utf8").digest("base64url")}`;
-}
-
 /**
  * Cleans a copy for RAG only. It never changes the original encrypted mail
  * payload and deliberately prefers a meaningful plain-text alternative.
@@ -207,7 +203,7 @@ export function cleanMailContent(input: MailCleaningInput): CleanedMailContent {
       cleanerVersion: MAIL_CLEANER_VERSION,
       normalizedSubject: subject,
       text: "",
-      contentHash: contentHash(""),
+      contentHash: sha256Digest(""),
       source,
       truncated: false,
       removedQuotedContent: false,
@@ -223,7 +219,7 @@ export function cleanMailContent(input: MailCleaningInput): CleanedMailContent {
     cleanerVersion: MAIL_CLEANER_VERSION,
     normalizedSubject: subject,
     text: truncated.text,
-    contentHash: contentHash(truncated.text),
+    contentHash: sha256Digest(truncated.text),
     source,
     truncated: truncated.truncated,
     removedQuotedContent: quote.removed,

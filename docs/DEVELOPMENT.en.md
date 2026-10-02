@@ -6,7 +6,7 @@ This guide is for contributors who build, test, or modify Nami Mail locally. The
 
 ## Prerequisites
 
-- Node.js 22.14.0 or later.
+- Node.js 24.21.0 or later (Electron 43 bundles Node 24, and CI validates this same floor).
 - Windows, required to build an NSIS installer and verify Electron paths.
 - A test account and app-specific password/authorization code for real mail verification. Do not use a primary password or write credentials into code, tests, screenshots, or commits.
 
@@ -37,8 +37,12 @@ The project loads `better-sqlite3` in both Node and Electron. Windows x64 v13 us
 | `apps/web` | React/Vite reading, composing, settings, and provider-guidance UI. |
 | `apps/server` | Local Fastify API, IMAP/SMTP, OAuth, SQLite, sync, and encrypted-data handling. |
 | `apps/desktop` | Electron main process, preload, local key protection, tray/single-instance behavior, and update boundaries. |
+| `packages/agent-contracts` | Interface contracts shared by the Agent, CLI, and MCP (External Mail v1 tools, Broker protocol, error codes). |
+| `packages/agent-core` | Agent session orchestration and tool-execution core. |
 | `scripts` | Native-module verification, builds, installer smoke tests, and GitHub Release validation. |
 | `build` | Version-controlled brand and Windows installer resources. |
+| `e2e` | Playwright end-to-end tests. |
+| `site` | Project website (GitHub Pages) build source. |
 
 Do not commit local runtime data or generated output. `data/`, `.env`, the legacy local build directories `release/` and `release-current/`, current versioned output `release-artifacts/`, `artifacts/`, `output/`, SQLite sidecar files, certificates, and key files are excluded by [`.gitignore`](../.gitignore). `build/` contains version-controlled brand assets, installer scripts, and the default empty update-trust configuration. It is source code and must not be excluded by a broad ignore rule.
 
@@ -50,10 +54,14 @@ Run the tests closest to your change first, then run this complete baseline:
 npm.cmd run build:brand:check
 npm.cmd run typecheck
 npm.cmd run test
+npm.cmd run lint
+npm.cmd run test:e2e
 npm.cmd run test:desktop-security
 npm.cmd run build
 npm.cmd run smoke:runtime
 ```
+
+The `npm test` suite runs the Agent contracts, Agent core, server, Web, and desktop tests; installers and installed apps still require separate verification:
 
 Real Windows installer validation also requires:
 

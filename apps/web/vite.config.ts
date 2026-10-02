@@ -32,7 +32,18 @@ export default defineConfig({
   server: {
     strictPort: true,
     proxy: {
-      "/api": "http://127.0.0.1:3187",
+      "/api": {
+        target: "http://127.0.0.1:3187",
+        // The local API's token-less Host allowlist (apps/server/src/app.ts,
+        // isTrustedTokenlessHost) only accepts this server's own loopback
+        // authorities on the configured port (127.0.0.1:3187). http-proxy
+        // forwards the browser's Host header untouched by default, so the
+        // dev server's own authority (localhost:5173) reached the guard and
+        // every /api call came back 403 under `npm run dev`. changeOrigin
+        // rewrites Host to the target origin, which is exactly what the
+        // allowlist expects.
+        changeOrigin: true,
+      },
     },
   },
   optimizeDeps: {

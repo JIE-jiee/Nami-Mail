@@ -8,6 +8,7 @@ import { useDismissTransition } from "./hooks/useDismissTransition";
 import { templatesCache } from "./dialogPrefetch";
 import { useStablePagedListHeight } from "./hooks/useStablePagedListHeight";
 import type { MailTemplate, MailTemplateInput } from "./types";
+import { FormNotice, type Notice } from "./FormNotice";
 
 export type TemplatesSectionProps = {
   demoMode?: boolean;
@@ -21,8 +22,6 @@ type TemplateDraft = {
   subject: string;
   body: string;
 };
-
-type Notice = { kind: "success" | "error"; message: string } | null;
 
 /** Templates past this count unlock the search / pagination / bulk toolbar. */
 const TEMPLATES_PER_PAGE = 5;
@@ -176,7 +175,10 @@ export default function TemplatesSection({ demoMode = false, initialTemplates }:
           <LayoutTemplate size={16} />
           <div><span>{t("settings.templates.title")}</span><p id="templates-settings">{t("settings.templates.description")}</p></div>
         </div>
-        <p className="settings-empty" role="status">{t("settings.templates.demoUnavailable")}</p>
+        <div className="settings-empty-card" role="status">
+          <LayoutTemplate className="empty-icon" size={32} strokeWidth={1.5} />
+          <p>{t("settings.templates.demoUnavailable")}</p>
+        </div>
       </section>
     );
   }
@@ -257,7 +259,7 @@ export default function TemplatesSection({ demoMode = false, initialTemplates }:
           <div><span>{t("settings.templates.title")}</span><p id="templates-settings">{t("settings.templates.description")}</p></div>
         </div>
 
-        {notice && <div className={`form-status ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "success" ? <Check size={17} /> : <X size={17} />}{notice.message}</div>}
+        <FormNotice notice={notice} />
 
         {loading ? (
           <p className="settings-empty" role="status"><LoaderCircle className="spin" size={14} aria-hidden="true" />{t("common.loading")}</p>
@@ -314,7 +316,10 @@ export default function TemplatesSection({ demoMode = false, initialTemplates }:
             )}
 
             {filteredTemplates.length === 0 ? (
-              <p className="settings-empty">{showToolbar ? t("settings.templates.noSearchResults") : (templates.length === 0 ? t("settings.templates.empty") : t("settings.templates.noMatches"))}</p>
+              <div className="settings-empty-card">
+                <LayoutTemplate className="empty-icon" size={32} strokeWidth={1.5} />
+                <p>{showToolbar ? t("settings.templates.noSearchResults") : (templates.length === 0 ? t("settings.templates.empty") : t("settings.templates.noMatches"))}</p>
+              </div>
             ) : (
               <>
                 {templates.some((template) => template.builtin) && (

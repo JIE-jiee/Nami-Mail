@@ -22,7 +22,7 @@ The release script first creates a draft Release, then downloads the five assets
 
 ## Prerequisites and Trust Roots
 
-- Use Windows x64 and Node.js 22.14.0 or later.
+- Use Windows x64 and Node.js 24.21.0 or later (Electron 43 bundles Node 24).
 - Use the public repository `QinIndexCode/nami-mail`, or update all build and release configuration if the repository moves.
 - The `package.json` version must be an exact stable semantic version `x.y.z`; the tag must be exactly `v<version>`.
 - The release output directory must be an isolated repository-relative directory, for example `release-artifacts/<version>`. The default output uses `release-artifacts/<package.json version>` for the current version. A production release and parallel verification must still set a directory explicitly and must not reuse old build output.

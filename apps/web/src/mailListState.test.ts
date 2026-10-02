@@ -5,8 +5,11 @@ import {
   applyMessageMoveConfirmation,
   applyMessageSeenChange,
   applyPinnedUnseenCorrections,
+  appendMessageCursorChain,
+  canLoadMoreMessagePage,
   EMPTY_PENDING_LOCAL_STATE,
   createPendingLocalState,
+  emptyMessageCursorChain,
   isArchivedMessage,
   isVisibleInUnreadView,
   matchesServerMessageQuery,
@@ -15,12 +18,14 @@ import {
   mergeRolledBackMessages,
   mergeUnreadViewSnapshot,
   pinFlagOverride,
+  startMessageCursorChain,
   unpinFlagOverride,
   nextMessageTotalForMove,
   nextMessageTotalForSnapshot,
   nextUnreadViewRecentlyReadIds,
   revertMessageMove,
   sidebarBadgeCounts,
+  type MessageCursorChain,
 } from "./mailListState";
 import type { Account, Message, Stats } from "./types";
 
@@ -29,6 +34,7 @@ const accounts: Account[] = [
     id: "account-1",
     email: "me@example.com",
     provider: "example",
+    authMethod: "password",
     providerName: "Example Mail",
     status: "connected",
     lastError: null,
@@ -686,5 +692,83 @@ describe("kind and date refinements mirror the server filters", () => {
     expect(matchesServerMessageQuery(pdfMail, accounts, {
       accountId: "all", folder: "", search: "", messageView: "attachments", attachmentKind: "image",
     })).toBe(false);
+  });
+});
+
+// The list's paging chain. `nextCursor` is the server's own "there is more"
+// verdict; the whole point of this file's second half is that the renderer
+// never re-derives it from `total`.
+describe("message cursor chain", () => {
+  const rows = (ids: readonly string[]): Message[] =>
+    ids.map((id) => ({ ...unreadMessage, id, subject: id }));
+
+  const page = (ids: readonly string[], nextCursor: string | null) => ({ items: rows(ids), nextCursor });
+
+  it("starts from the first page the server handed out", () => {
+    const chain = startMessageCursorChain(page(["a", "b", "c"], "cursor-1"));
+    expect(chain.items.map((item) => item.id)).toEqual(["a", "b", "c"]);
+    expect(chain.nextCursor).toBe("cursor-1");
+    expect(canLoadMoreMessagePage(chain)).toBe(true);
+  });
+
+  it("appends each page in the order it arrived and follows the cursor it returned", () => {
+    let chain: MessageCursorChain = startMessageCursorChain(page(["a", "b"], "cursor-1"));
+    chain = appendMessageCursorChain(chain, page(["c", "d"], "cursor-2"));
+    chain = appendMessageCursorChain(chain, page(["e"], null));
+    expect(chain.items.map((item) => item.id)).toEqual(["a", "b", "c", "d", "e"]);
+    expect(chain.nextCursor).toBeNull();
+    expect(canLoadMoreMessagePage(chain)).toBe(false);
+  });
+
+  it("drops a row the loaded window already holds, so a redelivered page adds nothing", () => {
+    // The snapshot merge above the chain (pending archive moves, the unread
+    // view's retained reads) can put a row back into the window. A chain that
+    // trusts the server to never repeat a row would render it twice.
+    let chain = startMessageCursorChain(page(["a", "b", "c"], "cursor-1"));
+    const before = chain.items;
+    chain = appendMessageCursorChain(chain, page(["c", "d"], "cursor-2"));
+    expect(chain.items.map((item) => item.id)).toEqual(["a", "b", "c", "d"]);
+    // Nothing new: the same page again must be a no-op, not a second copy.
+    const replayed = appendMessageCursorChain(chain, page(["c", "d"], "cursor-2"));
+    expect(replayed.items).toBe(chain.items);
+    expect(replayed.nextCursor).toBe("cursor-2");
+    expect(before).toHaveLength(3);
+  });
+
+  describe("the end of the list", () => {
+    it("stops on the server's signal even while new mail keeps the total ahead of it", () => {
+      // This is the gate the list used not to have: `loaded >= total` can never
+      // become true while mail arrives, because each arrival raises the total
+      // at the same moment it is prepended above the loaded window. Here the
+      // total is three times the loaded count on the last page, and the chain
+      // is still finished.
+      let chain = startMessageCursorChain(page(["a", "b"], "cursor-1"));
+      chain = appendMessageCursorChain(chain, page(["c", "d"], null));
+      const total = 1_000_000;
+      expect(chain.items).toHaveLength(4);
+      expect(total).toBeGreaterThan(chain.items.length);
+      expect(canLoadMoreMessagePage(chain)).toBe(false);
+    });
+
+    it("keeps asking while the server still hands out a cursor, however few rows loaded", () => {
+      // The opposite failure: a filter can leave far fewer rows than `total`
+      // once local merges have withheld some. A gate that compared the two
+      // would stop here and strand the rest of the view.
+      const chain = appendMessageCursorChain(startMessageCursorChain(page(["a"], "cursor-1")), page([], "cursor-2"));
+      expect(chain.items).toHaveLength(1);
+      expect(canLoadMoreMessagePage(chain)).toBe(true);
+    });
+
+    it("reports an empty first page as finished, not as more to come", () => {
+      const chain = startMessageCursorChain(page([], null));
+      expect(chain.items).toEqual([]);
+      expect(canLoadMoreMessagePage(chain)).toBe(false);
+    });
+  });
+
+  it("an untouched chain is finished, so the demo list never pages", () => {
+    const chain = emptyMessageCursorChain();
+    expect(canLoadMoreMessagePage(chain)).toBe(false);
+    expect(chain.items).toEqual([]);
   });
 });

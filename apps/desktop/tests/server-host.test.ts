@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { startServerHost } from "../src/server-host.mts";
+import { installServiceCrashGuard, serviceCrashExitCode, startServerHost } from "../src/server-host.mts";
 import type { BridgeRequest, ServerBridgeSettings, ServerStartParams, ServerTransport } from "../src/server-bridge.mts";
 
 const settle = (): Promise<void> => new Promise((resolve) => {
@@ -272,4 +272,59 @@ test("reports a failed start instead of a fake readiness", async () => {
   harness.fromMain({ id: 2, method: "getSettings" });
   await settle();
   assert.deepEqual(harness.replies().at(-1), { id: 2, ok: false, error: "The local service has not started." });
+});
+
+test("turns an uncaught exception into one diagnostic line and a controlled exit", () => {
+  // This module runs in the utility process, beside SQLite, the IMAP sockets,
+  // the Agent loop and the HTTP server. Electron's main-process handler cannot
+  // see anything raised here, so without this the child dies on Node's default
+  // terms and the crash-restart policy has nothing to explain.
+  let listener: ((error: unknown) => void) | undefined;
+  const target = {
+    on(event: "uncaughtException", handler: (error: unknown) => void) {
+      assert.equal(event, "uncaughtException");
+      listener = handler;
+    },
+  };
+  const lines: string[] = [];
+  const exits: number[] = [];
+
+  installServiceCrashGuard(target, { write: (line) => lines.push(line), exit: (code) => exits.push(code) });
+  assert.ok(listener, "the guard must subscribe to uncaughtException");
+
+  // The reviewed failure: a RangeError raised while a hostile MCP payload is
+  // being validated on the readline callback's own stack.
+  listener!(new RangeError("Maximum call stack size exceeded"));
+
+  assert.equal(lines.length, 1);
+  const report = JSON.parse(lines[0]!) as Record<string, unknown>;
+  assert.equal(report.level, 50);
+  assert.equal(report.event, "uncaught-exception");
+  assert.equal(report.name, "RangeError");
+  assert.equal(report.message, "Maximum call stack size exceeded");
+  assert.equal(typeof report.stack, "string");
+  assert.ok(typeof report.time === "number", "the diagnostic is timestamped");
+
+  // Controlled, but not swallowed: process state after an uncaught exception is
+  // unknown, so the exit is deliberate and main.mts takes it from there.
+  assert.deepEqual(exits, [serviceCrashExitCode]);
+  assert.notEqual(serviceCrashExitCode, 0);
+});
+
+test("still exits when writing the diagnostic itself fails", () => {
+  let listener: ((error: unknown) => void) | undefined;
+  const target = {
+    on(_event: "uncaughtException", handler: (error: unknown) => void) {
+      listener = handler;
+    },
+  };
+  const exits: number[] = [];
+
+  installServiceCrashGuard(target, {
+    write: () => { throw new Error("EPIPE"); },
+    exit: (code) => exits.push(code),
+  });
+
+  listener!("non-Error reason");
+  assert.deepEqual(exits, [serviceCrashExitCode]);
 });

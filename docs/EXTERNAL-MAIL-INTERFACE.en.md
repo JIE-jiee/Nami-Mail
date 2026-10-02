@@ -94,4 +94,4 @@ Errors, audit data, and support reports must not contain mail bodies, attachment
 
 ## Translation Boundary
 
-Experimental local NLLB-200 translation is separate from External Mail v1. It is prepared and triggered explicitly in the desktop reader; an unready model does not implicitly download or send message content. It is not a CLI/MCP tool and pairing does not enable it. See [message translation](TRANSLATION.en.md).
+Message translation is separate from External Mail v1. It is triggered explicitly in the desktop reader and sends the selected message's plain-text body to the endpoint of the chosen translation path (built-in free translation, a LibreTranslate-compatible service, or LLM translation); it is not a CLI/MCP tool and pairing does not enable it. See [message translation](TRANSLATION.en.md).

@@ -9,8 +9,10 @@ import { pollSubmittingSubmission } from "./sendingStatus";
 import DatePicker from "./DatePicker";
 import ThemedSelect from "./ThemedSelect";
 import { useDialogFocus } from "./hooks/useDialogFocus";
+import { usePopupExitTransition } from "./hooks/usePopupExitTransition";
 import { useDismissTransition } from "./hooks/useDismissTransition";
 import { useI18n } from "./i18n";
+import { ComposePolishControls, useComposePolish } from "./composePolish";
 import type { Account, Contact, MailTemplate, OutboundAttachment } from "./types";
 import { AttachmentFileIcon, formatFileSize, datetimeLocalFromDate, isoFromDatetimeLocal, IconButton, type ComposeDraft, type PendingAttachmentUpload, type ToastKind } from "./mailUi";
 
@@ -47,13 +49,18 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
   const [error, setError] = useState("");
   const [deliveryNotice, setDeliveryNotice] = useState("");
   const [sendAtLocal, setSendAtLocal] = useState("");
+  const polish = useComposePolish({ text, applyText: setText, notify: onSent, t });
   const [toSuggestions, setToSuggestions] = useState<Contact[]>([]);
   const [toSuggestionsOpen, setToSuggestionsOpen] = useState(false);
+  const { mounted: toSuggestionsMounted, closing: toSuggestionsClosing, beginClose: beginToSuggestionsClose } = usePopupExitTransition(toSuggestionsOpen, () => setToSuggestionsOpen(false));
   const [toSuggestionIndex, setToSuggestionIndex] = useState(0);
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const { mounted: templatePickerMounted, closing: templatePickerClosing, beginClose: beginTemplatePickerClose } = usePopupExitTransition(templatePickerOpen, () => setTemplatePickerOpen(false));
   const [composeTemplates, setComposeTemplates] = useState<MailTemplate[] | null>(null);
   const [templateLoadBusy, setTemplateLoadBusy] = useState(false);
   const [templateLoadFailed, setTemplateLoadFailed] = useState(false);
+  const [ccOpen, setCcOpen] = useState(() => Boolean(draft.cc?.trim()));
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const dragCounterRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -131,7 +138,7 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
   const toggleTemplatePicker = () => {
     if (busy || discarding) return;
     if (templatePickerOpen) {
-      setTemplatePickerOpen(false);
+      beginTemplatePickerClose();
       return;
     }
     setTemplatePickerOpen(true);
@@ -141,7 +148,7 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
     const applied = applyTemplateToDraft({ subject, body: text }, template);
     setSubject(applied.subject);
     setText(applied.body);
-    setTemplatePickerOpen(false);
+    beginTemplatePickerClose();
     onSent(t("compose.templates.inserted"));
   };
   const initialDraft = initialDraftRef.current;
@@ -595,7 +602,7 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
           </div>
         )}
         <header className="compose-header">
-          <div><span className="eyebrow">{draft.sourceDraftId ? t("compose.draft") : t("compose.new")}</span><h2 id="compose-title">{draft.sourceDraftId ? t("compose.editDraft") : t("compose.new")}</h2></div>
+          <div><h2 id="compose-title">{draft.sourceDraftId ? t("compose.editDraft") : t("compose.new")}</h2></div>
           <div className="compose-header-actions">{draft.sourceDraftId && <IconButton label={t("compose.deleteDraft")} onClick={() => { resetConfirmClosing(); setConfirmAction("delete"); }} disabled={busy || uploading || discarding}><Trash2 size={18} /></IconButton>}<IconButton label={t("common.close")} onClick={requestClose} disabled={busy || uploading || discarding}><X size={18} /></IconButton></div>
         </header>
         <form noValidate onSubmit={submit}>
@@ -612,24 +619,33 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
             }
           }} disabled={busy || uploading || discarding}>{accounts.map((account) => <option key={account.id} value={account.id}>{account.email}</option>)}</ThemedSelect></label>
           <div className="compose-row compose-to-row">
-            <label htmlFor="compose-to"><span>{t("compose.to")}</span><input id="compose-to" type="text" data-dialog-initial-focus value={to} onChange={(event) => { setTo(event.target.value); searchContacts(event.target.value); }} onKeyDown={(event) => {
-              if (event.key === "Escape") { setToSuggestionsOpen(false); return; }
-              if ((event.key === "ArrowDown" || event.key === "ArrowUp")) {
-                if (!toSuggestionsOpen || toSuggestions.length === 0) return;
-                event.preventDefault();
-                const delta = event.key === "ArrowDown" ? 1 : -1;
-                setToSuggestionIndex((index) => (index + delta + toSuggestions.length) % toSuggestions.length);
-                return;
-              }
-              // While the suggestions are open, Enter applies the highlighted
-              // contact instead of submitting the compose form.
-              if (event.key === "Enter" && toSuggestionsOpen && toSuggestions.length > 0) {
-                const active = toSuggestions[suggestedIndex];
-                if (active) { event.preventDefault(); applyRecipientSuggestion(active); }
-              }
-            }} placeholder="email@example.com" disabled={busy || discarding} aria-autocomplete="list" aria-expanded={toSuggestionsOpen} aria-controls={toSuggestionsOpen ? "compose-contact-suggestions" : undefined} aria-activedescendant={toSuggestionsOpen && toSuggestions.length > 0 ? `compose-contact-suggestion-${suggestedIndex}` : undefined} /></label>
-            {toSuggestionsOpen && (
-              <div className="compose-contact-suggestions" id="compose-contact-suggestions" role="listbox" aria-label={t("compose.contactSuggestions")}>
+            <label htmlFor="compose-to"><span>{t("compose.to")}</span>
+              <div className="compose-to-input-wrap">
+                <input id="compose-to" type="text" data-dialog-initial-focus value={to} onChange={(event) => { setTo(event.target.value); searchContacts(event.target.value); }} onKeyDown={(event) => {
+                  if (event.key === "Escape") { beginToSuggestionsClose(); return; }
+                  if ((event.key === "ArrowDown" || event.key === "ArrowUp")) {
+                    if (!toSuggestionsOpen || toSuggestions.length === 0) return;
+                    event.preventDefault();
+                    const delta = event.key === "ArrowDown" ? 1 : -1;
+                    setToSuggestionIndex((index) => (index + delta + toSuggestions.length) % toSuggestions.length);
+                    return;
+                  }
+                  // While the suggestions are open, Enter applies the highlighted
+                  // contact instead of submitting the compose form.
+                  if (event.key === "Enter" && toSuggestionsOpen && toSuggestions.length > 0) {
+                    const active = toSuggestions[suggestedIndex];
+                    if (active) { event.preventDefault(); applyRecipientSuggestion(active); }
+                  }
+                }} placeholder="email@example.com" disabled={busy || discarding} aria-autocomplete="list" aria-expanded={toSuggestionsOpen} aria-controls={toSuggestionsOpen ? "compose-contact-suggestions" : undefined} aria-activedescendant={toSuggestionsOpen && toSuggestions.length > 0 ? `compose-contact-suggestion-${suggestedIndex}` : undefined} />
+                {!ccOpen && !cc.trim() && (
+                  <button type="button" className="compose-cc-toggle" onClick={() => setCcOpen(true)} disabled={busy || discarding}>
+                    {t("compose.cc")}
+                  </button>
+                )}
+              </div>
+            </label>
+            {toSuggestionsMounted && (
+              <div className={`compose-contact-suggestions${toSuggestionsClosing ? " closing" : ""}`} id="compose-contact-suggestions" role="listbox" aria-label={t("compose.contactSuggestions")}>
                 {toSuggestions.map((contact, index) => (
                   <button key={contact.id} type="button" role="option" id={`compose-contact-suggestion-${index}`} aria-selected={index === suggestedIndex} onMouseDown={(event) => event.preventDefault()} onClick={() => applyRecipientSuggestion(contact)}>
                     <span>{contact.name || contact.email}</span><small>{contact.name ? contact.email : ""}</small>
@@ -638,45 +654,12 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
               </div>
             )}
           </div>
-          <label className="compose-row" htmlFor="compose-cc"><span>{t("compose.cc")}</span><input id="compose-cc" type="text" value={cc} onChange={(event) => setCc(event.target.value)} placeholder={t("compose.ccPlaceholder")} disabled={busy || discarding} /></label>
-          <label className="compose-row" htmlFor="compose-subject"><span>{t("compose.subject")}</span><input id="compose-subject" type="text" value={subject} onChange={(event) => setSubject(event.target.value)} placeholder={t("compose.subjectPlaceholder")} disabled={busy || discarding} /></label>
-          <label className="compose-row compose-schedule-row" htmlFor="compose-schedule"><span><CalendarClock size={14} />{t("compose.schedule")}</span><span className="compose-schedule-field"><CalendarClock size={15} className="compose-schedule-icon" /><DatePicker mode="datetime" value={sendAtLocal} onChange={setSendAtLocal} disabled={busy || discarding} aria-label={t("compose.schedule")} />{sendAtLocal ? <button className="compose-schedule-clear" type="button" onClick={() => setSendAtLocal("")} disabled={busy || discarding} aria-label={t("compose.schedule.clear")}><X size={15} /></button> : null}</span></label>
-          <div className="compose-schedule-quick" role="group" aria-label={t("compose.schedule.quickLabel")}>
-            {scheduleOptions.map((option) => (
-              <button key={option.key} type="button" className={`schedule-chip${sendAtLocal === datetimeLocalFromDate(option.compute()) ? " active" : ""}`} onClick={() => setSendAtLocal(datetimeLocalFromDate(option.compute()))} disabled={busy || discarding}>{option.label}</button>
-            ))}
-            <button className="secondary-button compose-template-toggle" type="button" disabled={busy || discarding} onClick={toggleTemplatePicker} aria-expanded={templatePickerOpen} aria-controls={templatePickerOpen ? "compose-template-picker" : undefined} aria-haspopup="listbox"><LayoutTemplate size={15} />{t("compose.templates")}</button>{templatePickerOpen && (
-              <div className="compose-template-picker" id="compose-template-picker" role="listbox" aria-label={t("compose.templates")}>
-                {isDemo ? (
-                  <p className="compose-template-empty" role="status">{t("compose.templates.demoUnavailable")}</p>
-                ) : templateLoadBusy ? (
-                  <p className="compose-template-empty" role="status"><LoaderCircle className="spin" size={14} aria-hidden="true" />{t("common.loading")}</p>
-                ) : templateLoadFailed ? (
-                  <div className="compose-template-empty" role="alert">
-                    <span>{t("compose.templates.loadFailed")}</span>
-                    <button className="secondary-button" type="button" onClick={() => void loadComposeTemplates()}>
-                      <RefreshCw size={14} aria-hidden="true" />{t("common.retry")}
-                    </button>
-                  </div>
-                ) : composeTemplates && composeTemplates.length === 0 ? (
-                  <p className="compose-template-empty" role="status">{t("compose.templates.empty")}</p>
-                ) : (
-                  <ul className="compose-template-list">
-                    {composeTemplates?.map((template, index) => (
-                      <li key={template.id}>
-                        <button type="button" role="option" id={`compose-template-option-${index}`} onClick={() => applyTemplate(template)}>
-                          <span>{template.name}</span>
-                          {template.subject && <small>{template.subject}</small>}
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
+          <div className={`compose-row compose-cc-row${ccOpen || cc.trim() ? " is-open" : " is-collapsed"}`}>
+            <label htmlFor="compose-cc"><span>{t("compose.cc")}</span><input id="compose-cc" type="text" value={cc} onChange={(event) => setCc(event.target.value)} placeholder={t("compose.ccPlaceholder")} disabled={busy || discarding} /></label>
           </div>
+          <label className="compose-row" htmlFor="compose-subject"><span>{t("compose.subject")}</span><input id="compose-subject" type="text" value={subject} onChange={(event) => setSubject(event.target.value)} placeholder={t("compose.subjectPlaceholder")} disabled={busy || discarding} /></label>
           <label className="visually-hidden" htmlFor="compose-body">{t("compose.body")}</label>
-          <textarea id="compose-body" className="compose-body" value={text} onChange={(event) => setText(event.target.value)} placeholder={t("compose.bodyPlaceholder")} disabled={busy || discarding} />
+          <textarea id="compose-body" className={`compose-body${polish.polishing ? " is-polishing" : ""}`} value={text} onChange={(event) => setText(event.target.value)} placeholder={t("compose.bodyPlaceholder")} disabled={busy || discarding || polish.polishing} aria-busy={polish.polishing || undefined} />
           <section className="compose-attachments" aria-label={t("compose.attachment.aria", { count: attachmentSummary.attachedCount, status: attachmentStatus })}>
             <div className="compose-attachments-heading"><span><Paperclip size={16} />{t("compose.attachments")}</span><small aria-live="polite">{attachmentSummary.attachedCount} / 10{t("common.dotSeparator")}{formatFileSize(attachmentSummary.attachedBytes)}{attachmentStatus ? `${t("common.dotSeparator")}${attachmentStatus}` : ""}</small><button className="compose-attachment-add" type="button" onClick={chooseFiles} disabled={busy || uploading || discarding || !accountId}>{uploading ? <LoaderCircle className="spin" size={15} /> : <Paperclip size={15} />}{uploading ? t("compose.attachment.uploading") : t("compose.attachment.add")}</button></div>
             <input ref={fileInputRef} className="visually-hidden" type="file" tabIndex={-1} multiple onChange={(event) => void addFiles(event)} />
@@ -695,8 +678,69 @@ export function ComposeModal({ accounts, draft, onClose, onSent, onDraftSaved, o
           {deliveryNotice && <div className="form-status warning" role="status"><LoaderCircle className="spin" size={17} />{deliveryNotice}</div>}
           {error && <div id="compose-error" className="form-status error" role="alert"><X size={17} />{error}</div>}
           <footer className="compose-footer">
-            <button className="secondary-button" type="button" disabled={busy || uploading || discarding || hasPendingUploads || !accountId} onClick={() => void saveDraft()}>{busy ? <LoaderCircle className="spin" size={17} /> : <FilePenLine size={17} />}{t("compose.saveDraft")}</button>
-            <button className="primary-button" type="submit" disabled={busy || uploading || discarding || hasPendingUploads || !accountId}>{busy ? <LoaderCircle className="spin" size={17} /> : scheduled ? <CalendarClock size={17} /> : <Send size={17} />}{busy ? t("compose.sending") : scheduled ? t("compose.scheduleSend") : t("compose.send")}</button>
+            <div className="compose-footer-tools">
+              <ComposePolishControls polish={polish} t={t} />
+              <button className="secondary-button" type="button" disabled={busy || uploading || discarding || hasPendingUploads || !accountId} onClick={() => void saveDraft()}>{busy ? <LoaderCircle className="spin" size={17} /> : <FilePenLine size={17} />}{t("compose.saveDraft")}</button>
+              <div className="compose-template-wrap">
+                <button className="secondary-button compose-template-toggle" type="button" disabled={busy || discarding} onClick={toggleTemplatePicker} aria-expanded={templatePickerOpen} aria-controls={templatePickerOpen ? "compose-template-picker" : undefined} aria-haspopup="listbox"><LayoutTemplate size={15} />{t("compose.templates")}</button>
+                {templatePickerMounted && (
+                  <div className={`compose-template-picker${templatePickerClosing ? " closing" : ""}`} id="compose-template-picker" role="listbox" aria-label={t("compose.templates")}>
+                    {isDemo ? (
+                      <p className="compose-template-empty" role="status">{t("compose.templates.demoUnavailable")}</p>
+                    ) : templateLoadBusy ? (
+                      <p className="compose-template-empty" role="status"><LoaderCircle className="spin" size={14} aria-hidden="true" />{t("common.loading")}</p>
+                    ) : templateLoadFailed ? (
+                      <div className="compose-template-empty" role="alert">
+                        <span>{t("compose.templates.loadFailed")}</span>
+                        <button className="secondary-button" type="button" onClick={() => void loadComposeTemplates()}>
+                          <RefreshCw size={14} aria-hidden="true" />{t("common.retry")}
+                        </button>
+                      </div>
+                    ) : composeTemplates && composeTemplates.length === 0 ? (
+                      <p className="compose-template-empty" role="status">{t("compose.templates.empty")}</p>
+                    ) : (
+                      <ul className="compose-template-list">
+                        {composeTemplates?.map((template, index) => (
+                          <li key={template.id}>
+                            <button type="button" role="option" id={`compose-template-option-${index}`} onClick={() => applyTemplate(template)}>
+                              <span>{template.name}</span>
+                              {template.subject && <small>{template.subject}</small>}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="compose-footer-send-group">
+              {sendAtLocal ? (
+                <div className="compose-scheduled-badge">
+                  <CalendarClock size={13} />
+                  <span>{sendAtLocal}</span>
+                  <button type="button" onClick={() => setSendAtLocal("")} aria-label={t("compose.schedule.clear")} disabled={busy || discarding}><X size={13} /></button>
+                </div>
+              ) : null}
+              <div className="compose-send-split">
+                <button className="primary-button compose-send-main" type="submit" disabled={busy || uploading || discarding || hasPendingUploads || !accountId}>{busy ? <LoaderCircle className="spin" size={17} /> : scheduled ? <CalendarClock size={17} /> : <Send size={17} />}{busy ? t("compose.sending") : scheduled ? t("compose.scheduleSend") : t("compose.send")}</button>
+                <button className="primary-button compose-schedule-toggle" type="button" aria-label={t("compose.schedule")} disabled={busy || uploading || discarding || !accountId} onClick={() => setScheduleOpen((open) => !open)}><CalendarClock size={15} /></button>
+                {scheduleOpen && (
+                  <div className="compose-schedule-popover" role="dialog" aria-label={t("compose.schedule")}>
+                    <div className="compose-schedule-field">
+                      <CalendarClock size={15} className="compose-schedule-icon" />
+                      <DatePicker mode="datetime" value={sendAtLocal} onChange={(val) => { setSendAtLocal(val); setScheduleOpen(false); }} disabled={busy || discarding} aria-label={t("compose.schedule")} />
+                      {sendAtLocal ? <button className="compose-schedule-clear" type="button" onClick={() => setSendAtLocal("")} disabled={busy || discarding} aria-label={t("compose.schedule.clear")}><X size={15} /></button> : null}
+                    </div>
+                    <div className="compose-schedule-quick" role="group" aria-label={t("compose.schedule.quickLabel")}>
+                      {scheduleOptions.map((option) => (
+                        <button key={option.key} type="button" className={`schedule-chip${sendAtLocal === datetimeLocalFromDate(option.compute()) ? " active" : ""}`} onClick={() => { setSendAtLocal(datetimeLocalFromDate(option.compute())); setScheduleOpen(false); }} disabled={busy || discarding}>{option.label}</button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
           </footer>
         </form>
         {confirmAction && (

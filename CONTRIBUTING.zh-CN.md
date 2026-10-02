@@ -13,7 +13,7 @@
 
 ## 本地开发
 
-项目要求 Node.js 22.14.0 或更高版本。在项目根目录执行：
+项目要求 Node.js 24.21.0 或更高版本（与 Electron 43 内置的 Node 24 同主版本）。在项目根目录执行：
 
 ```powershell
 npm.cmd ci
@@ -58,6 +58,8 @@ npm.cmd run verify:electron-sqlite
 npm.cmd run build:brand:check
 npm.cmd run typecheck
 npm.cmd run test
+npm.cmd run lint
+npm.cmd run test:e2e
 npm.cmd --workspace @nami/web run test
 npm.cmd run test:desktop-security
 npm.cmd run build
@@ -70,7 +72,7 @@ Windows 安装包、签名和发布路径的额外步骤见 [发布指南](docs/
 
 1. 从上游仓库 fork 项目，基于最新的 `main` 创建名称清晰的功能或修复分支；不要直接向上游 `main` 推送提交。
 2. 在自己的 fork 中提交聚焦的改动。不要把 `.env`、测试账户、OAuth 回调参数、令牌、应用专用密码、证书、构建产物或本地数据一起推送。
-3. 提交前先执行下面的完整本地检查。它与 GitHub 上 `Validate Pull Request / validate` 使用同一组验证命令；仅修正文档时也至少运行与改动相关的检查并在 PR 中说明未运行项。
+3. 提交前先执行下面的完整本地检查。它是 GitHub 上 `Validate Pull Request / validate` 的本地子集——CI 还会额外执行 `lint`、`test:e2e`、SQLite 加载验证与 smoke 检查；仅修正文档时也至少运行与改动相关的检查并在 PR 中说明未运行项。
 4. 向上游 `main` 发起 Pull Request，按模板填写关联 Issue、用户可感知变化、验证证据和残余风险。来自 fork 的验证工作流只使用只读令牌，不读取发布或签名凭据；请不要尝试通过 PR 请求这些凭据。
 5. 先等待 `Validate Pull Request / validate` 成功，再请求审查。当前 `main` 规则要求 PR、已解决的讨论、至少一位有效审批，以及基于最新 `main` 的 `validate`；新提交会使旧审批失效。`.github/CODEOWNERS` 会将 PR 自动路由给维护者，但不能替代远端规则或人工审查。常规协作者不能直接推送或强推；管理员仅应在紧急情况下绕过，并留下可审计的后续 PR。
 
@@ -79,10 +81,12 @@ Windows 安装包、签名和发布路径的额外步骤见 [发布指南](docs/
 ```powershell
 npm.cmd ci
 npm.cmd run build:brand:check
-node --test scripts/release-policy.test.mjs
+node --test "scripts/tests/*.test.mjs"
 npm.cmd run typecheck
 npm.cmd run build
 npm.cmd run test
+npm.cmd run lint
+npm.cmd run test:e2e
 npm.cmd --workspace @nami/web run test
 npm.cmd run test:desktop-security
 npm.cmd run smoke:runtime

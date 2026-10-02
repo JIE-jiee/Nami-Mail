@@ -35,6 +35,83 @@ export function mergeThreadMembers(local: readonly Message[], extras: readonly M
   return [...local, ...extras.filter((message) => !known.has(message.id))];
 }
 
+/**
+ * Folds the several rows one message occupies back into the single member it
+ * represents. The store keeps one row per (account, mailbox, uid), so a mail
+ * filed in more than one folder — the inbox plus a user label — is stored
+ * twice: two ids, one RFC Message-ID, one sent time. A conversation is a set
+ * of messages rather than of rows, so the reader must not draw one card per
+ * folder: the strip would show two identical timestamps side by side and only
+ * one of them could hold the focus state.
+ *
+ * Both sources feed the same duplication. The list-side grouping unions the
+ * rows into one thread, and GET /api/messages/:id/thread walks every row of
+ * the account, so either alone is enough to produce the pair.
+ *
+ * `selectedId` is the row the reader has open and it always survives, so the
+ * focused card is the copy that stays rather than a lookalike of it. Rows
+ * without a Message-ID carry no identity to compare and are never folded.
+ */
+export function collapseDuplicateMembers(members: readonly Message[], selectedId?: string | null): Message[] {
+  const keptAt = new Map<string, number>();
+  const kept: Message[] = [];
+  for (const member of members) {
+    const identity = trimmedId(member.messageId);
+    const at = identity === null ? undefined : keptAt.get(identity);
+    if (at === undefined) {
+      if (identity !== null) keptAt.set(identity, kept.length);
+      kept.push(member);
+      continue;
+    }
+    if (kept[at]!.id !== selectedId && member.id === selectedId) kept[at] = member;
+  }
+  return kept;
+}
+
+/**
+ * How many messages a conversation holds, counting the folder copies of one
+ * message once. Same root cause as `collapseDuplicateMembers`, read instead of
+ * folded: the list badge wants the number, not the members, and it recomputes
+ * it for every visible row on every scroll frame, so this walks the members
+ * without building the folded array.
+ *
+ * Identity is the RFC Message-ID, exactly as when folding; a row without one
+ * has nothing to compare and counts as its own message. An absent or empty
+ * thread still means the row itself, so the answer is never 0.
+ */
+export function countThreadMessages(members: readonly Message[] | null | undefined): number {
+  if (!members || members.length === 0) return 1;
+  const identities = new Set<string>();
+  for (const member of members) {
+    identities.add(trimmedId(member.messageId) ?? member.id);
+  }
+  return identities.size;
+}
+
+export type ThreadSnapshot = {
+  anchorId: string;
+  members: Message[];
+};
+
+/**
+ * Folds a freshly fetched server thread into the previous snapshot without
+ * dropping members. The reader may currently be showing a member that only
+ * the previous snapshot contained, so a refetch of the same conversation
+ * unions (fresh server values win on collisions) while a fetch for a
+ * different conversation replaces wholesale.
+ */
+export function mergeThreadSnapshot(previous: ThreadSnapshot | null, next: ThreadSnapshot): ThreadSnapshot {
+  if (!previous) return next;
+  const nextIds = new Set(next.members.map((message) => message.id));
+  const sameConversation = previous.members.some((message) => nextIds.has(message.id));
+  if (!sameConversation) return next;
+  const known = new Set(next.members.map((message) => message.id));
+  return {
+    anchorId: next.anchorId,
+    members: [...next.members, ...previous.members.filter((message) => !known.has(message.id))],
+  };
+}
+
 /** Whether the thread strip should render collapsed: only long conversations,
  *  and only while the open message sits at an endpoint of the timeline, so
  *  collapsing never hides the message being read. */

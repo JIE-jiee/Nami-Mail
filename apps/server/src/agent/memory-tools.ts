@@ -233,6 +233,11 @@ const autoReplyDeclinedSearchOutputSchema = z.object({
 
 type AutoReplyDeclinedSearchInput = z.infer<typeof autoReplyDeclinedSearchInputSchema>;
 
+// The tool description embeds the reason vocabulary so the model can pass any
+// recorded reason. It is derived from the contract array so the two cannot
+// drift; a test anchors the generated string to the historical literal.
+const declinedReasonList = autoReplyDecisionReasons.map((reason) => `'${reason}'`).join("|");
+
 /**
  * Auto-reply decline/failure audit tool. Read-only and confirmation-free: it
  * only reveals why the Agent did not reply to an inbound message.
@@ -243,7 +248,7 @@ export function createAutoReplyDecisionTools(store: EncryptedAutoReplyDecisionSt
       descriptor: {
         name: "auto-reply.declined.search",
         title: "Search declined auto-replies",
-        description: "Searches the audit list of inbound messages the Agent did not auto-reply to (screened out, out of scope, low value, rejected confirmations, send failures). Input: { query?: string, reason?: 'screening'|'scope'|'low-value'|'sensitive'|'user-rejected'|'daily-cap'|'llm-failed'|'send-failed'|'no-template'|'expired', fromAddress?: string, subject?: string, limit?: number }. Use when the user asks why no auto-reply was sent to someone, or wants to review skipped messages. Returns the most recent decisions first.",
+        description: `Searches the audit list of inbound messages the Agent did not auto-reply to (screened out, out of scope, low value, rejected confirmations, send failures). Input: { query?: string, reason?: ${declinedReasonList}, fromAddress?: string, subject?: string, limit?: number }. Use when the user asks why no auto-reply was sent to someone, or wants to review skipped messages. Returns the most recent decisions first.`,
         category: "system",
         executionMode: "read",
         requiredScopes: ["manage:memory"],

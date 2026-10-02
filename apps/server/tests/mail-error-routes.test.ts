@@ -19,7 +19,17 @@ vi.mock("../src/mail.js", async (importOriginal) => {
 
 vi.mock("../src/sync.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/sync.js")>();
-  return { ...actual, syncAccount, updateMessageFlags, moveMessage };
+  return { ...actual, syncAccount };
+});
+
+vi.mock("../src/sync-flags.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sync-flags.js")>();
+  return { ...actual, updateMessageFlags };
+});
+
+vi.mock("../src/sync-moves.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sync-moves.js")>();
+  return { ...actual, moveMessage };
 });
 
 vi.mock("../src/drafts.js", async (importOriginal) => {
@@ -164,7 +174,7 @@ describe("mail transport error API responses", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true, destination: "[Gmail]/All Mail", refreshPending: true });
     await vi.waitFor(() => {
-      expect(syncAccount).toHaveBeenCalledWith(db, expect.any(Buffer), "account-1", expect.any(Number), undefined, undefined);
+      expect(syncAccount).toHaveBeenCalledWith(db, expect.any(Buffer), "account-1", expect.any(Number), undefined, undefined, undefined);
     });
   });
 

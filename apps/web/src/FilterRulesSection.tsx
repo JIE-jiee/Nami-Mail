@@ -4,6 +4,7 @@ import { api } from "./api";
 import { mailErrorMessage } from "./errorPresentation";
 import { useI18n, type Translate } from "./i18n";
 import ThemedSelect from "./ThemedSelect";
+import { FormNotice, type Notice } from "./FormNotice";
 import type {
   Account,
   FilterRule,
@@ -28,8 +29,6 @@ type FilterRuleDraft = {
   conditions: FilterRuleCondition[];
   actions: FilterRuleAction[];
 };
-
-type Notice = { kind: "success" | "error"; message: string } | null;
 
 const conditionKindOptions: Array<{ value: FilterRuleCondition["kind"]; labelKey: string }> = [
   { value: "from", labelKey: "settings.filterRules.condition.from" },
@@ -292,7 +291,7 @@ export default function FilterRulesSection({
         <div><span>{t("settings.filterRules.title")}</span><p id="filter-rules-settings">{t("settings.filterRules.description")}</p></div>
       </div>
 
-      {notice && <div className={`form-status ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "success" ? <Check size={17} /> : <X size={17} />}{notice.message}</div>}
+      <FormNotice notice={notice} />
 
       {loading ? (
         <p className="settings-empty" role="status"><LoaderCircle className="spin" size={14} aria-hidden="true" />{t("common.loading")}</p>

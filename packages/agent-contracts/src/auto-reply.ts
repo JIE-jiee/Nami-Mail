@@ -86,6 +86,38 @@ export const autoReplyConfigPatchSchema = z.object({
   dailyLimitPerAccount: autoReplyDailyLimitSchema.optional(),
 }).strict();
 
+/**
+ * The decline/failure reasons the auto-reply pipeline records in its audit.
+ * Single source for the server's encrypted decision store (and the
+ * auto_reply_decisions CHECK constraint), the Agent declined-search tool
+ * description, and the web review dialog's reason filter.
+ */
+export const autoReplyDecisionReasons = [
+  "screening",
+  "scope",
+  "low-value",
+  "sensitive",
+  "user-rejected",
+  "daily-cap",
+  "llm-failed",
+  "send-failed",
+  "no-template",
+  "expired",
+] as const;
+
+export type AutoReplyDecisionReason = (typeof autoReplyDecisionReasons)[number];
+
+/**
+ * Out-of-the-box auto-reply configuration, derived by running the config
+ * schema over its own defaults so the constant and the schema cannot drift.
+ * The scope's date fields parse as absent (the wire omits them until set);
+ * web consumers normalize them through their seam.
+ */
+export const autoReplyConfigDefaults: AutoReplyConfig = autoReplyConfigSchema.parse({
+  enabled: false,
+  accountIds: [],
+});
+
 export const agentMemoryKinds = [
   "auto-reply-sent",
   "auto-reply-ignored",

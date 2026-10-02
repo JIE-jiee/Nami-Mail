@@ -1,6 +1,11 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { domainToASCII } from "node:url";
 import {
+  outboundSubmissionStatuses as OUTBOUND_SUBMISSION_STATUSES,
+  type OutboundSubmission,
+  type OutboundSubmissionStatus,
+} from "@nami/agent-contracts";
+import {
   decryptTextEnvelope,
   deriveEncryptionKey,
   encryptTextEnvelope,
@@ -8,6 +13,7 @@ import {
 import type { DatabaseHandle } from "./db.js";
 import { mailErrorCode, type MailErrorCode } from "./mail.js";
 import { messagePayloadForRow, type MessageStorageRow } from "./message-storage.js";
+import { pruneExpiredOutboundSubmissions } from "./outbox-retention.js";
 
 export const OUTBOUND_SUBMISSION_CRYPTO_VERSION = 1;
 
@@ -17,16 +23,11 @@ const detailsKeyPurpose = "outbound-submission-details-v1";
 const fingerprintKeyPurpose = "outbound-submission-fingerprint-v1";
 const messageIdKeyPurpose = "outbound-submission-message-id-v1";
 
-export const OUTBOUND_SUBMISSION_STATUSES = [
-  "pending",
-  "submitting",
-  "submitted",
-  "confirmed",
-  "unknown_delivery",
-  "failed",
-] as const;
-
-export type OutboundSubmissionStatus = typeof OUTBOUND_SUBMISSION_STATUSES[number];
+// The submission status vocabulary and the wire record are single-sourced in
+// @nami/agent-contracts (`publicSubmission` below is the producer the schema
+// describes); these re-exports keep the historical local names.
+export { OUTBOUND_SUBMISSION_STATUSES };
+export type { OutboundSubmission, OutboundSubmissionStatus };
 
 export type OutboundSubmissionRequest = {
   to: string[];
@@ -68,23 +69,6 @@ type SubmissionDetails = {
   postSubmitWarning: string | null;
 };
 
-export type OutboundSubmission = {
-  id: string;
-  accountId: string;
-  messageId: string;
-  subject: string;
-  recipients: string[];
-  deliveryStatus: OutboundSubmissionStatus;
-  errorCode: string | null;
-  errorMessage: string | null;
-  postSubmitWarning: string | null;
-  submittedAt: string | null;
-  confirmedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-  sendAt: string | null;
-};
-
 export class SubmissionConflictError extends Error {
   constructor() {
     super("This send request is already associated with different message content.");
@@ -112,13 +96,28 @@ function legacyRequestFingerprint(request: OutboundSubmissionRequest): string {
   return createHash("sha256").update(canonicalRequest(request), "utf8").digest("hex");
 }
 
+// Every derived key here depends only on (masterKey, purpose): crypto.ts's
+// HKDF salt is a compile-time constant and no per-call randomness enters the
+// derivation, so memoizing per master-key object is safe (same pattern as
+// sync.ts's remoteIdLookupKeyCache). Without the cache the migration
+// verification pass re-derived HKDF up to four times per stored submission.
+// Cached keys share the master key's own lifetime (both live for the whole
+// process), which is why they are not zeroed after each use; every callback
+// treats the key as read-only.
+const derivedKeyCache = new WeakMap<Buffer, Map<string, Buffer>>();
+
 function withDerivedKey<T>(masterKey: Buffer, purpose: string, callback: (key: Buffer) => T): T {
-  const key = deriveEncryptionKey(masterKey, purpose);
-  try {
-    return callback(key);
-  } finally {
-    key.fill(0);
+  let keysByPurpose = derivedKeyCache.get(masterKey);
+  if (!keysByPurpose) {
+    keysByPurpose = new Map();
+    derivedKeyCache.set(masterKey, keysByPurpose);
   }
+  let key = keysByPurpose.get(purpose);
+  if (!key) {
+    key = deriveEncryptionKey(masterKey, purpose);
+    keysByPurpose.set(purpose, key);
+  }
+  return callback(key);
 }
 
 function requestAad(row: Pick<StoredSubmission, "id" | "account_id">): string {
@@ -187,7 +186,25 @@ function normalizeStoredDetails(value: unknown): SubmissionDetails {
   return { rfcMessageId: item.rfcMessageId, errorMessage, providerMessageId, postSubmitWarning };
 }
 
-function requestForRow(row: StoredSubmission, masterKey: Buffer): OutboundSubmissionRequest {
+/** Everything requestForRow/detailsForRow read — no more.
+ *
+ * The migration verification page is spelled out column by column instead of
+ * `rowid, *`: the sweep only proves ciphertext and HMAC integrity, so a `*`
+ * would pull in the plain columns it never reads (status, error_code,
+ * idempotency_key, the timestamps) and inflate exactly the resident page the
+ * pagination exists to bound. Typing the helpers against this projection is
+ * what keeps the two sides from drifting apart. */
+type SubmissionReadRow = Pick<
+  StoredSubmission,
+  | "id" | "account_id" | "crypto_version" | "request_fingerprint" | "rfc_message_id"
+  | "request_json" | "encrypted_details" | "error_message" | "provider_message_id"
+  | "post_submit_warning"
+>;
+
+/** One page of the keyset-paginated verification sweep. */
+type SubmissionVerificationRow = SubmissionReadRow & { rowid: number };
+
+function requestForRow(row: SubmissionReadRow, masterKey: Buffer): OutboundSubmissionRequest {
   let plaintext: string;
   if (row.crypto_version === OUTBOUND_SUBMISSION_CRYPTO_VERSION && row.request_json.startsWith("nami-v1.")) {
     plaintext = withDerivedKey(masterKey, requestKeyPurpose, (key) =>
@@ -203,7 +220,7 @@ function requestForRow(row: StoredSubmission, masterKey: Buffer): OutboundSubmis
   }
 }
 
-function detailsForRow(row: StoredSubmission, masterKey: Buffer): SubmissionDetails {
+function detailsForRow(row: SubmissionReadRow, masterKey: Buffer): SubmissionDetails {
   let details: SubmissionDetails;
   if (row.crypto_version === OUTBOUND_SUBMISSION_CRYPTO_VERSION && row.encrypted_details) {
     const plaintext = withDerivedKey(masterKey, detailsKeyPurpose, (key) =>
@@ -308,6 +325,54 @@ function protectSubmissionRow(
   );
 }
 
+// Pages of submissions verified per statement while streaming; sized so peak
+// memory stays at one page of ciphertext instead of the whole outbox.
+const VERIFICATION_PAGE_SIZE = 200;
+
+// Mirrors message-storage.ts's verification gate: the full decrypt sweep runs
+// only when its proof can be stale — the marker is missing (first startup
+// after the migration, or a marker cleared by an interrupted retry: a crash
+// mid-migration can leave rows in either form, and a half-migrated corrupted
+// row must not be silently accepted) or rows were re-encrypted this pass.
+// Routine startups (marker present, nothing migrated) skip it: re-proving
+// every submission costs two envelope decrypts per row before listen, for a
+// property the next real decrypt re-establishes anyway — a row corrupted
+// after a skipped sweep surfaces at its first real decrypt instead. A
+// fingerprint/sample hybrid was rejected because a sampled scheme still
+// passes a corrupted row a full pass would catch, and the stored HMAC
+// columns authenticate plaintexts, not ciphertexts.
+function verifyOutboundSubmissions(db: DatabaseHandle, masterKey: Buffer): number {
+  // Keyset pagination over rowid (`id` is a TEXT primary key, so rowid is the
+  // only stable non-NULL cursor): each page reads only its own ciphertexts and
+  // the columns the proof needs — see SubmissionVerificationRow for why the
+  // projection is explicit rather than `rowid, *`.
+  const page = db.prepare(`
+    SELECT rowid, id, account_id, crypto_version, request_fingerprint, rfc_message_id,
+           request_json, encrypted_details, error_message, provider_message_id, post_submit_warning
+    FROM outbound_submissions WHERE rowid > ? ORDER BY rowid LIMIT ?
+  `);
+  let cursor = 0;
+  let verified = 0;
+  for (;;) {
+    const batch = page.all(cursor, VERIFICATION_PAGE_SIZE) as SubmissionVerificationRow[];
+    if (batch.length === 0) break;
+    for (const row of batch) {
+      if (
+        row.crypto_version !== OUTBOUND_SUBMISSION_CRYPTO_VERSION
+        || row.error_message !== null || row.provider_message_id !== null || row.post_submit_warning !== null
+        || row.request_fingerprint !== requestFingerprint(masterKey, row.account_id, requestForRow(row, masterKey))
+        || row.rfc_message_id !== messageIdLookup(masterKey, row.account_id, detailsForRow(row, masterKey).rfcMessageId)
+      ) {
+        throw new Error("Outbound submission storage migration verification failed.");
+      }
+      verified += 1;
+    }
+    cursor = batch[batch.length - 1]!.rowid;
+    if (batch.length < VERIFICATION_PAGE_SIZE) break;
+  }
+  return verified;
+}
+
 /** Encrypts legacy send requests and diagnostic details before API startup. */
 export function migrateOutboundSubmissionStorage(
   db: DatabaseHandle,
@@ -328,24 +393,12 @@ export function migrateOutboundSubmissionStorage(
     }
   })();
 
-  const protectedRows = db.prepare("SELECT * FROM outbound_submissions").all() as StoredSubmission[];
-  for (const row of protectedRows) {
-    const request = requestForRow(row, masterKey);
-    const details = detailsForRow(row, masterKey);
-    if (
-      row.crypto_version !== OUTBOUND_SUBMISSION_CRYPTO_VERSION
-      || row.error_message !== null
-      || row.provider_message_id !== null
-      || row.post_submit_warning !== null
-      || row.request_fingerprint !== requestFingerprint(masterKey, row.account_id, request)
-      || row.rfc_message_id !== messageIdLookup(masterKey, row.account_id, details.rfcMessageId)
-    ) {
-      throw new Error("Outbound submission storage migration verification failed.");
-    }
-  }
+  // The sweep is owed only when the decryptability proof can be stale (see
+  // verifyOutboundSubmissions): no marker yet, or rows migrated in this pass.
+  const verifiedCount = !marker || rows.length > 0 ? verifyOutboundSubmissions(db, masterKey) : 0;
 
   let vacuumed = false;
-  if (rows.length > 0 || (!marker && protectedRows.length > 0)) {
+  if (rows.length > 0 || (!marker && verifiedCount > 0)) {
     db.pragma("wal_checkpoint(TRUNCATE)");
     db.exec("VACUUM");
     db.pragma("wal_checkpoint(TRUNCATE)");
@@ -356,6 +409,7 @@ export function migrateOutboundSubmissionStorage(
     ON CONFLICT(id) DO UPDATE SET completed_at = excluded.completed_at
   `).run(OUTBOUND_SUBMISSION_MIGRATION_ID, new Date().toISOString());
   if (vacuumed) db.pragma("wal_checkpoint(TRUNCATE)");
+  pruneExpiredOutboundSubmissions(db); // startup retention prune; failure-safe, see outbox-retention.ts
   return { migrated: rows.length, vacuumed };
 }
 

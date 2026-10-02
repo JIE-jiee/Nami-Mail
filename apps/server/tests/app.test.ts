@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import { request as httpRequest } from "node:http";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+
+// Generated per run so the fixture carries no credential literal; the value
+// only has to prove that the token header flows through to the routes.
+const desktopSessionToken = `desktop-session-${randomUUID()}`;
 import type { FastifyInstance } from "fastify";
 import sharp from "sharp";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,8 +16,22 @@ import { AccountLifecycleStore } from "../src/agent/lifecycle.js";
 import { applyAgentStoreSchema } from "../src/agent/schema.js";
 import { AgentSourceEventOutbox } from "../src/agent/source-events.js";
 import { openDatabase, type DatabaseHandle } from "../src/db.js";
+import { config } from "../src/config.js";
 import { indexMessageFts } from "../src/message-search.js";
+import { LIST_TEXT_PREVIEW_CHARS } from "../src/message-wire.js";
+import { MAX_STORED_HTML_BODY_BYTES, TRUNCATED_BODY_NOTICE } from "../src/message-body-limits.js";
 import type { OAuthService } from "../src/oauth.js";
+
+// Fastify's inject stamps a synthetic default of "Host: localhost:80" on
+// every request that does not carry an explicit host header. The token-less
+// Host allowlist in src/app.ts validates that header against the configured
+// port, so the suite pins PORT=80 (hoisted above the src imports so
+// src/config.js sees it) and every pre-existing inject-based case stays
+// inside the allowlist unchanged. New tests below cover the allowlist
+// explicitly with explicit host headers.
+vi.hoisted(() => {
+  process.env.PORT = "80";
+});
 
 const { imapClientForAccount } = vi.hoisted(() => ({ imapClientForAccount: vi.fn() }));
 
@@ -129,7 +148,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       masterKey: Buffer.alloc(32, 7),
       backgroundDirectory,
       agentService: agentService as never,
-    });
+    }, { localApiAccessToken: desktopSessionToken });
     await streamingApp.listen({ host: "127.0.0.1", port: 0 });
     const address = streamingApp.server.address();
     if (!address || typeof address === "string") throw new Error("Expected a TCP listener.");
@@ -141,7 +160,7 @@ it("keeps an Agent stream running after the client closes its response", async (
           port: address.port,
           method: "POST",
           path: "/api/agent/conversations/conversation-1/messages",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", "x-nami-api-token": desktopSessionToken },
         }, (response) => {
           response.once("data", () => {
             client.destroy();
@@ -208,7 +227,7 @@ it("keeps an Agent stream running after the client closes its response", async (
         yield { type: "completed", reason: "stop" };
       });
 
-      const streamingApp = await buildApp({ db, masterKey: serviceMasterKey, backgroundDirectory, agentService });
+      const streamingApp = await buildApp({ db, masterKey: serviceMasterKey, backgroundDirectory, agentService }, { localApiAccessToken: desktopSessionToken });
       await streamingApp.listen({ host: "127.0.0.1", port: 0 });
       const address = streamingApp.server.address();
       if (!address || typeof address === "string") throw new Error("Expected a TCP listener.");
@@ -220,7 +239,7 @@ it("keeps an Agent stream running after the client closes its response", async (
             port: address.port,
             method: "POST",
             path: `/api/agent/conversations/${conversation.id}/messages`,
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", "x-nami-api-token": desktopSessionToken },
           }, (response) => {
             response.once("data", () => {
               // The user moved away from the assistant panel mid-generation.
@@ -243,7 +262,7 @@ it("keeps an Agent stream running after the client closes its response", async (
         let lastMessage: { role: string; content: string; state?: string } | undefined;
         let roles: string[] = [];
         while (Date.now() < deadline) {
-          const response = await streamingApp.inject({ method: "GET", url: `/api/agent/conversations/${conversation.id}` });
+          const response = await streamingApp.inject({ method: "GET", url: `/api/agent/conversations/${conversation.id}`, headers: { "x-nami-api-token": desktopSessionToken } });
           const conversationSnapshot = response.json();
           roles = conversationSnapshot.messages.map((message: { role: string }) => message.role);
           lastMessage = conversationSnapshot.messages[conversationSnapshot.messages.length - 1];
@@ -494,7 +513,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       db,
       masterKey: Buffer.alloc(32, 7),
       backgroundDirectory,
-    }, { localApiAccessToken: "desktop-session-token" });
+    }, { localApiAccessToken: desktopSessionToken });
     try {
       const health = await protectedApp.inject({ method: "GET", url: "/api/health" });
       const unauthorized = await protectedApp.inject({ method: "GET", url: "/api/accounts" });
@@ -506,7 +525,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       const authorized = await protectedApp.inject({
         method: "GET",
         url: "/api/accounts",
-        headers: { "x-nami-api-token": "desktop-session-token" },
+        headers: { "x-nami-api-token": desktopSessionToken },
       });
       const oauthCallback = await protectedApp.inject({
         method: "GET",
@@ -516,7 +535,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       expect(health.statusCode).toBe(200);
       expect(unauthorized.statusCode).toBe(401);
       expect(unauthorized.json()).toMatchObject({ ok: false, code: "local_api_unauthorized" });
-      expect(unauthorized.body).not.toContain("desktop-session-token");
+      expect(unauthorized.body).not.toContain(desktopSessionToken);
       expect(wrongToken.statusCode).toBe(401);
       expect(authorized.statusCode).toBe(200);
       expect(oauthCallback.statusCode).not.toBe(401);
@@ -550,6 +569,68 @@ it("keeps an Agent stream running after the client closes its response", async (
       expect(lan.json()).toMatchObject({ ok: false, code: "local_api_unauthorized" });
     } finally {
       await unprotectedApp.close();
+    }
+  });
+
+  it("accepts token-less requests whose Host header names this server's own loopback authority", async () => {
+    // Regression guard: the Host allowlist must not lock browser-only
+    // development out of its own local API. Every loopback authority form —
+    // IPv4, the localhost name in any case, and the bracketed IPv6 form — is
+    // accepted on the configured port.
+    const ipv4 = await app.inject({ method: "GET", url: "/api/accounts", headers: { host: `127.0.0.1:${config.port}` } });
+    const localhost = await app.inject({ method: "GET", url: "/api/accounts", headers: { host: `localhost:${config.port}` } });
+    const upperCase = await app.inject({ method: "GET", url: "/api/accounts", headers: { host: `LOCALHOST:${config.port}` } });
+    const ipv6 = await app.inject({ method: "GET", url: "/api/accounts", headers: { host: `[::1]:${config.port}` } });
+
+    expect(ipv4.statusCode).toBe(200);
+    expect(localhost.statusCode).toBe(200);
+    expect(upperCase.statusCode).toBe(200);
+    expect(ipv6.statusCode).toBe(200);
+  });
+
+  it("rejects token-less requests with a foreign or mismatched Host header", async () => {
+    // DNS rebinding presents a loopback socket peer while the browser keeps
+    // the attacker's authority in the Host header, so anything that is not
+    // exactly this server's own loopback authority on the configured port is
+    // refused (403, local_api_forbidden_host).
+    for (const host of [
+      `evil.example:${config.port}`,
+      `rebound.attacker.example:${config.port}`,
+      `127.0.0.1:${config.port + 1}`,
+      `[::1]:${config.port + 1}`,
+      "localhost",
+    ]) {
+      const response = await app.inject({ method: "GET", url: "/api/accounts", headers: { host } });
+      expect(response.statusCode, `host ${host}`).toBe(403);
+      expect(response.json()).toMatchObject({ ok: false, code: "local_api_forbidden_host" });
+    }
+  });
+
+  it("never applies the Host allowlist to requests carrying the desktop token", async () => {
+    // Desktop mode authenticates with a per-boot capability token; its
+    // behavior must not change with the Host header at all.
+    const protectedApp = await buildApp({
+      db,
+      masterKey: Buffer.alloc(32, 7),
+      backgroundDirectory,
+    }, { localApiAccessToken: desktopSessionToken });
+    try {
+      const authorized = await protectedApp.inject({
+        method: "GET",
+        url: "/api/accounts",
+        headers: { host: `evil.example:${config.port}`, "x-nami-api-token": desktopSessionToken },
+      });
+      const missingToken = await protectedApp.inject({
+        method: "GET",
+        url: "/api/accounts",
+        headers: { host: `evil.example:${config.port}` },
+      });
+
+      expect(authorized.statusCode).toBe(200);
+      expect(missingToken.statusCode).toBe(401);
+      expect(missingToken.json()).toMatchObject({ ok: false, code: "local_api_unauthorized" });
+    } finally {
+      await protectedApp.close();
     }
   });
 
@@ -594,8 +675,8 @@ it("keeps an Agent stream running after the client closes its response", async (
     expect(gmail).toMatchObject({
       family: "google",
       priority: "P0",
-      authMethods: ["oauth2", "app-password"],
-      recommendedAuthMethod: "oauth2",
+      authMethods: ["app-password", "oauth2"],
+      recommendedAuthMethod: "app-password",
       credentialName: "16 位应用专用密码",
       usernameMode: "email",
       oauthProvider: "google",
@@ -692,11 +773,11 @@ it("keeps an Agent stream running after the client closes its response", async (
     const invalidAttempt = await app.inject({ method: "GET", url: "/api/oauth/attempts/not-a-uuid" });
 
     expect(malformed.statusCode).toBe(400);
-    expect(malformed.json()).toMatchObject({ ok: false, code: "invalid_request" });
+    expect(malformed.json()).toMatchObject({ ok: false, code: "invalid_argument" });
     expect(unavailable.statusCode).toBe(503);
     expect(unavailable.json()).toMatchObject({ ok: false, code: "oauth_not_configured" });
     expect(invalidAttempt.statusCode).toBe(400);
-    expect(invalidAttempt.json()).toMatchObject({ ok: false, code: "invalid_request" });
+    expect(invalidAttempt.json()).toMatchObject({ ok: false, code: "invalid_argument" });
   });
 
   it("does not issue a Microsoft authorization URL when its IPv6 callback bridge is unavailable", async () => {
@@ -740,7 +821,7 @@ it("keeps an Agent stream running after the client closes its response", async (
     });
 
     expect(response.statusCode).toBe(400);
-    expect(response.json()).toMatchObject({ ok: false, code: "invalid_request" });
+    expect(response.json()).toMatchObject({ ok: false, code: "invalid_argument" });
   });
 
   it("returns JSON for unknown API routes", async () => {
@@ -982,11 +1063,39 @@ it("keeps an Agent stream running after the client closes its response", async (
     expect(mismatchedType.statusCode).toBe(400);
     expect(mismatchedType.json()).toMatchObject({ ok: false });
     expect(oversized.statusCode).toBe(413);
-    expect(oversized.json()).toEqual({ ok: false, message: "背景图片不能超过 50 MB。" });
+    expect(oversized.json()).toEqual({ ok: false, code: "payload_too_large", message: "背景图片不能超过 50 MB。" });
     expect(fs.readdirSync(backgroundDirectory)).toEqual(filesBefore);
 
     const settings = await app.inject({ method: "GET", url: "/api/settings" });
     expect(settings.json()).toEqual(settingsBefore);
+  });
+
+  // The octet-stream parser is global, but its size ceiling must not be: the
+  // upload routes raise their own (see the background cases above and the
+  // outbound-attachment route suite), and every other route falls back to the
+  // 3 MB server-wide bodyLimit instead of inheriting the upload ceiling.
+  it("caps octet-stream bodies on routes that never accept an upload", async () => {
+    const oversized = Buffer.alloc(4 * 1024 * 1024);
+    const withinLimit = Buffer.alloc(2 * 1024 * 1024);
+
+    const rejected = await app.inject({
+      method: "DELETE",
+      url: "/api/outbound-attachments",
+      headers: { "content-type": "application/octet-stream" },
+      payload: oversized,
+    });
+    const accepted = await app.inject({
+      method: "DELETE",
+      url: "/api/outbound-attachments",
+      headers: { "content-type": "application/octet-stream" },
+      payload: withinLimit,
+    });
+
+    expect(rejected.statusCode).toBe(413);
+    // Under the ceiling the body reaches the handler, which then rejects the
+    // payload on its own schema rather than on its size.
+    expect(accepted.statusCode).toBe(400);
+    expect(accepted.json()).toMatchObject({ ok: false });
   });
 
   it("validates message move requests before attempting an IMAP connection", async () => {
@@ -1004,7 +1113,7 @@ it("keeps an Agent stream running after the client closes its response", async (
     expect(malformed.statusCode).toBe(400);
     expect(malformed.json()).toMatchObject({ ok: false });
     expect(missing.statusCode).toBe(422);
-    expect(missing.json()).toEqual({ ok: false, message: "Message not found." });
+    expect(missing.json()).toEqual({ ok: false, code: "unprocessable", message: "Message not found." });
   });
 
   it("strictly validates message flag updates before reaching IMAP and accepts the flagged path", async () => {
@@ -1026,7 +1135,7 @@ it("keeps an Agent stream running after the client closes its response", async (
     });
 
     expect(missing.statusCode).toBe(422);
-    expect(missing.json()).toEqual({ ok: false, message: "Message not found." });
+    expect(missing.json()).toEqual({ ok: false, code: "unprocessable", message: "Message not found." });
   });
 
   it("validates batch message flag updates before touching any message", async () => {
@@ -1051,7 +1160,10 @@ it("keeps an Agent stream running after the client closes its response", async (
       payload: { ids: ["missing-message", "also-missing"], patch: { seen: true } },
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ ok: true, updated: 0, failed: 2, changedIds: [] });
+    // Counts only. The ids that would have changed are unknowable here by
+    // definition (nothing existed) and unreadable everywhere else, so they
+    // are not part of the contract — see the key-set test below.
+    expect(response.json()).toEqual({ ok: true, updated: 0, failed: 2 });
   });
 
   it("accepts large selections in one batch request so the write slot is taken once", async () => {
@@ -1065,7 +1177,11 @@ it("keeps an Agent stream running after the client closes its response", async (
       payload: { ids, patch: { seen: true } },
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ ok: true, updated: 0, failed: 150, changedIds: [] });
+    expect(response.json()).toEqual({ ok: true, updated: 0, failed: 150 });
+    // The regression the counts-only contract exists for: the response used to
+    // echo every id it changed, so a 150-id selection paid for 150 strings and
+    // a 5000-id one cost ~200 KB. The payload is flat in the selection size.
+    expect(response.body.length).toBe(JSON.stringify({ ok: true, updated: 0, failed: 150 }).length);
   });
 
   it("validates batch message moves and reports per-message outcomes", async () => {
@@ -1134,8 +1250,70 @@ it("keeps an Agent stream running after the client closes its response", async (
         sent_at, snippet, text_body, html_body, flags_json, has_attachments, size, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    return { now, insertMessage };
+    return {
+      now,
+      insertMessage,
+    };
   }
+
+  /** The exact key set `PATCH /api/messages/batch/flags` returns. Counts only. */
+  const FLAG_BATCH_KEYS = ["failed", "ok", "updated"];
+  /** The exact key set `POST /api/messages/batch/move` returns. Same counts, plus failure detail. */
+  const MOVE_BATCH_KEYS = ["failed", "failures", "ok", "updated"];
+
+  it("answers a batch flag update with counts only — never the changed ids", async () => {
+    // The same shape rule as batch-jobs' PROGRESS_KEYS: pin the whole key set
+    // so a re-added per-id echo fails here instead of quietly costing ~40
+    // bytes per selected message on the wire. `BatchMessageOperationResult` in
+    // the renderer declares no such field and nothing reads one.
+    imapClientForAccount.mockReturnValue(readyMailClient());
+    const { now, insertMessage } = seedJobAccount("flag-batch-keys");
+    insertMessage.run("key-1", "flag-batch-keys", "INBOX", 71, "Keys", "Demo", "demo@example.com", "[]", now, "k", "k", "", "[]", 0, 10, now);
+
+    const success = await app.inject({
+      method: "PATCH",
+      url: "/api/messages/batch/flags",
+      payload: { ids: ["key-1", "key-missing"], patch: { seen: true } },
+    });
+    expect(success.statusCode).toBe(200);
+    expect(Object.keys(success.json()).sort()).toEqual(FLAG_BATCH_KEYS);
+    expect("changedIds" in success.json()).toBe(false);
+    // The counts still describe the real outcome: one committed, one refused.
+    expect(success.json()).toEqual({ ok: true, updated: 1, failed: 1 });
+
+    // The all-refused path carries the same keys — the id echo was never
+    // load-bearing, it was simply present on both branches.
+    const refused = await app.inject({
+      method: "PATCH",
+      url: "/api/messages/batch/flags",
+      payload: { ids: ["key-missing-2", "key-missing-3"], patch: { seen: true } },
+    });
+    expect(refused.statusCode).toBe(200);
+    expect(Object.keys(refused.json()).sort()).toEqual(FLAG_BATCH_KEYS);
+    expect("changedIds" in refused.json()).toBe(false);
+  });
+
+  it("answers a batch move with counts and failures only — never a moved-id list", async () => {
+    // The sibling route. It never echoed a per-id array, so nothing has to
+    // change; pinning its key set keeps the two batch contracts from drifting
+    // apart and closes the "same bug, other route" search.
+    imapClientForAccount.mockReturnValue(readyMailClient());
+    const { now, insertMessage } = seedJobAccount("move-batch-keys", true);
+    insertMessage.run("move-key-1", "move-batch-keys", "INBOX", 72, "Move", "Demo", "demo@example.com", "[]", now, "m", "m", "", "[]", 0, 10, now);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/messages/batch/move",
+      payload: { ids: ["move-key-1", "move-missing"], target: "archive" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(Object.keys(response.json()).sort()).toEqual(MOVE_BATCH_KEYS);
+    const body = response.json();
+    // `failures` is bounded by the refusal count, not the selection: one
+    // entry for the one id the server could not move.
+    expect(body.failures).toEqual([{ id: "move-missing", message: "Message not found." }]);
+    expect(body.updated).toBe(1);
+  });
 
   it("commits batch flags locally and records one durable push per account", async () => {
     imapClientForAccount.mockReturnValue(readyMailClient());
@@ -1150,12 +1328,10 @@ it("keeps an Agent stream running after the client closes its response", async (
       payload: { ids: ["flag-a-1", "flag-b-1"], patch: { seen: true } },
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({
-      ok: true,
-      updated: 2,
-      failed: 0,
-      changedIds: expect.arrayContaining(["flag-a-1", "flag-b-1"]),
-    });
+    // `updated: 2` is what this test is about: the two ids really committed.
+    // That it was *these* two ids is proven below by the durable push rows,
+    // which name them per account — the response itself no longer echoes ids.
+    expect(response.json()).toEqual({ ok: true, updated: 2, failed: 0 });
 
     // The flags are visible locally immediately (write-behind), and one
     // durable flags-push row per account carries the remote delta — a
@@ -1203,7 +1379,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       payload: { ids: ["flag-dead-1"], patch: { seen: true } },
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ ok: true, updated: 1, failed: 0, changedIds: ["flag-dead-1"] });
+    expect(response.json()).toEqual({ ok: true, updated: 1, failed: 0 });
     const local = JSON.parse(
       (db.prepare("SELECT flags_json, pending_flags_push FROM messages WHERE id = ?").get("flag-dead-1") as { flags_json: string; pending_flags_push: number }).flags_json,
     );
@@ -1225,7 +1401,7 @@ it("keeps an Agent stream running after the client closes its response", async (
       payload: { ids: ["flag-push-1"], patch: { seen: true } },
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ ok: true, updated: 1, failed: 0, changedIds: ["flag-push-1"] });
+    expect(response.json()).toEqual({ ok: true, updated: 1, failed: 0 });
     // The background chain runs on the next macrotask; poll briefly.
     for (let attempt = 0; attempt < 50; attempt += 1) {
       const row = db.prepare("SELECT pending_flags_push FROM messages WHERE id = ?").get("flag-push-1") as { pending_flags_push: number };
@@ -1268,6 +1444,9 @@ it("keeps an Agent stream running after the client closes its response", async (
     const job = await waitForJob(jobId);
     // The predicate is resolved server-side to exactly the two unread
     // messages, the remote STORE succeeds, and both are persisted + reported.
+    // This literal IS the progress contract: the ids the job changed are
+    // deliberately absent, because the renderer re-reads this response every
+    // 600ms for as long as the job runs (1.3 MB per poll at 30k messages).
     expect(job).toEqual({
       id: jobId,
       kind: "flags",
@@ -1277,7 +1456,6 @@ it("keeps an Agent stream running after the client closes its response", async (
       updated: 2,
       failed: 0,
       createdAt: expect.any(Number),
-      changedIds: ["job-inbox-1", "job-inbox-2"],
       undoWindowMs: expect.any(Number),
     });
     const inboxFlagged = (db.prepare("SELECT flags_json FROM messages WHERE id = ?").get("job-inbox-1") as { flags_json: string }).flags_json;
@@ -1364,9 +1542,20 @@ it("keeps an Agent stream running after the client closes its response", async (
 
     const job = await waitForJob(jobId);
     // The predicate is resolved server-side and the UIDPLUS-confirmed move is
-    // persisted locally and counted as updated.
-    expect(job).toMatchObject({ status: "completed", total: 1, done: 1, updated: 1, failed: 0 });
-    expect(job.changedIds).toEqual([]);
+    // persisted locally and counted as updated. A move job's undo scope is its
+    // origin mailboxes, which the server holds internally — a move snapshot
+    // never carried a changed-id list in the first place.
+    expect(job).toEqual({
+      id: jobId,
+      kind: "move",
+      status: "completed",
+      total: 1,
+      done: 1,
+      updated: 1,
+      failed: 0,
+      createdAt: expect.any(Number),
+      undoWindowMs: expect.any(Number),
+    });
     const moved = db.prepare("SELECT mailbox, uid FROM messages WHERE id = ?").get("job-move-1") as { mailbox: string; uid: number };
     expect(moved).toEqual({ mailbox: "Archive", uid: 101 });
   });
@@ -1487,10 +1676,74 @@ it("keeps an Agent stream running after the client closes its response", async (
 
     const search = await app.inject({ method: "GET", url: "/api/messages?accountId=account-1&q=Inbox" });
     expect(search.statusCode).toBe(200);
-    expect(search.json()).toMatchObject({ total: 2, page: 1 });
+    // Two matching rows and the default page size of 40: the whole result set
+    // fit, so this is the last page and says so.
+    expect(search.json()).toMatchObject({ total: 2, pageSize: 40, nextCursor: null });
 
     const stats = await app.inject({ method: "GET", url: "/api/stats" });
     expect(stats.json()).toMatchObject({ accounts: 1, messages: 2, unread: 1 });
+  });
+
+  it("keeps the body off the list page and serves it from the message endpoint", async () => {
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO accounts (
+        id, email, provider, provider_name, encrypted_password,
+        imap_host, imap_port, imap_secure, smtp_host, smtp_port, smtp_secure,
+        username_mode, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("account-1", "demo@example.com", "custom", "Demo", "encrypted", "imap.example.com", 993, 1, "smtp.example.com", 465, 1, "email", "connected", now);
+    db.prepare("INSERT INTO folders (account_id, path, name, special_use, total, unseen) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("account-1", "INBOX", "Inbox", "\\Inbox", 1, 1);
+    const textBody = `head-${"b".repeat(LIST_TEXT_PREVIEW_CHARS * 2)}-tail`;
+    const htmlBody = `<p>head</p><img src="cid:logo@mail">`;
+    db.prepare(`
+      INSERT INTO messages (
+        id, account_id, mailbox, uid, subject, from_name, from_address, to_json,
+        sent_at, snippet, text_body, html_body, flags_json, has_attachments, size, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("message-1", "account-1", "INBOX", 1, "Body carrier", "Demo", "demo@example.com", "[]", now, "snippet", textBody, htmlBody, "[]", 0, textBody.length, now);
+    // A message with inline-image metadata must not smuggle its html part out
+    // through the list either.
+    db.prepare(`
+      INSERT INTO messages (
+        id, account_id, mailbox, uid, subject, from_name, from_address, to_json,
+        sent_at, snippet, text_body, html_body, flags_json, has_attachments,
+        attachments_json, size, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("message-2", "account-1", "INBOX", 2, "Inline image", "Demo", "demo@example.com", "[]", now, "snippet", "text", htmlBody, "[]", 1, 12,
+      JSON.stringify([{ partId: "1.1", filename: "logo.png", contentType: "image/png", size: 12, related: true, disposition: "inline", contentId: "logo@mail" }]), now);
+
+    const list = await app.inject({ method: "GET", url: "/api/messages?accountId=account-1" });
+    expect(list.statusCode).toBe(200);
+    const items = list.json().items as Array<Record<string, unknown>>;
+    expect(items).toHaveLength(2);
+    for (const item of items) {
+      // The key is absent, not empty: "this row has no body" has to stay
+      // distinguishable from "this message's body is empty".
+      expect("htmlBody" in item).toBe(false);
+      expect(typeof item.snippet).toBe("string");
+      expect(item.subject).toBeTruthy();
+    }
+    const carried = items.find((item) => item.id === "message-1")!;
+    expect(carried.textBody).toBe(textBody.slice(0, LIST_TEXT_PREVIEW_CHARS));
+    expect(carried.textBody).not.toContain("tail");
+
+    const detail = await app.inject({ method: "GET", url: "/api/messages/message-1" });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json()).toMatchObject({ textBody, htmlBody });
+
+    // A row stored before the ingest cap existed is bounded on the wire too:
+    // the reader is a single user click, but a 200MB string still freezes it.
+    const legacyHtml = `<p>${"i".repeat(MAX_STORED_HTML_BODY_BYTES + 2048)}</p>`;
+    db.prepare("UPDATE messages SET html_body = ? WHERE id = 'message-2'").run(legacyHtml);
+    const bounded = await app.inject({ method: "GET", url: "/api/messages/message-2" });
+    const boundedHtml = bounded.json().htmlBody as string;
+    expect(boundedHtml.endsWith(`<p>${TRUNCATED_BODY_NOTICE}</p>`)).toBe(true);
+    expect(boundedHtml.length).toBeLessThan(legacyHtml.length);
+    // The stored row is what EML export and the search index still read.
+    const stored = db.prepare("SELECT html_body FROM messages WHERE id = 'message-2'").get() as { html_body: string };
+    expect(stored.html_body).toBe(legacyHtml);
   });
 
   it("lists messages with attachments across every folder and account", async () => {

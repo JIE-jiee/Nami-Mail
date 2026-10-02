@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { calendarEventColors, type CalendarEventColor } from "@nami/agent-contracts";
 import { decryptTextEnvelope, deriveEncryptionKey, encryptTextEnvelope } from "./crypto.js";
 import type { DatabaseHandle } from "./db.js";
 
@@ -11,8 +12,10 @@ import type { DatabaseHandle } from "./db.js";
  * SQL string operators stay correct across timezone offsets.
  */
 
-export const calendarEventColors = ["blue", "green", "amber", "red", "purple", "teal"] as const;
-export type CalendarEventColor = typeof calendarEventColors[number];
+// The color vocabulary is single-sourced in @nami/agent-contracts; this
+// re-export keeps the historical local names for the rest of the server.
+export { calendarEventColors };
+export type { CalendarEventColor };
 
 export type CalendarEvent = {
   id: string;

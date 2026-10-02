@@ -32,7 +32,14 @@ export function isLoopbackHost(value: string): boolean {
   return false;
 }
 
-/** True for loopback socket peer addresses, including Node's IPv4-mapped forms. */
+/**
+ * True for loopback socket peer addresses, including Node's IPv4-mapped forms.
+ *
+ * This alone no longer authorizes token-less requests: DNS rebinding presents
+ * a loopback peer from an attacker-controlled origin, so app.ts additionally
+ * validates the Host header of token-less requests (see
+ * isTrustedTokenlessHost there).
+ */
 export function isLoopbackRemoteAddress(value: string | undefined): boolean {
   if (!value) return true; // injected requests and abstract sockets carry no peer address
   const remote = value.trim().toLowerCase();
@@ -51,6 +58,23 @@ if (!isLoopbackHost(hostValue)) {
     + "only from this machine; set HOST to 127.0.0.1, ::1, or localhost.",
   );
 }
+
+/**
+ * Vendor-registered public-client OAuth application IDs. A client ID is not a
+ * secret (it appears in every authorization URL the browser opens), so these
+ * ship in source the way Thunderbird and other mail clients bundle theirs:
+ * users sign in without ever opening the Azure or Google consoles. The
+ * nami-mail.env keys remain as overrides for installs that must present their
+ * own registered app instead.
+ *
+ * To fill in: register a public-client app whose redirect URI is the loopback
+ * callback path (the local port is ephemeral, so the registration must use the
+ * desktop platform where Microsoft ignores the port), enable public-client
+ * flows, paste the application ID here, and keep any previously distributed
+ * registration valid until no released build references it.
+ */
+const builtinGoogleOAuthClientId = "";
+const builtinMicrosoftOAuthClientId = "";
 
 export const config = {
   projectRoot,
@@ -73,8 +97,8 @@ export const config = {
   // directly to startServer so child processes never inherit it from the
   // desktop main process.
   localApiAccessToken: optionalEnv("NAMI_MAIL_LOCAL_API_TOKEN"),
-  googleOAuthClientId: optionalEnv("NAMI_MAIL_GOOGLE_OAUTH_CLIENT_ID"),
-  microsoftOAuthClientId: optionalEnv("NAMI_MAIL_MICROSOFT_OAUTH_CLIENT_ID"),
+  googleOAuthClientId: optionalEnv("NAMI_MAIL_GOOGLE_OAUTH_CLIENT_ID") ?? builtinGoogleOAuthClientId,
+  microsoftOAuthClientId: optionalEnv("NAMI_MAIL_MICROSOFT_OAUTH_CLIENT_ID") ?? builtinMicrosoftOAuthClientId,
   microsoftOAuthTenant: optionalEnv("NAMI_MAIL_MICROSOFT_TENANT") || "common",
   oauthFlowTtlSeconds: integerEnv("NAMI_MAIL_OAUTH_FLOW_TTL_SECONDS", 600, 60, 900),
   translationEndpoint: optionalEnv("NAMI_MAIL_TRANSLATION_ENDPOINT"),

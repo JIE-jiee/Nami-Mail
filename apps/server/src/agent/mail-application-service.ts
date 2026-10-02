@@ -1,4 +1,4 @@
-import type { CallerContext, Citation } from "@nami/agent-contracts";
+import type { CallerContext, Citation, OutboundSubmissionStatus } from "@nami/agent-contracts";
 import type { AgentToolExecutionContext } from "@nami/agent-core";
 
 export type MailApplicationContext = Pick<AgentToolExecutionContext, "requestId" | "caller" | "accountIds" | "allowedMessageIds" | "signal"> & {
@@ -133,7 +133,7 @@ export type PreparedMailSubmission = {
   /** Present on prepare; omitted after submission because the key is consumed. */
   idempotencyKey?: string;
   accountId: string;
-  status: "pending" | "submitting" | "submitted" | "confirmed" | "unknown_delivery" | "failed";
+  status: OutboundSubmissionStatus;
 };
 
 /**

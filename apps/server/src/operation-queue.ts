@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseHandle } from "./db.js";
-import { acquireAccountWriteSlots, withHeldWriteSlots, withTimeout } from "./sync.js";
+import { acquireAccountWriteSlots, isAccountWriteSlotTimeoutError, withHeldWriteSlots, withTimeout } from "./sync-locks.js";
 import { serverLog } from "./logging.js";
 
 /**
@@ -49,6 +49,14 @@ export type OperationQueue = {
    * caller — and the HTTP response — is not blocked on IMAP round-trips.
    * Rows survive a restart through resumePending. */
   enqueueBackground(accountIds: readonly string[], kind: OperationKind, payload: unknown): void;
+  /** Transactional variant of {@link enqueueBackground}: records the same
+   * durable row inside a transaction the caller already owns, and returns the
+   * starter that joins the row to the per-account FIFO chain. Call the starter
+   * *after* the transaction commits — the row is only readable once it is
+   * committed, and the whole point of the variant is that the row and the
+   * state it describes can never be committed apart. A rollback discards both.
+   */
+  stageBackgroundInTransaction(accountIds: readonly string[], kind: OperationKind, payload: unknown): () => void;
   /** Re-enqueues every pending/running row after a restart and prunes old
    * terminal rows. Returns how many operations were resumed. */
   resumePending(): Promise<number>;
@@ -66,7 +74,9 @@ const OPERATION_RUN_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Background (write-behind) operations retry with exponential backoff up to
  * this many attempts before being given up on and handed to
- * onBackgroundPermanentFailure. 8 attempts span roughly 4-5 minutes. */
+ * onBackgroundPermanentFailure. Eight attempts span roughly 90 seconds
+ * (1+2+4+8+16+30+30). Only failures that can plausibly clear on their own are
+ * retried — see driveWithRetries. */
 const BACKGROUND_MAX_ATTEMPTS = 8;
 const BACKGROUND_RETRY_BASE_MS = 1_000;
 const BACKGROUND_RETRY_MAX_MS = 30_000;
@@ -148,7 +158,19 @@ export function createOperationQueue(db: DatabaseHandle, hooks: OperationQueueHo
       try {
         await runRow(row);
         return;
-      } catch {
+      } catch (error) {
+        // A write-slot timeout says nothing about this operation: it never
+        // reached the executor, because the account is already saturated (a
+        // hung predecessor, or a burst of writes queued behind one). Re-queueing
+        // it would add another waiter to the very queue that just rejected it
+        // — measured on a wedged account, 60 queued writes turned into 480
+        // further attempts against the same stuck slot and delayed the drain
+        // by minutes. Give up instead: the row settles failed, the hook clears
+        // the operation's own markers, and anything half-applied upstream is
+        // reconciled by the next sync. Every other failure keeps its retries:
+        // a dropped connection or a rejected provider command is exactly what
+        // backoff is for.
+        if (isAccountWriteSlotTimeoutError(error)) break;
         if (attempt >= BACKGROUND_MAX_ATTEMPTS) break;
         const delay = Math.min(BACKGROUND_RETRY_MAX_MS, BACKGROUND_RETRY_BASE_MS * 2 ** (attempt - 1));
         try {
@@ -168,6 +190,18 @@ export function createOperationQueue(db: DatabaseHandle, hooks: OperationQueueHo
     } catch (hookError) {
       serverLog.warn({ operationId: row.id, kind: row.kind }, "Background failure hook threw", hookError);
     }
+  }
+
+  /** Joins a durable background row to the account's FIFO chain. Strict FIFO:
+   * rows for the same message must push in the order they were committed, or
+   * deltas could compose out of order. */
+  function scheduleBackgroundRow(id: string): void {
+    const row = db.prepare("SELECT * FROM operation_queue WHERE id = ?").get(id) as OperationQueueRow | undefined;
+    if (!row) return;
+    const chain = (backgroundChains.get(row.account_id) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => driveWithRetries(row));
+    backgroundChains.set(row.account_id, chain);
   }
 
   return {
@@ -199,13 +233,15 @@ export function createOperationQueue(db: DatabaseHandle, hooks: OperationQueueHo
       const id = randomUUID();
       const now = new Date().toISOString();
       insertPending.run(id, accountIds[0] ?? "", kind, JSON.stringify(payload), now, now);
-      const row = db.prepare("SELECT * FROM operation_queue WHERE id = ?").get(id) as OperationQueueRow;
-      // Strict FIFO per account: rows for the same message must push in the
-      // order they were committed, or deltas could compose out of order.
-      const chain = (backgroundChains.get(row.account_id) ?? Promise.resolve())
-        .catch(() => undefined)
-        .then(() => driveWithRetries(row));
-      backgroundChains.set(row.account_id, chain);
+      scheduleBackgroundRow(id);
+    },
+
+    stageBackgroundInTransaction(accountIds: readonly string[], kind: OperationKind, payload: unknown): () => void {
+      if (accountIds.length === 0) return () => undefined;
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      insertPending.run(id, accountIds[0] ?? "", kind, JSON.stringify(payload), now, now);
+      return () => scheduleBackgroundRow(id);
     },
 
     async resumePending(): Promise<number> {

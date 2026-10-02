@@ -101,7 +101,12 @@ export function submissionMessageIdSuffix(messageId: string): string {
   return localPart.length > 10 ? localPart.slice(-10) : localPart;
 }
 
-export function recipientSummary(recipients: string[] | undefined, maxVisible = 3, t: Translate = defaultTranslate): string | null {
+export function recipientSummary(recipients: string[], maxVisible = 3, t: Translate = defaultTranslate): string | null {
+  // `OutboundSubmission.recipients` is a compile-time contract only: api.ts
+  // hands the raw response body to it as a bare type assertion, so a
+  // malformed payload arrives as undefined/null. This is the runtime floor
+  // that keeps one bad row from taking the whole sending-status modal down
+  // (the call sites only guard the *empty* case with `?? "recipientsMissing"`).
   const normalized = (recipients ?? []).map((recipient) => recipient.trim()).filter(Boolean);
   if (!normalized.length) return null;
   const visible = normalized.slice(0, maxVisible).join(t("common.listSeparator"));
@@ -115,8 +120,10 @@ export function newMessageDraftFromSubmission(submission: OutboundSubmission): {
 } {
   return {
     accountId: submission.accountId,
-    ...(submission.recipients?.length ? { to: submission.recipients.join(", ") } : {}),
-    ...(submission.subject !== undefined && submission.subject !== null ? { subject: submission.subject } : {}),
+    // subject/recipients are required on the wire (the server always emits
+    // them), so the old null/undefined guards are dead.
+    ...(submission.recipients.length ? { to: submission.recipients.join(", ") } : {}),
+    subject: submission.subject,
   };
 }
 

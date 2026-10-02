@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { groupMessagesByThread, mergeThreadMembers, shouldCollapseThread, sortThreadByTimeline } from "./threads";
+import { collapseDuplicateMembers, countThreadMessages, groupMessagesByThread, mergeThreadMembers, mergeThreadSnapshot, shouldCollapseThread, sortThreadByTimeline, type ThreadSnapshot } from "./threads";
 import type { Message } from "./types";
 
 function message(overrides: Partial<Message> & { id: string }): Message {
@@ -97,6 +100,160 @@ describe("message threading", () => {
     expect(groups).toHaveLength(1);
     expect(groups[0]!.messages.map((item) => item.id)).toEqual(["old", "mid", "young"]);
     expect(groups[0]!.key).toBe("old");
+  });
+});
+
+describe("mergeThreadSnapshot", () => {
+  const snapshot = (anchorId: string, ids: string[]): ThreadSnapshot => ({
+    anchorId,
+    members: ids.map((id) => message({ id, subject: "Thread" })),
+  });
+
+  it("returns the next snapshot when there is no previous one", () => {
+    const next = snapshot("b", ["b"]);
+    expect(mergeThreadSnapshot(null, next)).toBe(next);
+  });
+
+  it("unions a same-conversation refetch and keeps old-only members", () => {
+    const previous = snapshot("a", ["a", "b"]);
+    const result = mergeThreadSnapshot(previous, snapshot("b", ["b", "c"]));
+    expect(result.anchorId).toBe("b");
+    expect(result.members.map((member) => member.id).sort()).toEqual(["a", "b", "c"]);
+  });
+
+  it("lets fresh server values win on id collisions", () => {
+    const previous = snapshot("a", ["a"]);
+    previous.members[0]!.seen = false;
+    const result = mergeThreadSnapshot(previous, snapshot("a", ["a"]));
+    expect(result.members).toHaveLength(1);
+    expect(result.members[0]!.seen).toBe(false);
+    result.members[0]!.seen = true;
+    expect(previous.members[0]!.seen).toBe(false);
+  });
+
+  it("replaces wholesale when the fetch belongs to a different conversation", () => {
+    const previous = snapshot("a", ["a", "b"]);
+    const result = mergeThreadSnapshot(previous, snapshot("x", ["x", "y"]));
+    expect(result.members.map((member) => member.id).sort()).toEqual(["x", "y"]);
+  });
+});
+
+describe("one message stored in two folders", () => {
+  // The store keeps one row per (account, mailbox, uid), so a mail that lives
+  // in the inbox *and* a user label is two rows with different ids, the same
+  // RFC Message-ID and the same sent time. They are one conversation member,
+  // and the strip must show one card for them.
+  const filed = [
+    message({ id: "inbox-row", mailbox: "INBOX", messageId: "<plan@example.com>", sentAt: "2026-07-20T09:00:00.000Z" }),
+    message({ id: "label-row", mailbox: "Projects", messageId: "<plan@example.com>", sentAt: "2026-07-20T09:00:00.000Z" }),
+  ];
+
+  it("collapses the two folder copies into a single member", () => {
+    const collapsed = collapseDuplicateMembers(filed);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]!.id).toBe("inbox-row");
+  });
+
+  it("keeps the row the reader has open when it is the second copy", () => {
+    // The focused card is drawn from the selected row; dropping that one
+    // would leave the strip with no focused card at all.
+    const collapsed = collapseDuplicateMembers(filed, "label-row");
+    expect(collapsed.map((item) => item.id)).toEqual(["label-row"]);
+  });
+
+  it("still shows every distinct member of a real conversation", () => {
+    const conversation = [
+      message({ id: "root", messageId: "<root@example.com>", sentAt: "2026-07-20T09:00:00.000Z" }),
+      message({ id: "sent", mailbox: "Sent", messageId: "<reply@example.com>", inReplyTo: "<root@example.com>", sentAt: "2026-07-20T09:05:00.000Z" }),
+    ];
+    expect(collapseDuplicateMembers(conversation).map((item) => item.id)).toEqual(["root", "sent"]);
+  });
+
+  it("never merges headerless rows, which carry no identity to compare", () => {
+    const headerless = [
+      message({ id: "one", subject: "Weekly digest" }),
+      message({ id: "two", subject: "Weekly digest", sentAt: "2026-07-21T09:00:00.000Z" }),
+    ];
+    expect(collapseDuplicateMembers(headerless).map((item) => item.id)).toEqual(["one", "two"]);
+  });
+
+  it("collapses folder copies the local grouping already put in one thread", () => {
+    // The list-side grouping unions both rows into one thread, so the badge
+    // reads 2 for a single message. The strip collapses them back to one.
+    const groups = groupMessagesByThread(filed);
+    expect(groups).toHaveLength(1);
+    const strip = collapseDuplicateMembers(groups[0]!.messages);
+    expect(strip.map((item) => item.id)).toEqual(["inbox-row"]);
+  });
+
+  it("collapses the folder copies the server thread endpoint also returns", () => {
+    // GET /api/messages/:id/thread walks every row of the account, so it
+    // answers with both rows for a one-message conversation.
+    const groups = groupMessagesByThread([filed[0]!]);
+    const local = groups[0]!.messages;
+    const extras = filed;
+    const merged = collapseDuplicateMembers(mergeThreadMembers(local, extras));
+    expect(merged.map((item) => item.id)).toEqual(["inbox-row"]);
+  });
+});
+
+describe("reader strip membership wiring", () => {
+  // App.tsx is a 4 300-line module with no seam to open the reader through, so
+  // the wiring is pinned by reading the source — the approach
+  // messageListPaging.test.ts takes for the list's own contract.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(path.join(here, "App.tsx"), "utf8");
+
+  it("collapses duplicate rows before the strip counts its members", () => {
+    expect(source).toContain("collapseDuplicateMembers(");
+    const start = source.indexOf("const selectedThread = selected");
+    expect(start, "selectedThread not found").toBeGreaterThan(-1);
+    const end = source.indexOf(";", start);
+    const declaration = source.slice(start, end);
+    expect(declaration).toContain("collapseDuplicateMembers(");
+    // Without this the strip can show two cards for one message, and the
+    // "conversation of N" caption counts the copies too.
+    expect(declaration).not.toBe("const selectedThread = selected ? sortThreadByTimeline(mergeThreadMembers(threadById.get(selected.id) ?? [], threadExtrasForSelected))");
+  });
+});
+
+describe("countThreadMessages", () => {
+  // The list badge counts the conversation, and the conversation is a set of
+  // messages: the grouping unions one message filed in two folders into a
+  // single thread of two rows, so the raw row count overstates it.
+  const filed = [
+    message({ id: "inbox-row", mailbox: "INBOX", messageId: "<plan@example.com>" }),
+    message({ id: "label-row", mailbox: "Projects", messageId: "<plan@example.com>" }),
+  ];
+
+  it("counts one message stored in two folders once", () => {
+    expect(countThreadMessages(filed)).toBe(1);
+    // The row count it replaces is what the badge used to show.
+    expect(filed.length).toBe(2);
+  });
+
+  it("agrees with the folded strip it shadows", () => {
+    const conversation = [
+      message({ id: "root", messageId: "<root@example.com>", sentAt: "2026-07-20T09:00:00.000Z" }),
+      message({ id: "sent", mailbox: "Sent", messageId: "<reply@example.com>", inReplyTo: "<root@example.com>", sentAt: "2026-07-20T09:05:00.000Z" }),
+      message({ id: "sent-copy", mailbox: "Archive", messageId: "<reply@example.com>", inReplyTo: "<root@example.com>", sentAt: "2026-07-20T09:05:00.000Z" }),
+    ];
+    expect(countThreadMessages(conversation)).toBe(collapseDuplicateMembers(conversation).length);
+    expect(countThreadMessages(conversation)).toBe(2);
+  });
+
+  it("counts a headerless row as its own message, since it has no identity to share", () => {
+    const headerless = [
+      message({ id: "one", subject: "Weekly digest" }),
+      message({ id: "two", subject: "Weekly digest", sentAt: "2026-07-21T09:00:00.000Z" }),
+    ];
+    expect(countThreadMessages(headerless)).toBe(2);
+  });
+
+  it("never reports zero, because the row itself is a message", () => {
+    expect(countThreadMessages(undefined)).toBe(1);
+    expect(countThreadMessages(null)).toBe(1);
+    expect(countThreadMessages([])).toBe(1);
   });
 });
 

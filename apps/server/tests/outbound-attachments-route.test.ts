@@ -72,7 +72,7 @@ describe("outbound attachment API", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  async function upload(filename = "notes.txt") {
+  async function upload(filename = "notes.txt", contents = Buffer.from("outbound contents")) {
     const response = await app.inject({
       method: "POST",
       url: "/api/outbound-attachments?accountId=account-1",
@@ -81,7 +81,7 @@ describe("outbound attachment API", () => {
         "x-nami-file-name": encodeURIComponent(filename),
         "x-nami-file-content-type": encodeURIComponent("text/plain"),
       },
-      payload: Buffer.from("outbound contents"),
+      payload: contents,
     });
     expect(response.statusCode).toBe(201);
     return response.json().attachment as { token: string; filename: string };
@@ -103,7 +103,7 @@ describe("outbound attachment API", () => {
       payload: Buffer.from("cmd"),
     });
     expect(unsafe.statusCode).toBe(400);
-    expect(unsafe.json()).toEqual({ ok: false, message: "不允许添加可执行或脚本文件。" });
+    expect(unsafe.json()).toEqual({ ok: false, code: "invalid_argument", message: "不允许添加可执行或脚本文件。" });
   });
 
   it("hands resolved content to SMTP, cleans a successful unsaved send, and rejects hidden BCC input", async () => {
@@ -227,5 +227,27 @@ describe("outbound attachment API", () => {
     expect(downloadMessageAttachment).toHaveBeenCalledWith(expect.anything(), expect.any(Buffer), "provider-draft", "2", undefined);
     const listed = await app.inject({ method: "GET", url: "/api/messages/provider-draft/outbound-attachments" });
     expect(listed.json()).toEqual({ items: [expect.objectContaining({ token: items[0]?.token, filename: "provider-note.txt" })] });
+  });
+
+  // This route owns its 10 MB ceiling through the route-level bodyLimit, which
+  // is what keeps it working after the global octet-stream parser stopped
+  // carrying the (much larger) background-upload limit of its own.
+  it("keeps its own 10 MB upload ceiling instead of the global body limit", async () => {
+    // `upload` asserts the 201 itself, so reaching here proves a body of
+    // exactly the route ceiling still reaches the handler.
+    const atLimit = await upload("at-limit.txt", Buffer.alloc(10 * 1024 * 1024));
+    const overLimit = await app.inject({
+      method: "POST",
+      url: "/api/outbound-attachments?accountId=account-1",
+      headers: {
+        "content-type": "application/octet-stream",
+        "x-nami-file-name": encodeURIComponent("over-limit.txt"),
+        "x-nami-file-content-type": encodeURIComponent("text/plain"),
+      },
+      payload: Buffer.alloc(10 * 1024 * 1024 + 1),
+    });
+
+    expect(atLimit).toMatchObject({ token: expect.stringMatching(/^out_[0-9a-f-]{36}$/), filename: "at-limit.txt" });
+    expect(overLimit.statusCode).toBe(413);
   });
 });

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentRagWorker } from "../src/agent-rag-worker.js";
 import { AccountLifecycleStore } from "../src/agent/lifecycle.js";
 import { applyAgentStoreSchema } from "../src/agent/schema.js";
@@ -61,6 +61,73 @@ describe("Agent RAG initial backfill", () => {
     expect(billingResults).toHaveLength(1);
     expect(billingResults[0]?.citation.messageId).toBe("message-2");
     expect(outbox.listForAccount("account-1", 0)).toHaveLength(2);
+    await worker.stop();
+  });
+});
+
+describe("Agent RAG worker poll resilience", () => {
+  let db: DatabaseHandle | undefined;
+  let masterKey: Buffer | undefined;
+
+  afterEach(() => {
+    masterKey?.fill(0);
+    db?.close();
+    db = undefined;
+    masterKey = undefined;
+  });
+
+  function setup(): { lifecycle: AccountLifecycleStore; outbox: AgentSourceEventOutbox } {
+    const database = openDatabase(":memory:");
+    db = database;
+    masterKey = randomBytes(32);
+    insertAccount(database);
+    applyAgentStoreSchema(database, "2026-07-27T10:00:00.000Z");
+    const lifecycle = new AccountLifecycleStore(database, masterKey);
+    return { lifecycle, outbox: new AgentSourceEventOutbox(database, masterKey, lifecycle) };
+  }
+
+  it("reschedules the poll loop when a drain pass rejects instead of dying", async () => {
+    const { lifecycle, outbox } = setup();
+    // claimPending runs its SQL outside the per-claim try/catch in drain(), so
+    // a full disk or a locked database rejects the whole pass.
+    vi.spyOn(outbox, "claimPending").mockImplementation(() => {
+      throw new Error("SQLITE_FULL: database or disk is full");
+    });
+    const worker = new AgentRagWorker({
+      db: db as DatabaseHandle,
+      masterKey: masterKey as Buffer,
+      lifecycle,
+      sourceEvents: outbox,
+      pollIntervalMs: 250,
+    });
+    const schedule = vi.spyOn(worker as unknown as { schedule: (delay: number) => void }, "schedule");
+
+    worker.start();
+    // The first pass runs on a 0-delay timer; its failure must still book the
+    // next tick, and the rejection must not escape as an unhandled rejection
+    // (vitest fails the run when one does).
+    await expect.poll(() => schedule.mock.calls.length, { timeout: 3_000 }).toBeGreaterThanOrEqual(2);
+    await worker.stop();
+  });
+
+  it("stops rescheduling once the database handle is closed", async () => {
+    const { lifecycle, outbox } = setup();
+    const worker = new AgentRagWorker({
+      db: db as DatabaseHandle,
+      masterKey: masterKey as Buffer,
+      lifecycle,
+      sourceEvents: outbox,
+      pollIntervalMs: 250,
+    });
+    const schedule = vi.spyOn(worker as unknown as { schedule: (delay: number) => void }, "schedule");
+    db?.close();
+    db = undefined;
+
+    worker.start();
+    // The first tick fails on the closed handle; unlike an ordinary failure it
+    // must not book a retry — one poll interval later no further pass is due.
+    await new Promise<void>((resolve) => setTimeout(resolve, 800));
+    expect(schedule.mock.calls.length).toBe(1);
     await worker.stop();
   });
 });

@@ -64,7 +64,9 @@ import { cleanupExpiredOutboundAttachments, outboundAttachmentDirectory } from "
 import { getAppSettings, getSyncMessageLimit, updateAppSettings, type AppSettings, type AppSettingsPatch } from "./settings.js";
 import { submitDueScheduledSubmissions } from "./scheduled-send.js";
 import { releaseDueSnoozedMessages } from "./snooze.js";
-import { syncAccount, scheduleSentSubmissionVerification, type NewInboxMessage } from "./sync.js";
+import { syncAccount, type NewInboxMessage } from "./sync.js";
+import { scheduleSentSubmissionVerification } from "./sync-sent-verify.js";
+import { clearAccountSyncState } from "./sync-locks.js";
 import type { AccountRecord, RuntimeContext } from "./types.js";
 
 export type RunningServer = {
@@ -350,6 +352,10 @@ export async function startServer(options: ServerRuntimeOptions = {}): Promise<R
   let autoReplyEngine: AutoReplyEngine | undefined;
   const translationAbortController = new AbortController();
   const scheduledSendAbortController = new AbortController();
+  // Shutdown signal for the runtime's own sync passes (poll + IDLE). Aborting
+  // it makes an in-flight pass unwind through SyncAbortedError instead of
+  // holding the socket open until the whole mailbox is read.
+  const syncAbortController = new AbortController();
   // Startup instrumentation: fold per-phase timings into the desktop's
   // startup-timings.json via onStartupTiming (if provided).
   const startupPhaseStart = performance.now();
@@ -478,6 +484,7 @@ export async function startServer(options: ServerRuntimeOptions = {}): Promise<R
           getSyncMessageLimit(database),
           oauthService,
           agentMailEvents,
+          syncAbortController.signal,
         )),
       );
       const newInboxMessages = results.flatMap((result) => result.status === "fulfilled" ? result.value.newInboxMessages : []);
@@ -536,7 +543,7 @@ export async function startServer(options: ServerRuntimeOptions = {}): Promise<R
       onChange: (accountId) => {
         void (async () => {
           try {
-            const result = await syncAccount(database, runtimeMasterKey, accountId, getSyncMessageLimit(database), oauthService, agentMailEvents);
+            const result = await syncAccount(database, runtimeMasterKey, accountId, getSyncMessageLimit(database), oauthService, agentMailEvents, syncAbortController.signal);
             if (result.newInboxMessages.length) {
               if (options.onNewInboxMessages) {
                 await options.onNewInboxMessages(result.newInboxMessages);
@@ -561,8 +568,15 @@ export async function startServer(options: ServerRuntimeOptions = {}): Promise<R
       agentService,
       outboundAttachmentDirectory: outboundDirectory,
       onRefreshIntervalChanged: () => scheduler?.reschedule(),
+      onAccountDeleted: async (accountId: string) => {
+        clearAccountSyncState(accountId);
+        await idleWatcher?.stopAccount(accountId).catch(() => undefined);
+      },
       oauthService,
       serverEvents,
+      // Same object the runtime's own poll and IDLE passes receive: aborting
+      // it in close() also unwinds the fire-and-forget syncs the routes start.
+      syncShutdownSignal: syncAbortController.signal,
       onRealtimePushChanged: (enabled) => {
         if (enabled) void idleWatcher?.ensureAccounts();
         else void idleWatcher?.close();
@@ -610,6 +624,7 @@ export async function startServer(options: ServerRuntimeOptions = {}): Promise<R
       closePromise ??= (async () => {
         translationAbortController.abort();
         scheduledSendAbortController.abort();
+        syncAbortController.abort();
         // Stop routing background logs into an app that is being torn down; the
         // facade falls back to stderr for anything that still reports.
         setServerLogger(undefined);
@@ -656,6 +671,9 @@ export async function startServer(options: ServerRuntimeOptions = {}): Promise<R
     };
   } catch (error) {
     translationAbortController.abort();
+    // A start that failed after the scheduler was created can still have a
+    // pass in flight; the database it writes to is about to close.
+    syncAbortController.abort();
     await closeMicrosoftOAuthCallbackBridge(microsoftOAuthCallbackBridge).catch(() => undefined);
     await scheduler?.close();
     await idleWatcher?.close();

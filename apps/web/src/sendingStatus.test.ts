@@ -19,6 +19,9 @@ const baseSubmission: OutboundSubmission = {
   id: "submission-1",
   accountId: "account-1",
   messageId: "<4d36290a-1af2-40d3-a0de-41b4218dbe1c@example.com>",
+  // The server always serializes the display-only subject and recipients.
+  subject: "状态更新",
+  recipients: ["one@example.com", "two@example.com"],
   deliveryStatus: "unknown_delivery",
   sendAt: null,
   errorCode: "timeout",
@@ -80,6 +83,16 @@ describe("sending status presentation", () => {
     expect(recipientSummary(["a@example.com", "b@example.com", "c@example.com", "d@example.com"]))
       .toBe(zh("sending.recipientsMore", { recipients: "a@example.com、b@example.com、c@example.com", count: 4 }));
     expect(recipientSummary([])).toBeNull();
+  });
+
+  it("survives a submission whose recipients field never arrived", () => {
+    // OutboundSubmission.recipients is a compile-time contract only — api.ts
+    // hands the parsed body straight to the renderer as a bare assertion — so
+    // a malformed payload reaches this as undefined/null. Throwing here took
+    // the whole sending-status modal down with it; the modal's own
+    // `?? "recipientsMissing"` guard only covers the empty case.
+    expect(recipientSummary(undefined as unknown as string[])).toBeNull();
+    expect(recipientSummary(null as unknown as string[])).toBeNull();
   });
 
   it("creates a fresh compose draft from summary fields without exposing or replaying a body", () => {

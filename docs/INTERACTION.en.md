@@ -45,3 +45,7 @@ List refreshes, polls and save responses must never wipe a form the user is fill
 ## 7. Teardown leaves nothing behind
 
 Close, update-install and start-failure paths all clean up child processes and subscriptions; subscriptions must not be torn down and re-created just because a callback identity changed (events arriving in that gap reach nobody).
+
+## 8. Sidebar folder display mode respects the user's choice
+
+The sidebar supports two folder display modes: focused (the selected account folds the other account rows, folders stay in the bottom list) and tree (every account row stays visible, each account folding its own folders independently via a disclosure chevron). The mode is switched from the accounts heading and stored locally; in tree mode, selecting another account must not collapse already-expanded folder lists, and focused-mode folding keeps its existing semantics.

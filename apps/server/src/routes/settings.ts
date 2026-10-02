@@ -9,6 +9,7 @@ import { emitSettingsChanged } from "../events.js";
 import { config } from "../config.js";
 import { validationMessage, decodedUploadHeader, MAX_BACKGROUND_UPLOAD_BYTES } from "../helpers.js";
 import { settingsPatchSchema } from "../schemas.js";
+import { ROUTE_ERROR_CODES, routeErrorCodeForStatus } from "./error-codes.js";
 
 const BACKGROUND_UPLOAD_TOO_LARGE_MESSAGE = "背景图片不能超过 50 MB。";
 const MAX_STORED_BACKGROUND_BYTES = 8 * 1024 * 1024;
@@ -135,12 +136,12 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: SettingsRoute
 
   app.patch("/api/settings", async (request, reply) => {
     const parsed = settingsPatchSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     const current = getAppSettings(context.db);
     const candidate = { ...current, ...parsed.data };
     const customPath = customBackgroundPath(context, candidate.customBackgroundFilename);
     if (candidate.backgroundPreset === "custom" && (!customPath || !fs.existsSync(customPath))) {
-      return reply.code(400).send({ ok: false, message: "请先上传自定义背景图片。" });
+      return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "请先上传自定义背景图片。" });
     }
     const updated = updateAppSettings(context.db, parsed.data as AppSettingsPatch);
     if (updated.refreshIntervalSeconds !== current.refreshIntervalSeconds) {
@@ -159,14 +160,14 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: SettingsRoute
     bodyLimit: MAX_BACKGROUND_UPLOAD_BYTES,
     errorHandler(error, _request, reply) {
       if (error.code === "FST_ERR_CTP_BODY_TOO_LARGE") {
-        return reply.code(413).send({ ok: false, message: BACKGROUND_UPLOAD_TOO_LARGE_MESSAGE });
+        return reply.code(413).send({ ok: false, code: ROUTE_ERROR_CODES.payload_too_large, message: BACKGROUND_UPLOAD_TOO_LARGE_MESSAGE });
       }
       return reply.send(error);
     },
   }, async (request, reply) => {
     const contentType = backgroundContentType(request.headers["x-nami-file-content-type"]);
     if (!contentType || !Buffer.isBuffer(request.body)) {
-      return reply.code(400).send({ ok: false, message: "请选择 JPEG、PNG 或 WebP 格式的背景图片。" });
+      return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "请选择 JPEG、PNG 或 WebP 格式的背景图片。" });
     }
 
     let image;
@@ -175,7 +176,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: SettingsRoute
     } catch (error) {
       const message = error instanceof BackgroundUploadError ? error.message : "无法处理这张背景图片。";
       const statusCode = error instanceof BackgroundUploadError ? error.statusCode : 400;
-      return reply.code(statusCode).send({ ok: false, message });
+      return reply.code(statusCode).send({ ok: false, code: routeErrorCodeForStatus(statusCode), message });
     }
 
     const directory = customBackgroundDirectory(context);
@@ -215,7 +216,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: SettingsRoute
   app.get("/api/settings/background-image", async (_request, reply) => {
     const settings = getAppSettings(context.db);
     const filePath = customBackgroundPath(context, settings.customBackgroundFilename);
-    if (!filePath || !fs.existsSync(filePath)) return reply.code(404).send({ ok: false, message: "未找到自定义背景。" });
+    if (!filePath || !fs.existsSync(filePath)) return reply.code(404).send({ ok: false, code: ROUTE_ERROR_CODES.not_found, message: "未找到自定义背景。" });
     const extension = path.extname(filePath).toLowerCase();
     const contentType = extension === ".png" ? "image/png" : extension === ".webp" ? "image/webp" : "image/jpeg";
     return reply.type(contentType).header("cache-control", "no-store").send(fs.readFileSync(filePath));
