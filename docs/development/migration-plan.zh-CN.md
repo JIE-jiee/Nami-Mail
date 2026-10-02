@@ -4,7 +4,7 @@
 
 ## 适用范围
 
-本计划只处理 Agent 自有 `agent_*` 表、加密页面、来源事件、会话、确认、审计和 Provider 配置。它不重写既有邮件 schema、IMAP 缓存、SMTP outbox 或实验性本地 NLLB 翻译数据。
+本计划只处理 Agent 自有 `agent_*` 表、加密页面、来源事件、会话、确认、审计和 Provider 配置。它不重写既有邮件 schema、IMAP 缓存、SMTP outbox 或翻译服务配置数据。
 
 ## 启动前条件
 

@@ -17,6 +17,7 @@ import {
   outboundAttachmentDiscardSchema,
   outboundAttachmentUploadQuerySchema,
 } from "../schemas.js";
+import { ROUTE_ERROR_CODES, routeErrorCodeForStatus } from "./error-codes.js";
 
 export type OutboundAttachmentRouteDeps = {
   context: RuntimeContext;
@@ -34,7 +35,7 @@ export function registerOutboundAttachmentRoutes(app: FastifyInstance, deps: Out
       const filename = decodedUploadHeader(request.headers["x-nami-file-name"]);
       const contentType = decodedUploadHeader(request.headers["x-nami-file-content-type"]);
       if (!query.success || !filename || !contentType) {
-        return reply.code(400).send({ ok: false, message: "附件上传参数无效。" });
+        return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: "附件上传参数无效。" });
       }
       const directory = outboundAttachmentDirectory(context);
       try {
@@ -51,14 +52,14 @@ export function registerOutboundAttachmentRoutes(app: FastifyInstance, deps: Out
         });
         return reply.code(201).send({ ok: true, attachment });
       } catch (error) {
-        return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, message: outboundAttachmentActionErrorMessage(error) });
+        return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, code: routeErrorCodeForStatus(outboundAttachmentErrorStatus(error)), message: outboundAttachmentActionErrorMessage(error) });
       }
     },
   );
 
   app.delete("/api/outbound-attachments", async (request, reply) => {
     const parsed = outboundAttachmentDiscardSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: validationMessage(parsed.error) });
+    if (!parsed.success) return reply.code(400).send({ ok: false, code: ROUTE_ERROR_CODES.invalid_argument, message: validationMessage(parsed.error) });
     try {
       const removed = discardPendingOutboundAttachments(
         context.db,
@@ -68,7 +69,7 @@ export function registerOutboundAttachmentRoutes(app: FastifyInstance, deps: Out
       );
       return { ok: true, removed };
     } catch (error) {
-      return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, message: outboundAttachmentActionErrorMessage(error) });
+      return reply.code(outboundAttachmentErrorStatus(error)).send({ ok: false, code: routeErrorCodeForStatus(outboundAttachmentErrorStatus(error)), message: outboundAttachmentActionErrorMessage(error) });
     }
   });
 }

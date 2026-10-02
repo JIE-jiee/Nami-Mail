@@ -22,17 +22,21 @@ Fastify 本地服务 (127.0.0.1，桌面版使用动态端口)
         |                         +-- SQLite 与加密数据目录
         |
         +-- IMAP / SMTP / DNS / OAuth 服务商
+        |
+        +-- Agent 运行时（工具注册、权限、确认）与外部 MCP
 ```
 
-桌面版窗口启用 `contextIsolation`、关闭 `nodeIntegration` 并使用沙箱化渲染器。访问令牌不会写入 URL、用户数据目录或普通配置；主进程在校验调用者确为当前主窗口的本地主帧后，才通过受限 preload IPC 向该页面提供本地 API 请求头。渲染器因此只能把它用于本机 `/api/*` 请求，不能借此获得通用 Node.js 或 Electron 能力。
+桌面版窗口启用 `contextIsolation`、关闭 `nodeIntegration` 并使用沙箱化渲染器。访问令牌不会写入 URL、用户数据目录或普通配置；主进程只对来自本机 `/api/*` 的请求通过 `session.webRequest.onBeforeSendHeaders` 注入该请求头，渲染器不持有令牌本体；主帧校验守卫的是桌面 IPC 通道。渲染器因此不能借此获得通用 Node.js 或 Electron 能力。
 
 ## 组件职责
 
 | 位置 | 职责 |
 | --- | --- |
 | `apps/web` | React 界面、主题、邮件阅读/撰写、账户引导和本地 API 客户端。 |
-| `apps/server` | Fastify 路由、IMAP/SMTP、OAuth、服务商发现、同步、草稿/发件队列、SQLite 与应用层加密。 |
-| `apps/desktop` | Electron 生命周期、单实例、托盘、Windows 通知、DPAPI 主密钥、preload IPC、更新检查与安装助手。 |
+| `apps/server` | Fastify 路由、IMAP/SMTP、OAuth、服务商发现、同步、草稿/发件队列、SQLite 与应用层加密；Agent 服务、工具执行与权限。 |
+| `apps/desktop` | Electron 生命周期、单实例、托盘、Windows 通知、DPAPI 主密钥、preload IPC、更新检查与安装助手；Agent Broker、配对与 secure-pipe。 |
+| `packages/agent-contracts` | Agent、CLI 与 MCP 共享的接口契约（外部 Mail v1 工具、Broker 协议、错误码）。 |
+| `packages/agent-core` | Agent 会话编排与工具执行核心。 |
 | `build` | 受版本控制的品牌资源、Windows 安装器资源及默认空更新信任配置。 |
 | `scripts` | 原生 SQLite 加载验证、构建、安装器 smoke、Release 资源与发布策略校验。 |
 

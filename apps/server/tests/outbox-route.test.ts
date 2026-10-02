@@ -8,8 +8,8 @@ vi.mock("../src/mail.js", async (importOriginal) => {
   return { ...actual, sendMail };
 });
 
-vi.mock("../src/sync.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/sync.js")>();
+vi.mock("../src/sync-sent-verify.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sync-sent-verify.js")>();
   return { ...actual, scheduleSentSubmissionVerification };
 });
 

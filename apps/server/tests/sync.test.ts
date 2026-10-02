@@ -22,19 +22,21 @@ import {
 } from "../src/message-storage.js";
 import { markSubmissionSubmitted, prepareSubmission, submissionForId } from "../src/outbox.js";
 import {
+  MAX_STORED_HTML_BODY_BYTES,
+  MAX_STORED_TEXT_BODY_BYTES,
+  TRUNCATED_BODY_NOTICE,
+} from "../src/message-body-limits.js";
+import { syncAccount } from "../src/sync.js";
+import { scheduleSentSubmissionVerification, verifySubmissionInSentMailbox } from "../src/sync-sent-verify.js";
+import { batchMoveMessages, moveMessage } from "../src/sync-moves.js";
+import { updateMessageFlags, updateMessageFlagsBatch } from "../src/sync-flags.js";
+import {
   ACCOUNT_SYNC_WAIT_MS,
-  scheduleSentSubmissionVerification,
-  batchMoveMessages,
   markAccountMoving,
-  moveMessage,
-  syncAccount,
   unmarkAccountMoving,
-  updateMessageFlags,
-  updateMessageFlagsBatch,
-  verifySubmissionInSentMailbox,
   waitForAccountSyncIdle,
   waitUntil,
-} from "../src/sync.js";
+} from "../src/sync-locks.js";
 
 describe("IMAP message flag updates", () => {
   let db: DatabaseHandle;
@@ -76,6 +78,19 @@ describe("IMAP message flag updates", () => {
   afterEach(() => {
     db.close();
   });
+
+  /**
+   * Records what a move path hands the Agent event sink *inside* its
+   * transaction, so a test can assert both what was announced and in what
+   * order. `acquireLease` returns a fixed lease so the assertions can name it.
+   */
+  function eventSink() {
+    return {
+      acquireLease: vi.fn(() => ({ accountId: "account-1", generation: 1 })),
+      messageUpsertedWithinTransaction: vi.fn(),
+      messageDeletedWithinTransaction: vi.fn(),
+    };
+  }
 
   it("updates the real IMAP flags and only then mirrors the requested values locally", async () => {
     await updateMessageFlags(db, Buffer.alloc(32, 7), "message-1", { seen: false, flagged: true });
@@ -224,6 +239,99 @@ describe("IMAP message flag updates", () => {
     const archiveFolder = db.prepare("SELECT unseen FROM folders WHERE account_id = ? AND path = ?").get("account-1", "Archive") as { unseen: number };
     expect(inboxFolder.unseen).toBe(0);
     expect(archiveFolder.unseen).toBe(0);
+  });
+
+  it("emits a duplicate-destination tombstone from a read taken before the UIDPLUS delete", async () => {
+    // The duplicate-detection read has to run *before* the DELETE in the same
+    // transaction: the Agent sink can only tombstone the ids it read, and once
+    // the DELETE has run there is nothing left to find. Nothing else observes
+    // the order — the row disappears either way — so without this assertion a
+    // move path that swapped the two statements would still pass every
+    // other test in this file.
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO folders (account_id, path, name, special_use, total, unseen) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("account-1", "[Gmail]/All Mail", "All Mail", "\\All", 1, 0);
+    db.prepare(`
+      INSERT INTO messages (
+        id, account_id, mailbox, uid, remote_id_lookup, all_mail_archived, subject, from_name, from_address, to_json,
+        sent_at, snippet, text_body, html_body, flags_json, has_attachments, size, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "all-mail-copy", "account-1", "[Gmail]/All Mail", 84, "h1.same-message", 0, "All Mail copy", "Demo", "demo@example.com", "[]",
+      now, "", "", "", "[\"\\\\Seen\"]", 0, 0, now,
+    );
+    client.messageMove.mockResolvedValueOnce({
+      path: "INBOX",
+      destination: "[Gmail]/All Mail",
+      uidMap: new Map([[42, 84]]),
+    });
+    const events = eventSink();
+
+    await expect(moveMessage(db, masterKey, "message-1", "archive", undefined, events))
+      .resolves.toMatchObject({ uid: 84 });
+
+    expect(db.prepare("SELECT id FROM messages WHERE id = ?").get("all-mail-copy")).toBeUndefined();
+    // The tombstone carries the row as it was *found*: the cache must learn
+    // the copy is gone from under the identity it had before the delete.
+    expect(events.messageDeletedWithinTransaction).toHaveBeenCalledWith(
+      { accountId: "account-1", generation: 1 },
+      "all-mail-copy",
+      {
+        reason: "move-destination-duplicate",
+        mailbox: "[Gmail]/All Mail",
+        uid: 84,
+        remoteIdLookup: "h1.same-message",
+        flagsJson: "[\"\\\\Seen\"]",
+        allMailArchived: 0,
+      },
+    );
+    // The surviving row is announced as the confirmed move, after the
+    // tombstones it replaced — the same order the move path has always used.
+    expect(events.messageUpsertedWithinTransaction).toHaveBeenCalledWith(
+      { accountId: "account-1", generation: 1 },
+      "message-1",
+      expect.objectContaining({ transition: "move-confirmed", mailbox: "[Gmail]/All Mail", uid: 84 }),
+    );
+    expect(events.messageDeletedWithinTransaction.mock.invocationCallOrder[0])
+      .toBeLessThan(events.messageUpsertedWithinTransaction.mock.invocationCallOrder[0]!);
+  });
+
+  it("emits a duplicate-destination tombstone from a read taken before the reconciliation delete", async () => {
+    // The same read-before-write ordering, on the server-without-UIDPLUS path
+    // where the duplicate is recognised by `remote_id_lookup` rather than by
+    // the destination UID.
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO folders (account_id, path, name, special_use, total, unseen) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("account-1", "Archive", "Archive", "\\Archive", 1, 0);
+    db.prepare(`
+      INSERT INTO messages (
+        id, account_id, mailbox, uid, remote_id_lookup, subject, from_name, from_address, to_json,
+        sent_at, snippet, text_body, html_body, flags_json, has_attachments, size, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "archive-copy", "account-1", "Archive", 7, "h1.same-message", "Archive copy", "Demo", "demo@example.com", "[]",
+      now, "", "", "", "[]", 0, 0, now,
+    );
+    db.prepare("UPDATE messages SET remote_id_lookup = ? WHERE id = ?").run("h1.same-message", "message-1");
+    client.messageMove.mockResolvedValueOnce({ path: "INBOX", destination: "Archive" });
+    const events = eventSink();
+
+    await expect(moveMessage(db, masterKey, "message-1", "archive", undefined, events))
+      .resolves.toMatchObject({ refreshPending: true });
+
+    expect(db.prepare("SELECT id FROM messages WHERE id = ?").get("archive-copy")).toBeUndefined();
+    expect(events.messageDeletedWithinTransaction).toHaveBeenCalledWith(
+      { accountId: "account-1", generation: 1 },
+      "archive-copy",
+      {
+        reason: "move-destination-duplicate",
+        mailbox: "Archive",
+        uid: 7,
+        remoteIdLookup: "h1.same-message",
+        flagsJson: "[]",
+        allMailArchived: null,
+      },
+    );
   });
 
   it("preserves the encrypted source cache row when UIDPLUS maps an archive move into Gmail All Mail", async () => {
@@ -1526,6 +1634,69 @@ describe("IMAP message flag updates", () => {
     expect(payload.inReplyTo).toBe("<parent@example.com>");
     expect(payload.references).toEqual(["<root@example.com>", "<parent@example.com>"]);
     expect(payload.cc).toEqual([{ name: "Carol", address: "carol@example.com" }]);
+  });
+
+  it("truncates an oversized body at sync time and keeps the message's metadata", async () => {
+    const inbox = { path: "INBOX", name: "Inbox", listed: true, flags: new Set<string>(), specialUse: "\\Inbox" };
+    // A hostile sender puts the payload in the body itself: an inline `data:`
+    // image needs no attachment part, so attachment metadata never sees it.
+    const hugeText = "t".repeat(MAX_STORED_TEXT_BODY_BYTES + 4096);
+    const hugeHtml = `<p>${"h".repeat(MAX_STORED_HTML_BODY_BYTES + 4096)}<img src="data:image/png;base64,AAAA`;
+    const source = Buffer.from([
+      "From: Attacker <attacker@example.com>",
+      "To: Demo <demo@example.com>",
+      "Message-ID: <huge@example.com>",
+      "Subject: Huge body",
+      'Content-Type: multipart/alternative; boundary="alt"',
+      "",
+      "--alt",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      hugeText,
+      "--alt",
+      "Content-Type: text/html; charset=utf-8",
+      "",
+      hugeHtml,
+      "--alt--",
+      "",
+    ].join("\r\n"));
+    const fetch = vi.fn(async function* (_range: unknown, query: { source?: boolean }) {
+      if (query.source) {
+        yield { uid: 1, flags: new Set(["\\Seen"]), internalDate: new Date("2026-07-20T03:04:05.000Z"), size: source.length, source };
+        return;
+      }
+      yield { uid: 1, flags: new Set(["\\Seen"]) };
+    });
+    Object.assign(client, {
+      mailbox: { exists: 1 },
+      list: vi.fn(async () => [inbox]),
+      status: vi.fn(async () => ({ messages: 1, unseen: 0 })),
+      fetch,
+    });
+    client.getMailboxLock.mockImplementation(async () => lock);
+
+    await syncAccount(db, masterKey, "account-1", 20);
+
+    const row = db.prepare("SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?")
+      .get("account-1", "INBOX", 1) as MessageStorageRow;
+    const payload = messagePayloadForRow(row, masterKey);
+    expect(payload.textBody.endsWith(`\n\n${TRUNCATED_BODY_NOTICE}`)).toBe(true);
+    expect(payload.textBody.startsWith("tttt")).toBe(true);
+    expect(Buffer.byteLength(payload.textBody, "utf8"))
+      .toBeLessThanOrEqual(MAX_STORED_TEXT_BODY_BYTES + 2 + Buffer.byteLength(TRUNCATED_BODY_NOTICE, "utf8"));
+    expect(payload.htmlBody.endsWith(`<p>${TRUNCATED_BODY_NOTICE}</p>`)).toBe(true);
+    expect(Buffer.byteLength(payload.htmlBody, "utf8"))
+      .toBeLessThanOrEqual(MAX_STORED_HTML_BODY_BYTES + Buffer.byteLength(`<p>${TRUNCATED_BODY_NOTICE}</p>`, "utf8"));
+    // Everything that identifies the mail survives the truncation.
+    expect(payload.subject).toBe("Huge body");
+    expect(payload.fromAddress).toBe("attacker@example.com");
+    expect(payload.messageId).toBe("<huge@example.com>");
+    expect(payload.snippet.length).toBeGreaterThan(0);
+    expect(payload.snippet.length).toBeLessThanOrEqual(151);
+    // The full RFC822 size stays on the row: it is what the UI shows and what
+    // the export path reports, and the cap only bounds the stored body.
+    expect(row.size).toBe(source.length);
+    expect(row.has_attachments).toBe(0);
   });
 
   it("hydrates a legacy metadata-less row once and then stops re-fetching its source", async () => {

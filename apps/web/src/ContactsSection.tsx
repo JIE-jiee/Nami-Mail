@@ -10,6 +10,7 @@ import { useStablePagedListHeight } from "./hooks/useStablePagedListHeight";
 import type { Contact, ContactInput } from "./types";
 import { getAvatar, setAvatar } from "./avatarStore";
 import { AvatarEditor } from "./AvatarEditor";
+import { FormNotice, type Notice } from "./FormNotice";
 
 export type ContactsSectionProps = {
   demoMode?: boolean;
@@ -29,8 +30,6 @@ type ContactDraft = {
   /** Email the row had when editing started; stale avatar keys are cleared on rename. */
   originalEmail?: string;
 };
-
-type Notice = { kind: "success" | "error"; message: string } | null;
 
 /** Contacts past this count unlock the search / pagination / bulk toolbar. */
 const CONTACTS_PER_PAGE = 5;
@@ -240,7 +239,10 @@ export default function ContactsSection({ demoMode = false, initialContacts }: C
           <BookUser size={16} />
           <div><span>{t("settings.contacts.title")}</span><p id="contacts-settings">{t("settings.contacts.description")}</p></div>
         </div>
-        <p className="settings-empty" role="status">{t("settings.contacts.demoUnavailable")}</p>
+        <div className="settings-empty-card" role="status">
+          <BookUser className="empty-icon" size={32} strokeWidth={1.5} />
+          <p>{t("settings.contacts.demoUnavailable")}</p>
+        </div>
       </section>
     );
   }
@@ -326,7 +328,7 @@ export default function ContactsSection({ demoMode = false, initialContacts }: C
           <div><span>{t("settings.contacts.title")}</span><p id="contacts-settings">{t("settings.contacts.description")}</p></div>
         </div>
 
-        {notice && <div className={`form-status ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "success" ? <Check size={17} /> : <X size={17} />}{notice.message}</div>}
+        <FormNotice notice={notice} />
 
         {loading ? (
           <p className="settings-empty" role="status"><LoaderCircle className="spin" size={14} aria-hidden="true" />{t("common.loading")}</p>
@@ -407,7 +409,10 @@ export default function ContactsSection({ demoMode = false, initialContacts }: C
             )}
 
             {filteredContacts.length === 0 ? (
-              <p className="settings-empty">{showToolbar ? t("settings.contacts.noSearchResults") : (contacts.length === 0 ? t("settings.contacts.empty") : t("settings.contacts.noMatches"))}</p>
+              <div className="settings-empty-card">
+                <BookUser className="empty-icon" size={32} strokeWidth={1.5} />
+                <p>{showToolbar ? t("settings.contacts.noSearchResults") : (contacts.length === 0 ? t("settings.contacts.empty") : t("settings.contacts.noMatches"))}</p>
+              </div>
             ) : (
               <>
                 <div ref={listScroll.ref} className="contacts-list" style={listScroll.style}>

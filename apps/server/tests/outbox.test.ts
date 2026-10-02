@@ -41,6 +41,40 @@ function insertAccount(db: DatabaseHandle): void {
   );
 }
 
+// Flips the final envelope byte, so authenticated decryption always fails
+// (re-encoding one base64url character can silently decode to the same bytes).
+function flipSubmissionEnvelopeByte(
+  db: DatabaseHandle,
+  id: string,
+  column: "request_json" | "encrypted_details",
+): void {
+  const row = db.prepare(`SELECT ${column} AS envelope FROM outbound_submissions WHERE id = ?`).get(id) as { envelope: string };
+  const envelope = Buffer.from(row.envelope.slice("nami-v1.".length), "base64url");
+  envelope[envelope.length - 1] = envelope[envelope.length - 1]! ^ 1;
+  db.prepare(`UPDATE outbound_submissions SET ${column} = ? WHERE id = ?`)
+    .run(`nami-v1.${envelope.toString("base64url")}`, id);
+}
+
+function insertBulkLegacySubmission(db: DatabaseHandle, index: number): void {
+  const id = `bulk-${String(index).padStart(3, "0")}`;
+  const requestJson = JSON.stringify({
+    to: [`recipient-${index}@example.com`], cc: [], inReplyTo: null, references: [],
+    subject: `Subject ${index}`, text: `Body ${index}`, html: null, discardDraftId: null, attachmentTokens: [],
+  });
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO outbound_submissions (
+      id, account_id, idempotency_key, request_fingerprint, rfc_message_id, request_json,
+      status, error_code, error_message, provider_message_id, post_submit_warning,
+      submitted_at, confirmed_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id, "account-1", `sub_bulk_${index}`, createHash("sha256").update(requestJson, "utf8").digest("hex"),
+    `<bulk-${index}@example.com>`, requestJson, "failed", "smtp_rejected",
+    `Recipient ${index} rejected`, `provider-${index}`, `Warning ${index}`, null, null, now, now,
+  );
+}
+
 describe("durable outbound submissions", () => {
   let db: DatabaseHandle;
   let masterKey: Buffer;
@@ -341,4 +375,68 @@ describe("durable outbound submissions", () => {
     const disk = bytes.toString("utf8");
     for (const canary of Object.values(canaries)) expect(disk).not.toContain(canary);
   }, migrationTestTimeoutMs);
+
+  it("skips the verification sweep on routine startups once the migration marker exists", () => {
+    const prepared = prepareSubmission(db, masterKey, {
+      accountId: "account-1",
+      accountEmail: "sender@example.com",
+      idempotencyKey: "sub_skip_sweep",
+      request,
+    });
+    expect(migrateOutboundSubmissionStorage(db, masterKey)).toEqual({ migrated: 0, vacuumed: true });
+
+    flipSubmissionEnvelopeByte(db, prepared.submission.id, "request_json");
+
+    // Marker present and nothing migrated: startup no longer decrypts the
+    // outbox, so the corrupted row does not fail the migration check (and
+    // vacuumed stays false because the sweep never counted the row).
+    expect(migrateOutboundSubmissionStorage(db, masterKey)).toEqual({ migrated: 0, vacuumed: false });
+
+    // The degradation is bounded: the corruption still surfaces on first read.
+    expect(() => submissionForId(db, masterKey, prepared.submission.id)).toThrow();
+  });
+
+  it("forces the full verification sweep when the migration marker is missing", () => {
+    const prepared = prepareSubmission(db, masterKey, {
+      accountId: "account-1",
+      accountEmail: "sender@example.com",
+      idempotencyKey: "sub_forced_sweep",
+      request,
+    });
+    migrateOutboundSubmissionStorage(db, masterKey);
+
+    flipSubmissionEnvelopeByte(db, prepared.submission.id, "request_json");
+    db.prepare("DELETE FROM data_migrations WHERE id = 'outbound-submission-payload-v1'").run();
+    expect(() => migrateOutboundSubmissionStorage(db, masterKey)).toThrow();
+  });
+
+  it("streams the verification sweep in pages that cover every row", { timeout: migrationTestTimeoutMs }, () => {
+    const total = 450; // Spans three pages under VERIFICATION_PAGE_SIZE (200).
+    for (let index = 0; index < total; index += 1) insertBulkLegacySubmission(db, index);
+    expect(migrateOutboundSubmissionStorage(db, masterKey)).toEqual({ migrated: total, vacuumed: true });
+
+    const envelopeOf = (id: string, column: "request_json" | "encrypted_details"): string =>
+      (db.prepare(`SELECT ${column} AS envelope FROM outbound_submissions WHERE id = ?`).get(id) as { envelope: string }).envelope;
+    const restoreEnvelope = (id: string, column: "request_json" | "encrypted_details", envelope: string): void => {
+      db.prepare(`UPDATE outbound_submissions SET ${column} = ? WHERE id = ?`).run(envelope, id);
+    };
+
+    // The final page's last row is only reached when every page advanced.
+    db.prepare("DELETE FROM data_migrations WHERE id = 'outbound-submission-payload-v1'").run();
+    const lastPageLast = envelopeOf("bulk-449", "request_json");
+    flipSubmissionEnvelopeByte(db, "bulk-449", "request_json");
+    expect(() => migrateOutboundSubmissionStorage(db, masterKey)).toThrow();
+    restoreEnvelope("bulk-449", "request_json", lastPageLast);
+
+    // A corrupted row inside a later page is caught before the sweep ends.
+    db.prepare("DELETE FROM data_migrations WHERE id = 'outbound-submission-payload-v1'").run();
+    const middlePageFirst = envelopeOf("bulk-200", "encrypted_details");
+    flipSubmissionEnvelopeByte(db, "bulk-200", "encrypted_details");
+    expect(() => migrateOutboundSubmissionStorage(db, masterKey)).toThrow();
+    restoreEnvelope("bulk-200", "encrypted_details", middlePageFirst);
+
+    // After repairs, a forced sweep completes and writes the marker again.
+    db.prepare("DELETE FROM data_migrations WHERE id = 'outbound-submission-payload-v1'").run();
+    expect(migrateOutboundSubmissionStorage(db, masterKey)).toEqual({ migrated: 0, vacuumed: true });
+  });
 });

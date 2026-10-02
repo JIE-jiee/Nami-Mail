@@ -20,6 +20,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     steps:
       - name: Checkout
         # v7.0.1 (Node.js 24); the PR action receives its own token explicitly.
@@ -28,10 +29,10 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        # v7.0.0 runs on Node.js 24; the project script uses Node 22.
+        # v7.0.0 runs on Node.js 24; use the project's supported Node minimum.
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 22.14.0
+          node-version: 24.21.0
 
       - name: Fetch contributors and update READMEs
         id: update
@@ -41,6 +42,7 @@ jobs:
         run: node scripts/update-contributors.mjs
 
       - name: Open or update contributor pull request
+        id: pr
         if: steps.update.outputs.changed == 'true'
         # v8 uses Node.js 24; this third-party action is restricted to this exact SHA.
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
@@ -62,3 +64,9 @@ jobs:
             before merging.
           labels: "automated,documentation"
           author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+      # GITHUB_TOKEN-created PRs do not trigger pull_request workflows.
+      - name: Trigger validation for the pull request
+        if: steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run validate.yml --ref "chore/update-contributors"

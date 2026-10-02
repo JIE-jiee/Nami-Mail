@@ -29,6 +29,76 @@ export type MessageListQuery = {
   before?: string;
 };
 
+/**
+ * The accumulated state of a cursor-chained list load.
+ *
+ * `nextCursor` is the server's own verdict on whether the list continues —
+ * null means this was the last page. It is deliberately *not* derived from
+ * `total`, which the server recomputes on every request and which grows with
+ * every arriving message: a gate that compared the two could never fire while
+ * mail kept landing, which is exactly when the user is scrolling.
+ */
+export type MessageCursorChain = {
+  items: Message[];
+  nextCursor: string | null;
+};
+
+/** A page as the list endpoint returns it. */
+export type MessageCursorPage = {
+  items: Message[];
+  nextCursor: string | null;
+};
+
+/** An empty chain: nothing loaded, and nothing more to ask for. */
+export function emptyMessageCursorChain(): MessageCursorChain {
+  return { items: [], nextCursor: null };
+}
+
+/**
+ * Adopts a freshly loaded first page, replacing whatever was on screen.
+ *
+ * A full load re-reads the view from the head, so the chain restarts with the
+ * server's cursor: the rows behind it are the ones this page actually covered,
+ * and continuing from anywhere else would leave a gap.
+ */
+export function startMessageCursorChain(page: MessageCursorPage): MessageCursorChain {
+  return { items: [...page.items], nextCursor: page.nextCursor };
+}
+
+/**
+ * Appends the page a cursor produced and advances the chain.
+ *
+ * Rows already loaded are dropped by id. A keyset cursor makes duplicates
+ * impossible in the common case — a page is strictly below the position that
+ * produced it — but the *snapshot* merge above it (pending archive moves, the
+ * unread view's retained reads) can put a row back into the window, and a
+ * list that rendered the same message twice is a visible defect. The append is
+ * therefore idempotent in the caller's favour: re-delivering a page changes
+ * nothing, which is what makes a retried fetch safe to replay.
+ */
+export function appendMessageCursorChain(
+  current: MessageCursorChain,
+  page: MessageCursorPage,
+): MessageCursorChain {
+  const known = new Set(current.items.map((message) => message.id));
+  const additions = page.items.filter((message) => !known.has(message.id));
+  return {
+    items: additions.length ? [...current.items, ...additions] : current.items,
+    nextCursor: page.nextCursor,
+  };
+}
+
+/**
+ * Whether the list can still be extended, answered by the server's last word.
+ *
+ * This is the "is it the end" gate. It used to be `loaded >= total`, which no
+ * longer terminates: new mail raises `total` at the same moment it is prepended
+ * above the loaded window, so the two never meet.
+ */
+export function canLoadMoreMessagePage(chain: MessageCursorChain): boolean {
+  return chain.nextCursor !== null;
+}
+
 export type PendingArchiveMove = {
   id: string;
   accountId: string;

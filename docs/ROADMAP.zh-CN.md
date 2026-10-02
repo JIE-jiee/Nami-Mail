@@ -2,6 +2,16 @@
 
 本文档记录已规划但尚未排期（backlog）的功能。已排期的功能请以 CHANGELOG 的 [Unreleased] 区块为准。
 
+## Microsoft 邮箱 OAuth 内置授权（Outlook / Hotmail 接入恢复）
+
+**状态**：阻塞中（2026-10-01）。详情、恢复路径与验收标准见 [issue #116](https://github.com/QinIndexCode/nami-mail/issues/116)。
+
+**现状**：微软已于 2024-09 关闭 Outlook.com IMAP/SMTP 基础认证（普通密码与应用密码均被服务器拒绝），OAuth 是唯一接入方式；当前构建未内置 OAuth client ID，默认安装无法添加 Outlook / Hotmail 账号。开发者侧注册 Azure 应用需绑卡（万事达/Visa），为当前阻塞点；前端已对该状态做诚实说明。
+
+**恢复步骤**（拿到 client ID 后一次性完成）：注册公共客户端应用（平台"移动和桌面应用程序"，回调 `http://localhost/api/oauth/microsoft/callback`，开启"允许公共客户端流"）→ 把应用（客户端）ID 填入 `apps/server/src/config.ts` 的 `builtinMicrosoftOAuthClientId`（机制已就绪，env 覆盖优先）→ 同步恢复三处"暂未开放"文案（zh/en）→ 门禁 + 实景验证后发布。
+
+**边界**：个人账号无用户数上限；企业账号在完成 Publisher Verification（免费）前需管理员租户级同意。Gmail 侧受限范围有 Google 100 测试用户上限 + CASA 安全评估门槛，另行决策。
+
 ## 图片上传 / 多模态（vision）支持
 
 **状态**：已确认需求，未排期。不建议在 0.3.0 发布周期内实现（跨层改动大，且非核心邮件场景刚需）。
@@ -45,6 +55,14 @@
 - **落地前置**：阅读区内联在 3818 行的 `App.tsx` 且无独立测试，需先把「意图 → 预置文本 / 是否自动发送」抽成纯函数并单测（照 `slashMenu.ts` / `contextMenu.ts` 模式），再接线。
 - **缺口**：`AgentWorkspace` 目前无 `initialPrompt` / 自动发送 intent 能力（只能种引用 chip），需新增 prop。
 - **约束**：新增文案必须同步 `zh-CN.json` + `en-US.json`（CI 的 `build-locale-catalog --check` 强制）。
+
+## 写邮件弹窗支持展开为整页（混合模式）
+
+**状态**：已确认方向，未排期（2026-09-27 交互评审提出）。
+
+**目标**：撰写弹窗默认保持覆盖层形态（保留收件箱上下文、适合快速回复），在弹窗头部提供"展开为整页"切换，复用阅读视图已有的整页 + 返回箭头壳层，满足长文写作的沉浸需求。从阅读视图回复时保持覆盖层形态（上下文即当前邮件）。
+
+**要点**：ComposeModal 增加尺寸状态与两档 CSS 布局；dialogRouting 的 Escape/焦点链基本不动；草稿内容需跨视图切换存续；移动端沿用弹窗形态。
 
 ## 界面与体验优化（2026-09-10 审计产出，分批推进）
 

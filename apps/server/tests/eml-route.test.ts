@@ -109,7 +109,7 @@ describe("EML export API", () => {
     const response = await app.inject({ method: "GET", url: "/api/messages/not-a-uuid/eml" });
 
     expect(response.statusCode).toBe(400);
-    expect(response.json()).toEqual({ ok: false, message: "邮件标识无效。" });
+    expect(response.json()).toEqual({ ok: false, code: "invalid_argument", message: "邮件标识无效。" });
     expect(client.connect).not.toHaveBeenCalled();
   });
 
@@ -117,7 +117,7 @@ describe("EML export API", () => {
     const response = await app.inject({ method: "GET", url: "/api/messages/00000000-0000-0000-0000-000000000000/eml" });
 
     expect(response.statusCode).toBe(404);
-    expect(response.json()).toEqual({ ok: false, message: "Message not found." });
+    expect(response.json()).toEqual({ ok: false, code: "not_found", message: "Message not found." });
     expect(client.connect).not.toHaveBeenCalled();
   });
 
@@ -126,7 +126,7 @@ describe("EML export API", () => {
     const response = await app.inject({ method: "GET", url: "/api/messages/11111111-1111-4111-8111-111111111111/eml" });
 
     expect(response.statusCode).toBe(409);
-    expect(response.json()).toEqual({ ok: false, message: "Message is no longer available in this mailbox. Sync this message again." });
+    expect(response.json()).toEqual({ ok: false, code: "conflict", message: "Message is no longer available in this mailbox. Sync this message again." });
     expect(client.getMailboxLock).toHaveBeenCalledWith("INBOX");
   });
 });

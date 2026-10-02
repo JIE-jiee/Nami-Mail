@@ -4,7 +4,7 @@
 // every escape-cascade branch, gate, and shortcut is pinned here — the App
 // effect is just a thin executor over these decisions.
 import { beforeEach, describe, expect, it } from "vitest";
-import { dialogKeydownDecision, isTypingTarget, type DialogKeydownSnapshot } from "./dialogRouting";
+import { dialogKeydownDecision, isTypingTarget, MODAL_KEYS, type DialogKeydownAction, type DialogKeydownSnapshot, type ModalKey } from "./dialogRouting";
 import type { Message } from "./types";
 
 function baseSnapshot(overrides: Partial<DialogKeydownSnapshot> = {}): DialogKeydownSnapshot {
@@ -21,6 +21,8 @@ function baseSnapshot(overrides: Partial<DialogKeydownSnapshot> = {}): DialogKey
     sendingStatusOpen: false,
     translationTermsOpen: false,
     attachmentPreviewOpen: false,
+    batchDeleteOpen: false,
+    agentOpen: false,
     selectedId: null,
     selected: false,
     keyboardSelectionAnchorId: null,
@@ -144,6 +146,14 @@ describe("dialogKeydownDecision · Escape cascade", () => {
     expect(decision?.action).toEqual({ kind: "close_mobile_sidebar" });
   });
 
+  it("closes the attachment preview before the reader (WEB-1: one Escape, one layer)", () => {
+    // The preview drawer stacks above the open message, so with both open the
+    // first Escape must close only the preview — never close_reader as well.
+    const decision = dialogKeydownDecision(key("Escape"), baseSnapshot({ attachmentPreviewOpen: true, selectedId: "m1" }));
+    expect(decision?.action).toEqual({ kind: "close_attachment_preview" });
+    expect(decision?.preventDefault).toBe(false);
+  });
+
   it("closes the reader when a message is selected", () => {
     const decision = dialogKeydownDecision(key("Escape"), baseSnapshot({ selectedId: "m1" }));
     expect(decision?.action).toEqual({ kind: "close_reader" });
@@ -158,6 +168,71 @@ describe("dialogKeydownDecision · Escape cascade", () => {
     expect(escape).toEqual({ action: { kind: "absorb" }, preventDefault: true });
     const composeKey = dialogKeydownDecision(key("n"), baseSnapshot({ updatePromptOpen: true, accountsLength: 1 }));
     expect(composeKey).toEqual({ action: { kind: "absorb" }, preventDefault: false });
+  });
+});
+
+describe("dialogKeydownDecision · Escape cascade exhaustiveness over MODAL_KEYS", () => {
+  // WEB-5 guard: the Escape cascade used to be enumerated by hand and one
+  // modal (attachmentPreviewOpen) shipped without a branch, so one Escape
+  // closed two layers. This table is typed Record<ModalKey, …>, so a modal
+  // added to the snapshot without pinning its Escape outcome here fails to
+  // compile — and every entry below asserts the exact decision the shell must
+  // return. updatePromptOpen is not in MODAL_KEYS on purpose (App-local
+  // state, absorbed before the cascade — see MODAL_KEYS's doc); its Escape
+  // outcome is pinned by the update-prompt test in the cascade describe.
+  type ExpectedEscape = { action: DialogKeydownAction; preventDefault: boolean } | null;
+  const expectedEscape: Record<ModalKey, ExpectedEscape> = {
+    settingsOpen: { action: { kind: "close_settings" }, preventDefault: false },
+    calendarOpen: { action: { kind: "close_calendar" }, preventDefault: false },
+    contactsOpen: { action: { kind: "close_contacts" }, preventDefault: false },
+    templatesOpen: { action: { kind: "close_templates" }, preventDefault: false },
+    accountsOpen: { action: { kind: "close_accounts" }, preventDefault: false },
+    // Compose owns Escape itself: the dirty-draft confirmation must decide
+    // before the shell, so the decision layer returns null (leave it to the
+    // component layer).
+    composeOpen: null,
+    addOpen: { action: { kind: "close_add_account" }, preventDefault: false },
+    mobileSidebar: { action: { kind: "close_mobile_sidebar" }, preventDefault: false },
+    // No shell branch: SendingStatusModal handles Escape in its own capture
+    // listener (details → confirm → close), so the shell must stay out.
+    sendingStatusOpen: null,
+    // No shell branch: TranslationTermsDialog handles Escape in its own
+    // capture listener (decline + close), so the shell must stay out.
+    translationTermsOpen: null,
+    // Preview drawer is the top layer over the reader: closes before
+    // close_reader (WEB-1 fix).
+    attachmentPreviewOpen: { action: { kind: "close_attachment_preview" }, preventDefault: false },
+    // No shell branch: App's batch-delete alertdialog consumes Escape in its
+    // own capture listener, so a fallback branch here could only ever fire as
+    // the second half of a WEB-1 double-close.
+    batchDeleteOpen: null,
+    // No shell branch, same reason: the agent workspace closes itself from its
+    // own capture listener.
+    agentOpen: null,
+  };
+
+  it.each(Object.entries(expectedEscape) as Array<[ModalKey, ExpectedEscape]>)(
+    "pins Escape with only %s open",
+    (modalKey, expected) => {
+      const overrides: Partial<DialogKeydownSnapshot> = {};
+      overrides[modalKey] = true;
+      expect(dialogKeydownDecision(key("Escape"), baseSnapshot(overrides))).toEqual(expected);
+    },
+  );
+
+  it("covers exactly the snapshot's modal booleans, so nothing bypasses the cascade", () => {
+    // The other direction of the guard: every boolean field in
+    // DialogKeydownSnapshot must be a MODAL_KEYS entry, except the two
+    // deliberate non-modals — updatePromptOpen (App-local state, absorbed
+    // before the cascade) and selected ("a message is selected", not an
+    // overlay). A new modal boolean added to the snapshot without joining
+    // MODAL_KEYS fails here instead of shipping without Escape routing.
+    const snapshot = baseSnapshot();
+    const booleanKeys = (Object.keys(snapshot) as Array<keyof DialogKeydownSnapshot>).filter((key) => typeof snapshot[key] === "boolean");
+    const nonModalBooleans = ["updatePromptOpen", "selected"];
+    const modalKeys = booleanKeys.filter((key) => !nonModalBooleans.includes(key));
+    expect(new Set(modalKeys)).toEqual(new Set(MODAL_KEYS));
+    expect(modalKeys).toHaveLength(MODAL_KEYS.length);
   });
 });
 

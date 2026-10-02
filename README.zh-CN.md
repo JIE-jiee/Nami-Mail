@@ -66,7 +66,7 @@ Nami Mail 是一个本地优先的多账户 Windows 桌面邮件客户端。它�
 
 ## 运行
 
-需要 Node.js 22.14.0 或更高版本。
+需要 Node.js 24.21.0 或更高版本（与 Electron 43 内置的 Node 24 同主版本）。
 
 ```powershell
 # 在本项目根目录执行
@@ -196,10 +196,10 @@ NAMI_MAIL_MICROSOFT_TENANT=common
 NAMI_MAIL_OAUTH_FLOW_TTL_SECONDS=600
 ```
 
-OAuth 回调会回到本机的 `/api/oauth/google/callback` 或 `/api/oauth/microsoft/callback`。开发 Web 服务默认使用 `http://127.0.0.1:3187`；为实际客户端登记回调地址前，请按对应服务商的当前桌面/回环应用要求核对主机和端口规则。没有配置 client ID 时，界面会明确提示，且不会伪装为可用的 OAuth 登录。
+OAuth 回调会回到本机的 `/api/oauth/google/callback` 或 `/api/oauth/microsoft/callback`。开发 Web 服务默认使用 `http://127.0.0.1:3187`；为实际客户端登记回调地址前，请按对应服务商的当前桌面/回环应用要求核对主机和端口规则。没有配置 client ID 时，界面会明确提示，且不会伪装为可用的 OAuth 登录。0.4.3 起服务端为两个 provider 预留了内置公共 client ID 常量（`apps/server/src/config.ts`，环境变量优先）；官方构建一旦嵌入登记好的 client ID，用户即可零配置登录，`nami-mail.env` 覆盖仍可用于企业自有应用。
 
 - Google：必须创建 Google Cloud 的 **Desktop app** 客户端。Nami Mail 采用原生应用回环流程，运行时会使用 `http://127.0.0.1:<动态端口>/api/oauth/google/callback`。不要把 Web application client ID 填入该变量，否则会出现 `redirect_uri_mismatch`。参见 [Google 原生应用 OAuth 文档](https://developers.google.com/identity/protocols/oauth2/native-app)。
-- Microsoft：必须在 Microsoft Entra 中按 **Mobile and desktop applications / public client** 配置回环回调，并登记 `http://localhost` 回环重定向项。运行时实际使用 `http://localhost:<动态端口>/api/oauth/microsoft/callback`，由仅绑定 IPv6 `::1` 的本机回调桥接器处理；不要把它改成 `127.0.0.1`，这会变成不同的重定向 URI。正式发布前必须使用目标租户完成一次真实登录验证。参见 [Microsoft 重定向 URI 文档](https://learn.microsoft.com/entra/identity-platform/reply-url) 和 [授权码流程文档](https://learn.microsoft.com/entra/identity-platform/v2-oauth2-auth-code-flow)。
+- Microsoft：在 Microsoft Entra 中按 **Mobile and desktop applications（移动和桌面应用程序）** 平台登记（Electron 应用即属此平台），添加自定义重定向 URI **`http://localhost/api/oauth/microsoft/callback`**，路径必须与实际回调完全一致。Nami Mail 运行时实际使用 `http://localhost:<动态端口>/api/oauth/microsoft/callback`，而微软对 localhost 回环重定向 URI **忽略端口匹配**（官方规则：回环 URI 靠路径区分用途，如 `http://localhost/MyWebApp` 与 `http://localhost/MyNativeApp` 互不匹配），因此带路径的自定义 URI 在任意端口下都能匹配。两个易错点：只登记平台自动生成的**不带路径** `http://localhost` 会因路径不一致报 `AADSTS50011`；选 **Web** 平台则要求精确匹配端口，安装版动态端口下必然失败。该回调由仅绑定 IPv6 `::1` 的本机回调桥接器处理，运行时 host 必须是 `localhost`，**不要**把它改成 `127.0.0.1`，这会变成不同的重定向 URI。租户使用 `common` 时，应用侧的「支持的账户类型」必须包含个人 Microsoft 账户（outlook.com/hotmail），否则个人账号登录会失败（AADSTS50020）。Nami Mail 是公共客户端，**不要**填写 client secret；Microsoft 已永久停用 Basic Auth，没有 Google 那样的 16 位应用专用密码，Microsoft 账号只有 OAuth 一条路。正式发布前必须使用目标租户完成一次真实登录验证。参见 [Microsoft 重定向 URI 文档](https://learn.microsoft.com/entra/identity-platform/reply-url)、[授权码流程文档](https://learn.microsoft.com/entra/identity-platform/v2-oauth2-auth-code-flow)、[OIDC 协议文档](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc)与 [Exchange Online 停用 Basic Auth 公告](https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online)（本条注册口径核对日期：2026-01-09 首核，2026-10-01 按重定向 URI 文档复核后把平台口径由 Web 修正为移动和桌面平台）。
 
 ## 功能
 
@@ -283,7 +283,7 @@ npm.cmd audit --omit=dev
         <img src="https://avatars.githubusercontent.com/u/177287013?v=4" width="64" height="64" style="border-radius:50%" alt="QinIndexCode" /><br />
         <sub><b>QinIndexCode</b></sub>
       </a><br />
-      <sub>190 次提交</sub>
+      <sub>207 次提交</sub>
     </td>
     <td align="center">
       <a href="https://github.com/JIE-jiee">

@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
+import { Transform, type TransformCallback } from "node:stream";
+import { serverLog } from "../logging.js";
 
 /**
  * Minimal MCP (Model Context Protocol) stdio client that speaks newline
@@ -7,6 +9,14 @@ import { createInterface } from "node:readline";
  * style of the desktop NamiMail MCP server (apps/desktop/src/agent/mcp.mts)
  * rather than depending on the SDK, so the transport, concurrency, timeout,
  * and JSON safety rules stay explicit and testable.
+ *
+ * Everything here crosses a trust boundary: the peer is an arbitrary
+ * user-configured child process writing to its own stdout. Its output is
+ * therefore treated as hostile input with three independent guards — a byte
+ * budget applied before readline sees a byte, a bounded shape/size check on
+ * every parsed value, and a top-level try/catch around the readline callback
+ * itself, which runs on a stack where an escaping exception becomes
+ * `uncaughtException` and takes down the whole service process.
  */
 
 export const mcpProtocolVersion = "2025-03-26";
@@ -16,6 +26,35 @@ const unsafeObjectKeys = new Set(["__proto__", "constructor", "prototype"]);
 const defaultConnectTimeoutMs = 15_000;
 const defaultRequestTimeoutMs = 60_000;
 const defaultToolLimit = 100;
+
+/**
+ * Byte budgets for one MCP server's stdout, enforced by the guard transform
+ * that sits between the child's pipe and readline.
+ *
+ * - Per line (8 MB). Comfortably above `maxStdioLineLength` (1 MB) so a merely
+ *   oversized *bounded* response is still dropped by the cheap
+ *   post-formation length check instead of costing the user their connection.
+ *   This threshold exists for the case that check cannot see at all: a server
+ *   that writes gigabytes without ever emitting a newline, where readline's own
+ *   line buffer keeps concatenating until Node throws
+ *   `RangeError: Invalid string length` from inside its data handler.
+ * - Per session (64 MB). A single response can never exceed the line budget, so
+ *   this only fires on sustained flooding. It is a rate/memory ceiling rather
+ *   than a quota, set high enough that an agent session doing ordinary tool
+ *   calls (tens of KB per response) never reaches it in practice.
+ */
+const maxStdioLineFloodBytes = 8 * 1024 * 1024;
+const maxStdioSessionFloodBytes = 64 * 1024 * 1024;
+const newlineByte = 0x0a;
+
+/**
+ * Deepest JSON nesting accepted from (or handed to) an MCP peer. Real
+ * `tools/list` schemas are an order of magnitude shallower than this, so the
+ * bound costs nothing legitimate while removing the stack-overflow vector:
+ * `isSafeJsonValue` recurses once per level, and a hostile document tens of
+ * thousands of levels deep used to blow the stack from inside the validator.
+ */
+export const maxJsonDepth = 64;
 
 /**
  * Variables that must never be inherited by an external MCP server process.
@@ -111,15 +150,108 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function isSafeJsonValue(value: unknown, visited = new WeakSet<object>()): boolean {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (!value || typeof value !== "object") return false;
-  if (visited.has(value)) return false;
+/**
+ * Why a value failed the JSON-safety walk. Depth is reported separately from
+ * an ordinary shape rejection because it is the one case that says something
+ * about the peer (a document tens of thousands of levels deep) rather than
+ * about the value, and it is worth a log line instead of a silent drop.
+ */
+type JsonVerdict = { safe: true } | { safe: false; reason: "shape" | "depth" };
+
+const jsonSafe: JsonVerdict = { safe: true };
+const jsonUnsafeShape: JsonVerdict = { safe: false, reason: "shape" };
+const jsonUnsafeDepth: JsonVerdict = { safe: false, reason: "depth" };
+
+function checkJsonValue(value: unknown, visited: WeakSet<object>, depth: number): JsonVerdict {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return jsonSafe;
+  if (typeof value === "number") return Number.isFinite(value) ? jsonSafe : jsonUnsafeShape;
+  if (!value || typeof value !== "object") return jsonUnsafeShape;
+  // Checked before recursing, so the walk itself can never overflow the stack
+  // no matter how deep the document claims to be.
+  if (depth >= maxJsonDepth) return jsonUnsafeDepth;
+  if (visited.has(value)) return jsonUnsafeShape;
   visited.add(value);
-  if (Array.isArray(value)) return value.every((entry) => isSafeJsonValue(entry, visited));
-  if (!isPlainObject(value)) return false;
-  return Object.entries(value).every(([key, entry]) => !unsafeObjectKeys.has(key) && isSafeJsonValue(entry, visited));
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const verdict = checkJsonValue(entry, visited, depth + 1);
+      if (!verdict.safe) return verdict;
+    }
+    return jsonSafe;
+  }
+  if (!isPlainObject(value)) return jsonUnsafeShape;
+  for (const [key, entry] of Object.entries(value)) {
+    if (unsafeObjectKeys.has(key)) return jsonUnsafeShape;
+    const verdict = checkJsonValue(entry, visited, depth + 1);
+    if (!verdict.safe) return verdict;
+  }
+  return jsonSafe;
+}
+
+/**
+ * Rejects values that are not plain JSON, that carry a prototype-polluting key,
+ * that form a cycle, or that nest deeper than `maxJsonDepth`.
+ *
+ * Exported for the depth-bound unit test: the depth rule is a pure predicate
+ * over a value and is worth pinning down without having to stage a child
+ * process to reach it.
+ */
+export function isSafeJsonValue(value: unknown, visited = new WeakSet<object>(), depth = 0): boolean {
+  return checkJsonValue(value, visited, depth).safe;
+}
+
+type StdioFloodReason = "line" | "session";
+
+/**
+ * Counts the child's stdout before readline is allowed to see any of it.
+ *
+ * `maxStdioLineLength` alone is not a flood guard: it only runs once readline
+ * has already assembled a whole line, and readline imposes no length ceiling of
+ * its own. This transform is therefore placed upstream, where exceeding a
+ * budget simply stops forwarding — readline never accumulates the buffer that
+ * would otherwise blow up as `RangeError: Invalid string length`.
+ */
+class StdioFloodGuard extends Transform {
+  /** Bytes of the not-yet-terminated line carried across chunks. */
+  private lineBytes = 0;
+  private sessionBytes = 0;
+  private tripped = false;
+
+  constructor(
+    private readonly onFlood: (reason: StdioFloodReason, detail: { lineBytes: number; sessionBytes: number }) => void,
+  ) {
+    super();
+  }
+
+  override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+    // After the first trip the guard is inert: the connection is already being
+    // torn down and nothing more may reach the listener.
+    if (this.tripped) {
+      callback();
+      return;
+    }
+    this.sessionBytes += chunk.length;
+    // Length of the line this chunk completes (or, with no newline in it, of
+    // the line still being built) — the conservative reading of "longest line
+    // in flight".
+    const firstBreak = chunk.indexOf(newlineByte);
+    const lastBreak = chunk.lastIndexOf(newlineByte);
+    const openLineBytes = firstBreak < 0 ? this.lineBytes + chunk.length : this.lineBytes + firstBreak + 1;
+    // Only the bytes after the last newline carry into the next chunk.
+    this.lineBytes = lastBreak < 0 ? this.lineBytes + chunk.length : chunk.length - lastBreak - 1;
+
+    const reason: StdioFloodReason | undefined = openLineBytes > maxStdioLineFloodBytes
+      ? "line"
+      : this.sessionBytes > maxStdioSessionFloodBytes
+        ? "session"
+        : undefined;
+    if (!reason) {
+      callback(null, chunk);
+      return;
+    }
+    this.tripped = true;
+    callback();
+    this.onFlood(reason, { lineBytes: openLineBytes, sessionBytes: this.sessionBytes });
+  }
 }
 
 function isJsonRpcId(value: unknown): value is McpJsonRpcId {
@@ -142,6 +274,7 @@ function mcpClientError(error: unknown): McpClientError {
  */
 export class McpStdioClient {
   private child?: ChildProcessWithoutNullStreams;
+  private stdoutGuard?: StdioFloodGuard;
   private readonly pending = new Map<number, PendingRequest>();
   private nextId = 1;
   private connected = false;
@@ -250,7 +383,7 @@ export class McpStdioClient {
       this.teardown();
     });
 
-    const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY, terminal: false });
+    const lines = createInterface({ input: this.attachStdoutGuard(child), crlfDelay: Number.POSITIVE_INFINITY, terminal: false });
     const handleLine = (line: string): void => this.handleLine(line);
     lines.on("line", handleLine);
 
@@ -297,6 +430,26 @@ export class McpStdioClient {
 
   private async requestWithTimeout(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
     return this.request(method, params, { timeoutMs });
+  }
+
+  /**
+   * Routes the child's stdout through the flood guard and returns the readable
+   * side for readline. The disconnect itself reuses the module's existing
+   * pattern (fail every pending request, then teardown), so a flood looks like
+   * any other lost connection to callers.
+   */
+  private attachStdoutGuard(child: ChildProcessWithoutNullStreams): StdioFloodGuard {
+    const guard = new StdioFloodGuard((reason, detail) => {
+      serverLog.warn(
+        { reason, ...detail, command: this.transport.command },
+        "MCP server exceeded its stdout byte budget; dropping the connection",
+      );
+      this.failPending(new McpClientError("CLOSED", `The MCP server exceeded its stdout byte budget (${reason}).`, true));
+      this.teardown();
+    });
+    this.stdoutGuard = guard;
+    child.stdout.pipe(guard);
+    return guard;
   }
 
   async listTools(options: { signal?: AbortSignal } = {}): Promise<readonly McpDiscoveredTool[]> {
@@ -351,7 +504,29 @@ export class McpStdioClient {
     };
   }
 
+  /**
+   * The one boundary between a child process and this process's event loop.
+   *
+   * readline emits `line` synchronously from inside its own data handler, so
+   * anything thrown from here lands in `uncaughtException` — which kills the
+   * whole service process (SQLite, IMAP, the Agent loop, the HTTP API), not
+   * just this connection. `JSON.parse` alone is guarded; the shape walk that
+   * follows it was not, so a deep-but-valid document killed the process from
+   * inside the validator. Everything now happens under this catch.
+   */
   private handleLine(line: string): void {
+    try {
+      this.dispatchLine(line);
+    } catch (error) {
+      serverLog.warn(
+        { command: this.transport.command, length: line.length },
+        "Dropped an MCP stdio line that failed validation",
+        error,
+      );
+    }
+  }
+
+  private dispatchLine(line: string): void {
     if (line.length > maxStdioLineLength) return;
     let message: unknown;
     try {
@@ -359,7 +534,20 @@ export class McpStdioClient {
     } catch {
       return;
     }
-    if (!isPlainObject(message) || !isSafeJsonValue(message)) return;
+    if (!isPlainObject(message)) return;
+    const verdict = checkJsonValue(message, new WeakSet(), 0);
+    if (!verdict.safe) {
+      // A document this deep is not a well-formed response to anything; the
+      // peer is either broken or hostile, and neither is worth staying quiet
+      // about, so the drop is recorded rather than lost.
+      if (verdict.reason === "depth") {
+        serverLog.warn(
+          { reason: verdict.reason, command: this.transport.command, length: line.length, maxJsonDepth },
+          "Dropped an MCP stdio line nested past the accepted JSON depth",
+        );
+      }
+      return;
+    }
     if (!Object.prototype.hasOwnProperty.call(message, "id")) return; // Notifications are acknowledged and ignored.
     const id = message.id;
     if (!isJsonRpcId(id)) return;
@@ -391,7 +579,10 @@ export class McpStdioClient {
     this.connected = false;
     this.closing = true;
     const child = this.child;
+    const guard = this.stdoutGuard;
     this.child = undefined;
+    this.stdoutGuard = undefined;
+    guard?.destroy();
     if (child) {
       child.stdin.end();
       child.kill();

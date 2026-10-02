@@ -22,17 +22,21 @@ Fastify local service (127.0.0.1; dynamic port for desktop)
         |                         +-- SQLite and encrypted-data directory
         |
         +-- IMAP / SMTP / DNS / OAuth providers
+        |
+        +-- Agent runtime (tool registry, permissions, confirmations) and external MCP
 ```
 
-The desktop window enables `contextIsolation`, disables `nodeIntegration`, and uses a sandboxed renderer. The access token is not written to a URL, the user-data directory, or ordinary configuration. The main process gives the page local API request headers through restricted preload IPC only after verifying that the caller is the local main frame of the current main window. The renderer can therefore use it only for local `/api/*` requests; it cannot gain general Node.js or Electron capabilities through it.
+The desktop window enables `contextIsolation`, disables `nodeIntegration`, and uses a sandboxed renderer. The access token is not written to a URL, the user-data directory, or ordinary configuration. The main process injects the header only for local `/api/*` requests through `session.webRequest.onBeforeSendHeaders`; the renderer never holds the token itself, and the main-frame check guards the desktop IPC channels. The renderer therefore cannot gain general Node.js or Electron capabilities through it.
 
 ## Component Responsibilities
 
 | Location | Responsibility |
 | --- | --- |
 | `apps/web` | React UI, themes, mail reading/composition, account guidance, and local API client. |
-| `apps/server` | Fastify routes, IMAP/SMTP, OAuth, provider discovery, sync, drafts/send queue, SQLite, and application-layer encryption. |
-| `apps/desktop` | Electron lifecycle, single instance, tray, Windows notifications, DPAPI main key, preload IPC, update checks, and installer helper. |
+| `apps/server` | Fastify routes, IMAP/SMTP, OAuth, provider discovery, sync, drafts/send queue, SQLite, and application-layer encryption; Agent service, tool execution, and permissions. |
+| `apps/desktop` | Electron lifecycle, single instance, tray, Windows notifications, DPAPI main key, preload IPC, update checks, and installer helper; Agent Broker, pairing, and the secure pipe. |
+| `packages/agent-contracts` | Interface contracts shared by the Agent, CLI, and MCP (External Mail v1 tools, Broker protocol, error codes). |
+| `packages/agent-core` | Agent session orchestration and tool-execution core. |
 | `build` | Version-controlled brand resources, Windows installer resources, and default empty update-trust configuration. |
 | `scripts` | Native SQLite loading verification, builds, installer smoke tests, and Release assets/release-policy validation. |
 

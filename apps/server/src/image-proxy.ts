@@ -1,19 +1,26 @@
-import { createHash } from "node:crypto";
 import dns from "node:dns";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
-import path from "node:path";
+import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { config } from "./config.js";
+import {
+  type CacheEntry,
+  type UnindexedFile,
+  cacheFilename,
+  cacheMeta,
+  ensureCacheDir,
+  listUnindexedFiles,
+  loadMeta,
+  safeCachePath,
+  saveMeta,
+} from "./image-cache-index.js";
+import { serverLog } from "./logging.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-
-const CACHE_DIR = path.join(path.dirname(config.databasePath), "image-cache");
-const META_FILE = path.join(CACHE_DIR, "_meta.json");
 
 /** Maximum total cache size in bytes (default 200 MB). */
 const MAX_CACHE_BYTES = integerEnv("NAMI_MAIL_IMAGE_CACHE_MAX_MB", 200) * 1024 * 1024;
@@ -33,47 +40,22 @@ const MAX_REDIRECT_HOPS = 5;
 /** Reject absurd URLs before they reach the parser or the socket layer. */
 const MAX_URL_LENGTH = 2048;
 
-/** Per-hop request timeout. */
+/** Per-hop request timeout. A socket IDLE timeout: it fires only when no data
+ * arrives for this long, so a remote that drips a byte just often enough never
+ * trips it. */
 const FETCH_TIMEOUT_MS = 15_000;
 
-/** Only hex characters — produced by SHA-256 digest. */
-const SAFE_FILENAME_RE = /^[0-9a-f]{64}$/;
+/**
+ * Wall-clock ceiling for transferring one response body. Complements
+ * `FETCH_TIMEOUT_MS`: the idle timeout cannot bound a slow-drip transfer, while
+ * this deadline ends the whole body transfer regardless of how much progress
+ * the remote keeps making.
+ */
+const TRANSFER_TIMEOUT_MS = integerEnv("NAMI_MAIL_IMAGE_TRANSFER_TIMEOUT_MS", 60_000);
 
 function integerEnv(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-// ---------------------------------------------------------------------------
-// Cache metadata
-// ---------------------------------------------------------------------------
-
-interface CacheEntry {
-  /** Relative filename inside CACHE_DIR (sha256 hex). */
-  file: string;
-  /** Original URL or "cid:<contentId>" for inline images. */
-  key: string;
-  /** MIME content-type. */
-  contentType: string;
-  /** File size in bytes. */
-  size: number;
-  /** Epoch-ms when this entry was last accessed. */
-  lastAccess: number;
-}
-
-let meta: Record<string, CacheEntry> = {};
-
-function loadMeta(): void {
-  try {
-    meta = JSON.parse(fs.readFileSync(META_FILE, "utf-8")) as Record<string, CacheEntry>;
-  } catch {
-    meta = {};
-  }
-}
-
-function saveMeta(): void {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  fs.writeFileSync(META_FILE, JSON.stringify(meta), "utf-8");
 }
 
 // ---------------------------------------------------------------------------
@@ -185,23 +167,9 @@ export function nextRedirectUrl(currentUrl: string, location: string): string | 
 // ---------------------------------------------------------------------------
 
 let cleanupTimer: ReturnType<typeof setInterval> | undefined;
-
-function ensureCacheDir(): void {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
-
-/** Content-hash filename — SHA-256 hex is path-traversal-safe by construction. */
-function cacheFilename(key: string): string {
-  return createHash("sha256").update(key).digest("hex");
-}
-
-/** Validate a filename is a safe hex string and resolves inside CACHE_DIR. */
-function safeCachePath(filename: string): string | null {
-  if (!SAFE_FILENAME_RE.test(filename)) return null;
-  const resolved = path.resolve(CACHE_DIR, filename);
-  if (resolved !== path.join(CACHE_DIR, filename)) return null;
-  return resolved;
-}
+/** Epoch-ms of the last warned cleanup failure; one warn per interval keeps a
+ * persistently broken cache directory from spamming the log every hour. */
+let lastCleanupWarnAt = 0;
 
 function touchEntry(entry: CacheEntry): void {
   entry.lastAccess = Date.now();
@@ -212,40 +180,97 @@ function touchEntry(entry: CacheEntry): void {
 // ---------------------------------------------------------------------------
 
 export function runCacheCleanup(): void {
-  ensureCacheDir();
-  loadMeta();
-  let totalBytes = 0;
-  const now = Date.now();
-  const keysToRemove: string[] = [];
+  // The pass is pure synchronous fs work and runs both on the startup path
+  // (startCacheCleanupTimer) and inside the hourly timer: a failing write
+  // (disk full, permissions, an antivirus lock on Windows) must degrade to a
+  // log line instead of escaping as an uncaughtException and killing the
+  // process. The per-file unlink below keeps its own local catch.
+  //
+  // It reconciles the index against the directory rather than trusting the
+  // index alone, which is what makes a lost index self-healing instead of
+  // permanent: after one bad write, the cache stops serving hits, but the age
+  // window and the quota keep applying to the bytes on disk.
+  try {
+    ensureCacheDir();
+    loadMeta();
+    // Re-read the index through the accessor: a concurrent `proxyImage` can
+    // have replaced it since, and the pass must sweep whatever is current.
+    const meta = cacheMeta();
+    let totalBytes = 0;
+    const now = Date.now();
+    const keysToRemove: string[] = [];
 
-  for (const [key, entry] of Object.entries(meta)) {
-    if (now - entry.lastAccess > MAX_AGE_MS) {
-      keysToRemove.push(key);
-      continue;
+    for (const [key, entry] of Object.entries(meta)) {
+      if (now - entry.lastAccess > MAX_AGE_MS) {
+        keysToRemove.push(key);
+        continue;
+      }
+      totalBytes += entry.size;
     }
-    totalBytes += entry.size;
-  }
 
-  if (totalBytes > MAX_CACHE_BYTES) {
-    const sorted = Object.entries(meta)
-      .filter(([k]) => !keysToRemove.includes(k))
-      .sort((a, b) => a[1].lastAccess - b[1].lastAccess);
-    for (const [key, entry] of sorted) {
+    // Files the index does not claim. The sweep above can only see entries, so
+    // a lost or reset index would leave the whole directory invisible to every
+    // pass — the 7-day age window and the size quota would stop applying and
+    // the cache would grow without bound. One directory listing feeds this,
+    // so the pass never scans the directory twice.
+    const unindexedToRemove: string[] = [];
+    const unindexed: UnindexedFile[] = [];
+    for (const file of listUnindexedFiles()) {
+      // mtime stands in for the `lastAccess` the lost index used to carry.
+      if (now - file.lastAccess > MAX_AGE_MS) {
+        unindexedToRemove.push(file.file);
+        continue;
+      }
+      totalBytes += file.size;
+      unindexed.push(file);
+    }
+
+    if (totalBytes > MAX_CACHE_BYTES) {
+      // The entry set runs to the 200MB/4KB ceiling (~50 000 rows), and this
+      // pass sits on the startup path and the hourly timer, so the "not
+      // already expired" test must be a Set lookup: a linear `includes` per
+      // entry made the pass O(n·k) and blocked the main thread for ~1.3s.
+      const removing = new Set(keysToRemove);
+      const sorted = Object.entries(meta)
+        .filter(([k]) => !removing.has(k))
+        .sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+      for (const [key, entry] of sorted) {
+        if (totalBytes <= MAX_CACHE_BYTES) break;
+        totalBytes -= entry.size;
+        keysToRemove.push(key);
+      }
+    }
+
+    // Unindexed files share the budget the sweep above just settled, coldest
+    // first: the quota covers the directory, so it is enforced on the same
+    // terms whether the bytes are indexed or not.
+    for (const file of unindexed.sort((a, b) => a.lastAccess - b.lastAccess)) {
       if (totalBytes <= MAX_CACHE_BYTES) break;
-      totalBytes -= entry.size;
-      keysToRemove.push(key);
+      totalBytes -= file.size;
+      unindexedToRemove.push(file.file);
     }
-  }
 
-  for (const key of keysToRemove) {
-    const entry = meta[key];
-    if (entry) {
-      const full = safeCachePath(entry.file);
+    for (const key of keysToRemove) {
+      const entry = meta[key];
+      if (entry) {
+        const full = safeCachePath(entry.file);
+        if (full) try { fs.unlinkSync(full); } catch { /* missing is fine */ }
+        delete meta[key];
+      }
+    }
+    for (const file of unindexedToRemove) {
+      const full = safeCachePath(file);
       if (full) try { fs.unlinkSync(full); } catch { /* missing is fine */ }
-      delete meta[key];
+    }
+    if (keysToRemove.length > 0) saveMeta();
+    lastCleanupWarnAt = 0; // a clean pass re-arms the throttled warning
+  } catch (error) {
+    const now = Date.now();
+    if (now - lastCleanupWarnAt >= CLEANUP_INTERVAL_MS) {
+      lastCleanupWarnAt = now;
+      serverLog.warn({}, "Image cache cleanup failed", error);
     }
   }
-  if (keysToRemove.length > 0) saveMeta();
 }
 
 export function startCacheCleanupTimer(): void {
@@ -293,7 +318,7 @@ export function guardedLookup(hostname: string, options: dns.LookupOptions, call
 }
 
 interface RemoteImageResponse {
-  stream: NodeJS.ReadableStream;
+  stream: http.IncomingMessage;
   status: number;
   location?: string;
   contentType: string;
@@ -358,6 +383,61 @@ async function fetchRemoteImage(startUrl: string): Promise<RemoteImageResponse |
 }
 
 // ---------------------------------------------------------------------------
+// Streaming guards — enforced DURING the body transfer, not only at its edges
+// ---------------------------------------------------------------------------
+
+// The header check and the post-write stat check only guard the edges of the
+// download. A remote that omits content-length can keep a chunked body growing
+// for as long as it likes (one byte per idle-timeout window already defeats
+// FETCH_TIMEOUT_MS), and the file only enters the meta index — the thing the
+// hourly cleanup reclaims — once the transfer completes. The two guards below
+// bound the transfer itself.
+
+/**
+ * `code` of the dedicated error thrown when a transfer breaches one of the hard
+ * limits below. The route layer surfaces this policy abort as a 500, while an
+ * ordinary fetch or stream failure still degrades to `null`. Exported so tests
+ * can recognize the error kind without matching message text.
+ */
+export const IMAGE_DOWNLOAD_LIMIT_CODE = "EIMAGE_DOWNLOAD_LIMIT";
+
+function downloadLimitError(reason: string): Error {
+  return Object.assign(new Error(`Remote image download aborted: ${reason}.`), {
+    code: IMAGE_DOWNLOAD_LIMIT_CODE,
+  });
+}
+
+function isDownloadLimitError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === IMAGE_DOWNLOAD_LIMIT_CODE
+  );
+}
+
+/**
+ * Byte-counting gate between the response stream and the disk write. The early
+ * abort and the post-write stat check deliberately share the same
+ * `MAX_FILE_BYTES` ceiling (and the same strictly-greater comparison), so the
+ * two guards cannot drift apart into different effective limits.
+ */
+function byteLimitTransform(limit: number): Transform {
+  let received = 0;
+  return new Transform({
+    transform(chunk: Buffer, _encoding: BufferEncoding, callback): void {
+      received += chunk.length;
+      if (received > limit) {
+        // `pipeline` destroys every stream in the chain as soon as one errors —
+        // including the response, which closes the socket, and the write stream.
+        callback(downloadLimitError("response body exceeded the size ceiling"));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -371,7 +451,11 @@ export async function proxyImage(url: string): Promise<{ filePath: string; conte
   ensureCacheDir();
   loadMeta();
 
-  const existing = meta[url];
+  // `cacheMeta()` is re-read at every use below, on purpose: the fetch below
+  // awaits, so another in-flight call can rebind the index meanwhile. Reading
+  // the binding each time is what keeps concurrent calls writing to one index
+  // instead of to two diverging copies of it.
+  const existing = cacheMeta()[url];
   if (existing) {
     const full = safeCachePath(existing.file);
     if (full && fs.existsSync(full)) {
@@ -379,7 +463,7 @@ export async function proxyImage(url: string): Promise<{ filePath: string; conte
       saveMeta();
       return { filePath: full, contentType: existing.contentType };
     }
-    delete meta[url];
+    delete cacheMeta()[url];
   }
 
   const response = await fetchRemoteImage(url);
@@ -402,11 +486,28 @@ export async function proxyImage(url: string): Promise<{ filePath: string; conte
     return null;
   }
 
+  // Two guards bound the transfer itself: the byte gate (same MAX_FILE_BYTES
+  // ceiling as the header check and the post-write stat check below) and the
+  // wall-clock deadline (FETCH_TIMEOUT_MS is only a socket idle timeout, so a
+  // drip-fed body would otherwise grow forever). `pipeline` destroys every
+  // stream in the chain as soon as one errors — the response, closing the
+  // socket, and the write stream included.
+  const deadline = setTimeout(() => {
+    response.stream.destroy(downloadLimitError("body transfer exceeded the wall-clock deadline"));
+  }, TRANSFER_TIMEOUT_MS);
+  deadline.unref();
   try {
-    await pipeline(response.stream, fs.createWriteStream(full));
-  } catch {
+    await pipeline(response.stream, byteLimitTransform(MAX_FILE_BYTES), fs.createWriteStream(full));
+  } catch (error) {
+    // The temp file is not in the meta index yet, so nothing else would ever
+    // reclaim it. Unlink failures stay swallowed so they cannot mask the
+    // original error: a limit abort is rethrown for the route layer, anything
+    // else degrades to `null` as before.
     try { fs.unlinkSync(full); } catch { /* ignore */ }
+    if (isDownloadLimitError(error)) throw error;
     return null;
+  } finally {
+    clearTimeout(deadline);
   }
 
   const stat = fs.statSync(full);
@@ -415,7 +516,7 @@ export async function proxyImage(url: string): Promise<{ filePath: string; conte
     return null;
   }
 
-  meta[url] = {
+  cacheMeta()[url] = {
     file,
     key: url,
     contentType,

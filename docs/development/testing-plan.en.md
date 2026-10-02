@@ -48,6 +48,6 @@ Run a single workspace as risk requires, for example `npm.cmd --workspace @nami/
 
 ## Manual release evidence
 
-At minimum, validate a real SID-DACL (not a mock) in the installed Windows app, CLI/MCP read-only access, visible confirmation, unreadability after account deletion, update drain, RAG rebuild after restart, and that local NLLB translation remains opt-in/user-triggered. Without that evidence, do not mark the feature release-ready.
+At minimum, validate a real SID-DACL (not a mock) in the installed Windows app, CLI/MCP read-only access, visible confirmation, unreadability after account deletion, update drain, RAG rebuild after restart, and that message translation remains opt-in/user-triggered. Without that evidence, do not mark the feature release-ready.
 
 See the [release checklist](release-checklist.en.md) and [RAG troubleshooting](../rag/troubleshooting.en.md).

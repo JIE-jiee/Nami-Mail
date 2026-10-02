@@ -37,7 +37,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 (Node.js 24)
         with:
-          node-version: 22.14.0
+          node-version: 24.21.0
           cache: npm
       # The pages are pre-rendered from `docs/`, which needs the Markdown parser
       # declared in the root package. `--ignore-scripts` skips the repository's

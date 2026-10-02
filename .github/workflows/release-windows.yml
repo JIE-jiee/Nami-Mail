@@ -31,19 +31,16 @@ jobs:
       # v7.0.0 (Node.js 24); keep this action pinned for the secret-free validation job.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 22.14.0
+          node-version: 24.21.0
           cache: npm
       - run: npm ci
       - run: npm run verify:node-sqlite
       - run: npm run verify:electron-sqlite
       - run: npm run smoke:server-node
       - run: npm run build:brand:check
-      - run: node --test scripts/release-policy.test.mjs
-      - run: node --test scripts/build-locale-catalog.test.mjs
-      - run: node --test scripts/dev-server-backoff.test.mjs scripts/package-win-trust.test.mjs scripts/dev-port-sync.test.mjs
-      - run: node --test scripts/github-update-assets.test.mjs
-      - run: node --test scripts/wiki-sync.test.mjs
-      - run: node --test scripts/build-docs-site.test.mjs
+      # Every script-level invariant lives in scripts/tests/ and is discovered
+      # by this one run (a placement guard fails if a test is filed elsewhere).
+      - run: node --test "scripts/tests/*.test.mjs"
       - run: node scripts/build-docs-site.mjs
       - run: node scripts/build-locale-catalog.mjs --check
       - run: npm run lint
@@ -75,7 +72,7 @@ jobs:
       # v7.0.0 (Node.js 24); keep this action pinned before this job receives release secrets.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 22.14.0
+          node-version: 24.21.0
           cache: npm
       - run: npm ci
       - name: Sign, upload draft, and run package smoke

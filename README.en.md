@@ -66,7 +66,7 @@ See [Windows installation and updates](docs/INSTALLING.en.md) for first installa
 
 ## Run from Source
 
-Node.js 22.14.0 or newer is required.
+Node.js 24.21.0 or newer is required (the same major as the Node runtime bundled with Electron 43).
 
 ```powershell
 # Run these commands from the project root.
@@ -196,10 +196,10 @@ NAMI_MAIL_MICROSOFT_TENANT=common
 NAMI_MAIL_OAUTH_FLOW_TTL_SECONDS=600
 ```
 
-OAuth callbacks return to local `/api/oauth/google/callback` or `/api/oauth/microsoft/callback`. The development Web service defaults to `http://127.0.0.1:3187`. Before registering a callback for a real client, check the provider's current desktop/loopback-app host and port requirements. When no client ID is configured, the UI clearly explains that OAuth is unavailable and does not pretend that sign-in can work.
+OAuth callbacks return to local `/api/oauth/google/callback` or `/api/oauth/microsoft/callback`. The development Web service defaults to `http://127.0.0.1:3187`. Before registering a callback for a real client, check the provider's current desktop/loopback-app host and port requirements. When no client ID is configured, the UI clearly explains that OAuth is unavailable and does not pretend that sign-in can work. Since 0.4.3 the server reserves built-in public client ID constants for both providers (`apps/server/src/config.ts`, environment variables win); once an official build embeds a registered client ID, users sign in with zero configuration, and the `nami-mail.env` override remains available for enterprise-owned apps.
 
 - Google: create a Google Cloud **Desktop app** client. Nami Mail uses the native-app loopback flow and at runtime uses `http://127.0.0.1:<dynamic port>/api/oauth/google/callback`. Do not put a Web application client ID in this variable or you will get `redirect_uri_mismatch`. See [Google native-app OAuth documentation](https://developers.google.com/identity/protocols/oauth2/native-app).
-- Microsoft: configure a loopback callback under Microsoft Entra **Mobile and desktop applications / public client**, including the `http://localhost` loopback redirect. At runtime, Nami Mail uses `http://localhost:<dynamic port>/api/oauth/microsoft/callback`, handled by a local callback bridge bound only to IPv6 `::1`. Do not change it to `127.0.0.1`; that is a different redirect URI. Before a production release, perform one real sign-in with the target tenant. See [Microsoft redirect URI documentation](https://learn.microsoft.com/entra/identity-platform/reply-url) and the [authorization code flow documentation](https://learn.microsoft.com/entra/identity-platform/v2-oauth2-auth-code-flow).
+- Microsoft: register under the Microsoft Entra **Mobile and desktop applications** platform (Electron apps belong there) and add the custom redirect URI **`http://localhost/api/oauth/microsoft/callback`** — the path must match the real callback exactly. At runtime Nami Mail uses `http://localhost:<dynamic port>/api/oauth/microsoft/callback`, and Microsoft **ignores the port when matching localhost redirect URIs** (per the official rule: loopback URIs are told apart by path, e.g. `http://localhost/MyWebApp` does not match `http://localhost/MyNativeApp`), so a path-bearing custom URI matches on any port. Two pitfalls: registering only the platform's auto-suggested **path-less** `http://localhost` fails with `AADSTS50011` (path mismatch); choosing the **Web** platform requires an exact port match, which always fails with the installed app's dynamic port. That callback is served by a local callback bridge bound only to IPv6 `::1`; the runtime host must stay `localhost` — **do not** change it to `127.0.0.1`, which is a different redirect URI. When the tenant is `common`, the app's supported account types must include personal Microsoft accounts (outlook.com/hotmail) or personal-account sign-in fails (AADSTS50020). Nami Mail is a public client: **never** supply a client secret. Microsoft has permanently retired Basic Auth, so there is no Google-style 16-character app password — Microsoft accounts have OAuth as their only path. Before a production release, perform one real sign-in with the target tenant. See [Microsoft redirect URI documentation](https://learn.microsoft.com/entra/identity-platform/reply-url), the [authorization code flow documentation](https://learn.microsoft.com/entra/identity-platform/v2-oauth2-auth-code-flow), the [OIDC protocol documentation](https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc), and the [Exchange Online Basic Auth retirement announcement](https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online) (this registration guidance was first verified on 2026-01-09 and revised on 2026-10-01 after re-reading the redirect URI rules: the platform prescription changed from Web to Mobile and desktop).
 
 ## Features
 
@@ -283,7 +283,7 @@ Thanks to everyone who has contributed to this project (bots excluded):
         <img src="https://avatars.githubusercontent.com/u/177287013?v=4" width="64" height="64" style="border-radius:50%" alt="QinIndexCode" /><br />
         <sub><b>QinIndexCode</b></sub>
       </a><br />
-      <sub>190 commits</sub>
+      <sub>207 commits</sub>
     </td>
     <td align="center">
       <a href="https://github.com/JIE-jiee">

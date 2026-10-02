@@ -1,6 +1,6 @@
 import { FileText, LoaderCircle, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "./api";
+import { api, type BinaryRequestOptions } from "./api";
 import {
   attachmentPreviewKind,
   extractAttachmentPreviewText,
@@ -24,7 +24,7 @@ type AttachmentPreviewModalProps = {
   attachment: PreviewAttachment | null;
   onClose: () => void;
   /** Test seam: override the blob fetcher used to load the attachment. */
-  fetchBlob?: (messageId: string, partId: string) => Promise<Blob>;
+  fetchBlob?: (messageId: string, partId: string, options?: BinaryRequestOptions) => Promise<Blob>;
 };
 
 type PreviewPhase = "loading" | "ready" | "error";
@@ -54,10 +54,14 @@ export default function AttachmentPreviewModal({
   useEffect(() => {
     if (!attachment || !kind || kind === "unsupported") return undefined;
     let active = true;
+    // Opening a second attachment, or closing the drawer, supersedes this
+    // transfer: `active` already threw its result away, and the signal makes
+    // the fetch stop too instead of streaming a blob nobody will read.
+    const controller = new AbortController();
     setPhase("loading");
     setText(null);
     setErrorDetail(null);
-    void fetch(messageId, attachment.partId).then(async (blob) => {
+    void fetch(messageId, attachment.partId, { signal: controller.signal }).then(async (blob) => {
       if (!active) return;
       if (kind === "pdf" || kind === "image") {
         objectUrlRef.current = URL.createObjectURL(blob);
@@ -80,6 +84,7 @@ export default function AttachmentPreviewModal({
     });
     return () => {
       active = false;
+      controller.abort();
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
         objectUrlRef.current = null;
@@ -117,10 +122,19 @@ export default function AttachmentPreviewModal({
   useEffect(() => {
     if (!attachment) return undefined;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") requestClose();
+      if (event.key !== "Escape") return;
+      // Capture + preventDefault + stopImmediatePropagation, matching the
+      // other shell dialogs (CalendarDialog, SettingsModal, ContactsSection):
+      // the preview drawer is the top layer above the reader, so this Escape
+      // closes only the preview — through the same requestClose → onClose
+      // path as the X button — and must not also reach App's window keydown
+      // chain, which would close the reader behind it in the same keypress.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      requestClose();
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [attachment, requestClose]);
 
   if (!attachment) return null;

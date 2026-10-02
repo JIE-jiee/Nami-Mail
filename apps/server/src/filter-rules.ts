@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { z } from "zod";
+import {
+  filterRuleCreateSchema,
+  filterRuleUpdateSchema,
+  type FilterRule,
+  type FilterRuleAction,
+  type FilterRuleCondition,
+  type FilterRuleInput,
+  type FilterRuleUpdate,
+} from "@nami/agent-contracts";
 import type { DatabaseHandle } from "./db.js";
 import type { MessagePayload } from "./message-storage.js";
 
@@ -8,58 +16,12 @@ import type { MessagePayload } from "./message-storage.js";
  * against a set of AND conditions and then runs its actions locally, without
  * modifying provider-side filter configuration. Actions reuse the same IMAP
  * operations as the user interface (flag changes, archive, move to folder).
+ *
+ * The wire schemas and types are single-sourced in @nami/agent-contracts;
+ * these re-exports keep the historical local names for the routes.
  */
-
-export type FilterRuleCondition =
-  | { kind: "from"; value: string }
-  | { kind: "to"; value: string }
-  | { kind: "subject"; value: string }
-  | { kind: "has_attachments"; value: boolean };
-
-export type FilterRuleAction =
-  | { kind: "mark_seen" }
-  | { kind: "add_flag" }
-  | { kind: "archive" }
-  | { kind: "move_to_folder"; folderPath: string };
-
-export type FilterRule = {
-  id: string;
-  name: string;
-  enabled: boolean;
-  /** null applies the rule to every account; otherwise only that account. */
-  accountId: string | null;
-  conditions: FilterRuleCondition[];
-  actions: FilterRuleAction[];
-  position: number;
-  createdAt: string;
-  updatedAt: string;
-};
-
-const filterRuleConditionSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("from"), value: z.string().trim().min(1).max(320) }).strict(),
-  z.object({ kind: z.literal("to"), value: z.string().trim().min(1).max(320) }).strict(),
-  z.object({ kind: z.literal("subject"), value: z.string().trim().min(1).max(200) }).strict(),
-  z.object({ kind: z.literal("has_attachments"), value: z.boolean() }).strict(),
-]);
-
-const filterRuleActionSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("mark_seen") }).strict(),
-  z.object({ kind: z.literal("add_flag") }).strict(),
-  z.object({ kind: z.literal("archive") }).strict(),
-  z.object({ kind: z.literal("move_to_folder"), folderPath: z.string().trim().min(1).max(500) }).strict(),
-]);
-
-const filterRuleInputSchema = z.object({
-  name: z.string().trim().min(1).max(120),
-  accountId: z.string().trim().min(1).max(128).nullable().optional(),
-  enabled: z.boolean().optional(),
-  conditions: z.array(filterRuleConditionSchema).min(1).max(10),
-  actions: z.array(filterRuleActionSchema).min(1).max(10),
-}).strict();
-
-export const filterRuleCreateSchema = filterRuleInputSchema;
-export const filterRuleUpdateSchema = filterRuleInputSchema.partial().strict()
-  .refine((patch) => Object.keys(patch).length > 0, { message: "至少需要更新一个字段。" });
+export { filterRuleCreateSchema, filterRuleUpdateSchema };
+export type { FilterRule, FilterRuleAction, FilterRuleCondition };
 
 type FilterRuleRow = {
   id: string;
@@ -120,7 +82,7 @@ export function listEnabledFilterRules(db: DatabaseHandle, accountId: string): F
   return (rows as FilterRuleRow[]).map(ruleFromRow);
 }
 
-export function createFilterRule(db: DatabaseHandle, input: z.infer<typeof filterRuleCreateSchema>): FilterRule {
+export function createFilterRule(db: DatabaseHandle, input: FilterRuleInput): FilterRule {
   const positionRow = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS next_position FROM filter_rules").get() as { next_position: number };
   const id = randomUUID();
   const now = new Date().toISOString();
@@ -145,7 +107,7 @@ export function createFilterRule(db: DatabaseHandle, input: z.infer<typeof filte
 export function updateFilterRule(
   db: DatabaseHandle,
   id: string,
-  input: z.infer<typeof filterRuleUpdateSchema>,
+  input: FilterRuleUpdate,
 ): FilterRule | undefined {
   const existing = db.prepare(`SELECT ${ruleSelectColumns} FROM filter_rules WHERE id = ?`).get(id) as FilterRuleRow | undefined;
   if (!existing) return undefined;

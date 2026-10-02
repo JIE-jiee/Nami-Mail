@@ -2,7 +2,7 @@
 
 [Chinese](security.zh-CN.md) | [English](security.en.md)
 
-> **Current-build status: enforced.** The 0.4.0 build ships the `namimail` CLI, MCP stdio adapter, Broker, pairing records, and the external AgentHost path behind a paired current-user SID-DACL named pipe. The security boundaries below are enforced by the shipped build; violating external entry points fail closed rather than degrading. Experimental local NLLB translation remains separate, explicit, and opt-in.
+> **Current-build status: enforced.** The 0.4.0 build ships the `namimail` CLI, MCP stdio adapter, Broker, pairing records, and the external AgentHost path behind a paired current-user SID-DACL named pipe. The security boundaries below are enforced by the shipped build; violating external entry points fail closed rather than degrading. Message translation remains separate, explicit, and opt-in.
 
 ## Threat model
 
@@ -23,7 +23,7 @@ Encryption does not replace access control: reads still require caller scope, ac
 
 ## Model and egress
 
-The model is untrusted and owns no tool permission. Runtime labels mail as data, limits tool descriptors, argument size, timeout, and call count, and validates every model tool call. Cloud mail-content egress is off by default and needs visible, explicit, revocable consent for the target provider. Local NLLB translation is not part of this provider path.
+The model is untrusted and owns no tool permission. Runtime labels mail as data, limits tool descriptors, argument size, timeout, and call count, and validates every model tool call. Cloud mail-content egress is off by default and needs visible, explicit, revocable consent for the target provider. Message translation is not part of this provider path.
 
 ## Human confirmation
 

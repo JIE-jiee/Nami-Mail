@@ -5,33 +5,12 @@ import type { AgentCitation, AgentToolActivity, AgentConfirmation, AgentUiStream
 export type { AgentCitation, AgentToolActivity, AgentConfirmation };
 export type AgentStreamEvent = AgentUiStreamEvent;
 
-export type AgentProviderKind = "openai-compatible" | "ollama" | "anthropic" | "gemini" | "openai-responses";
+// The provider summary shape is single-sourced in @nami/agent-contracts (the
+// server's provider service serializes against the same schema).
+import type { AgentProviderKind, AgentProviderSummary } from "@nami/agent-contracts";
+export type { AgentProviderKind, AgentProviderSummary };
 
 /** Non-secret provider details returned by the local Agent service. */
-export type AgentProviderSummary = {
-  id: string;
-  label: string;
-  kind: AgentProviderKind;
-  endpoint: string;
-  model: string;
-  /** Tolerated for older records; retrieval no longer uses embeddings. */
-  embeddingModel?: string;
-  timeoutMs: number;
-  apiKeyConfigured: boolean;
-  configured: boolean;
-  cloud: boolean;
-  cloudContentConsent: boolean;
-  streaming: boolean;
-  /** Whether the configured model accepts image inputs; gates image attachments. */
-  vision: boolean;
-  health?: {
-    state: "ready" | "degraded" | "unavailable";
-    checkedAt: string;
-    message?: string;
-    error?: { code: string; message: string; suggestion?: string; retryable?: boolean };
-  };
-};
-
 export type AgentProviderList = {
   items: AgentProviderSummary[];
   defaultProviderId: string | null;

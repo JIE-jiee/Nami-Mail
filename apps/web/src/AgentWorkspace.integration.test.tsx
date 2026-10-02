@@ -180,7 +180,10 @@ vi.mock("./api", () => ({
       const params = new URLSearchParams(query);
       const term = (params.get("q") ?? "").toLowerCase();
       const items = term ? h.mentionMail.filter((m) => m.subject.toLowerCase().includes(term)) : h.mentionMail;
-      return { items, total: items.length, page: Number(params.get("page") ?? "1"), pageSize: Number(params.get("pageSize") ?? "10") };
+      // The list is cursor-paged: a request carrying a cursor resumes below the
+      // position it names, and every fixture here is one page, so the answer is
+      // always "this was the last page".
+      return { items, total: items.length, pageSize: Number(params.get("pageSize") ?? "10"), nextCursor: null };
     }),
   },
 }));
@@ -275,6 +278,7 @@ const accountOne: Account = {
   id: "account-1",
   email: "me@example.com",
   provider: "demo",
+  authMethod: "password",
   providerName: "Demo",
   status: "connected",
   lastError: null,
@@ -434,6 +438,25 @@ describe("AgentWorkspace conversation switching", () => {
       chips[0]!.click();
     });
     expect(h.onOpenMessage).toHaveBeenCalledWith("msg-ref-1");
+  });
+
+  it("names the configured model by its display name and keeps the model id on hover", async () => {
+    await renderWorkspace();
+    // The fixture's provider label ("Local") and model id ("m") differ on
+    // purpose: the composer must present the name the user configured, not
+    // the raw model id it happens to be pointed at.
+    const modelButton = container.querySelector<HTMLButtonElement>(".agent-composer-model");
+    expect(modelButton).not.toBeNull();
+    const name = modelButton?.querySelector("span");
+    expect(name?.textContent).toBe("Local");
+    expect(name?.getAttribute("title")).toBe("m");
+
+    act(() => {
+      modelButton!.click();
+    });
+    const options = Array.from(container.querySelectorAll<HTMLElement>(".agent-model-option-name"));
+    expect(options.map((option) => option.textContent)).toContain("Local");
+    expect(options.every((option) => option.getAttribute("title") === "m")).toBe(true);
   });
 
   it("types /@ to reveal the mention menu and introduces a mail as a reference chip", async () => {

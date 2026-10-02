@@ -8,7 +8,7 @@
 
 External Agents use the documented `namimail` commands. The default level is read-only, and write commands become available only after "External CLI permission" is raised to "Confirm each action" or "Full automatic". They must not read, copy, back up, or synchronize NamiMail data directories, SQLite, pairing records, or key material. They must not try `--server`, local HTTP, TCP, file URIs, environment-variable tokens, or guessed named pipes as a substitute path.
 
-Experimental local NLLB-200 translation still requires deliberate UI action. It is not an external Agent channel and never automatically translates mail or sends mail content to a model.
+Message translation still requires deliberate UI action. It is not an external Agent channel and never automatically translates mail or sends mail content to a model.
 
 ## Calling contract
 

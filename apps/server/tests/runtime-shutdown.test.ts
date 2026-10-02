@@ -29,6 +29,7 @@ const mocks = vi.hoisted(() => ({
   },
   getAppSettings: vi.fn(),
   getSyncMessageLimit: vi.fn(() => 10),
+  idleWatcherOptions: [] as Array<{ onChange: (accountId: string) => void }>,
   loadOrCreateMasterKey: vi.fn(),
   migrateAccountCredentialStorage: vi.fn(),
   migrateKnownProviderUsernameCredentials: vi.fn(),
@@ -62,6 +63,18 @@ vi.mock("../src/app.js", () => ({ buildApp: mocks.buildApp }));
 vi.mock("../src/config.js", () => ({ config: mocks.config }));
 vi.mock("../src/crypto.js", () => ({ loadOrCreateMasterKey: mocks.loadOrCreateMasterKey }));
 vi.mock("../src/db.js", () => ({ openDatabase: mocks.openDatabase }));
+vi.mock("../src/idle.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/idle.js")>();
+  return {
+    ...actual,
+    // The watcher itself stays real; the host's onChange hook is recorded so a
+    // test can drive the IDLE-triggered pass without a live IMAP server.
+    createIdleWatcher: (options: Parameters<typeof actual.createIdleWatcher>[0]) => {
+      mocks.idleWatcherOptions.push(options as unknown as { onChange: (accountId: string) => void });
+      return actual.createIdleWatcher(options);
+    },
+  };
+});
 vi.mock("../src/outbound-attachments.js", () => ({
   cleanupExpiredOutboundAttachments: mocks.cleanupExpiredOutboundAttachments,
   outboundAttachmentDirectory: mocks.outboundAttachmentDirectory,
@@ -103,6 +116,7 @@ describe("server runtime shutdown", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    mocks.idleWatcherOptions.length = 0;
     mocks.config.microsoftOAuthClientId = undefined;
   });
 
@@ -242,6 +256,69 @@ describe("server runtime shutdown", () => {
 
     await vi.advanceTimersByTimeAsync(300_000);
     expect(mocks.syncAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands every pass it starts a signal that close() aborts, on the poll and IDLE paths alike", async () => {
+    const database = {
+      close: vi.fn(),
+      prepare: vi.fn(() => ({
+        all: () => [{ id: "account-1" }],
+      })),
+    };
+    const fastify = {
+      close: vi.fn(async () => undefined),
+      listen: vi.fn(async () => undefined),
+      log: {
+        error: vi.fn(),
+        warn: vi.fn(),
+      },
+      server: {
+        address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43187 }),
+      },
+    };
+
+    mocks.openDatabase.mockReturnValue(database);
+    mocks.loadOrCreateMasterKey.mockReturnValue(Buffer.alloc(32));
+    mocks.outboundAttachmentDirectory.mockReturnValue("outbound");
+    mocks.getAppSettings.mockReturnValue({ refreshIntervalSeconds: 1 });
+    mocks.buildApp.mockResolvedValue(fastify);
+    // A pass blocks until it is released, and only lets go when the signal it
+    // was handed aborts — the shape a real pass has while it reads a mailbox.
+    const abortedPasses: string[] = [];
+    mocks.syncAccount.mockImplementation(async (...args: unknown[]) => {
+      const signal = args[6] as AbortSignal | undefined;
+      if (!signal) {
+        await new Promise<void>(() => { /* never released without a signal */ });
+      }
+      return new Promise((_, reject) => {
+        signal!.addEventListener("abort", () => {
+          abortedPasses.push("pass");
+          reject(Object.assign(new Error("Sync aborted."), { name: "SyncAbortedError" }));
+        }, { once: true });
+      });
+    });
+
+    const server = await startServer();
+    await vi.advanceTimersByTimeAsync(1_000);
+    // The poll pass and the IDLE-triggered pass are the two entry points this
+    // runtime owns; a third kind (the interactive route) has its own controller.
+    mocks.idleWatcherOptions.at(-1)!.onChange("account-1");
+    expect(mocks.syncAccount).toHaveBeenCalledTimes(2);
+
+    const signals = mocks.syncAccount.mock.calls.map((call) => call[6] as AbortSignal);
+    expect(signals).toHaveLength(2);
+    expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+    expect(signals.every((signal) => !signal.aborted)).toBe(true);
+
+    const firstClose = server.close();
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+
+    // The pass unwinds on the abort, so shutdown completes without the
+    // scheduler's grace window — and without the mailbox read finishing.
+    await firstClose;
+    expect(abortedPasses).toHaveLength(2);
+    expect(fastify.close).toHaveBeenCalledTimes(1);
+    expect(database.close).toHaveBeenCalledTimes(1);
   });
 
   it("keeps Microsoft OAuth unavailable when its localhost IPv6 callback cannot use the runtime port", async () => {

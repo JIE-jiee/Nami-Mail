@@ -26,6 +26,6 @@ Changing recognition, budgets, or ID generation changes index semantics. After a
 
 ## What it does not do
 
-It does not auto-translate text before chunking. Experimental NLLB translation remains separate and user-triggered, never an implicit RAG-ingestion step.
+It does not auto-translate text before chunking. Message translation remains separate and user-triggered, never an implicit RAG-ingestion step.
 
 See [Retrieval](retrieval.en.md) and [Ingestion](ingestion.en.md).

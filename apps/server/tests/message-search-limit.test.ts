@@ -58,7 +58,7 @@ describe("encrypted message search scale", () => {
 
     const response = await app.inject({ method: "GET", url: "/api/messages?q=needle" });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ total: 1, page: 1 });
+    expect(response.json()).toMatchObject({ total: 1, nextCursor: null });
     expect(response.json().items[0]).toMatchObject({ id: "message-2500" });
 
     const missing = await app.inject({ method: "GET", url: "/api/messages?q=absent-term" });

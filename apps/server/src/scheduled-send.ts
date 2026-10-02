@@ -1,4 +1,5 @@
 import type { DatabaseHandle } from "./db.js";
+import { accountById } from "./account-store.js";
 import type { AgentMailEventSink } from "./agent/mail-state-events.js";
 import { discardDraft } from "./drafts.js";
 import type { AccountAccessTokenProvider } from "./mail.js";
@@ -29,10 +30,6 @@ export type ScheduledSendDependencies = {
   scheduleSentVerification: (submissionId: string) => void;
   onFailure?: (submissionId: string, error: unknown) => void;
 };
-
-function accountById(db: DatabaseHandle, id: string): AccountRecord | undefined {
-  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRecord | undefined;
-}
 
 function storedDraftMessageId(
   db: DatabaseHandle,

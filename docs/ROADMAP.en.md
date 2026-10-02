@@ -2,6 +2,16 @@
 
 This document tracks features that have been confirmed but are not yet scheduled (backlog). Scheduled features are tracked in the [Unreleased] section of the CHANGELOG.
 
+## Microsoft mailbox OAuth built-in authorization (Outlook / Hotmail access recovery)
+
+**Status**: blocked (2026-10-01). Details, recovery path and acceptance criteria in [issue #116](https://github.com/QinIndexCode/nami-mail/issues/116).
+
+**Situation**: Microsoft disabled IMAP/SMTP basic authentication for Outlook.com in Sept 2024 (plain and app passwords are rejected server-side), so OAuth is the only path; current builds do not bundle an OAuth client ID, so default installs cannot add Outlook / Hotmail accounts. Developer-side Azure app registration requires a payment card (Mastercard/Visa), which is the current blocker; the frontend explains this state honestly.
+
+**Recovery steps** (one-time once a client ID is available): register a public-client app (platform "Mobile and desktop applications", redirect URI `http://localhost/api/oauth/microsoft/callback`, enable "Allow public client flows") → paste the application (client) ID into `builtinMicrosoftOAuthClientId` in `apps/server/src/config.ts` (mechanism already shipped; env override wins) → restore the three "not yet available" copy keys (zh/en) → full gates + live verification, then release.
+
+**Boundaries**: personal accounts have no per-user cap; enterprise tenants need admin tenant-wide consent until Publisher Verification (free) is completed. Gmail restricted scopes carry Google's 100-test-user cap plus a CASA security assessment gate — decide separately.
+
 ## Image upload / multimodal (vision) support
 
 **Status**: confirmed, not scheduled. Not recommended for the 0.3.0 release cycle (large cross-cutting change, and not a core requirement for the mail workflow).
@@ -40,6 +50,14 @@ Agent workspace with the reference already attached and the instruction already 
 - **Prerequisite**: the reading pane is inline in the 3,818-line `App.tsx` with no dedicated test, so the "intent → preset text / whether to auto-send" decision must first be extracted into a pure, unit-tested function (following `slashMenu.ts` / `contextMenu.ts`).
 - **Gap**: `AgentWorkspace` has no `initialPrompt` / auto-send intent (it can only seed the reference chip), so a new prop is required.
 - **Constraint**: new copy must land in both `zh-CN.json` and `en-US.json` (enforced by `build-locale-catalog --check` in CI).
+
+## Compose dialog: expandable full-page mode (hybrid)
+
+**Status**: direction confirmed, unscheduled (raised in the 2026-09-27 interaction review).
+
+**Goal**: keep the compose overlay as the default (it preserves the inbox context and suits quick replies) and add an "expand to full page" toggle in the dialog header, reusing the reader's existing full-page shell with the back arrow for immersive long-form writing. Replies started from the reader keep the overlay form (the context is the open message).
+
+**Notes**: ComposeModal gains a size state with two CSS layouts; the dialogRouting Escape/focus chain stays untouched; draft content must survive view switches; mobile keeps the overlay form.
 
 ## UI and interaction polish (audited 2026-09-10, delivered in batches)
 

@@ -6,6 +6,7 @@
  */
 import { z } from "zod";
 import { type AccountCredentialIdentity } from "./account-credentials.js";
+import type { ProviderDiscovery, ProviderProfile } from "@nami/agent-contracts";
 import { OutboundAttachmentError } from "./outbound-attachments.js";
 import { mailErrorHttpStatus, safeMailError } from "./mail.js";
 import { OAuthError } from "./oauth.js";
@@ -39,7 +40,13 @@ export function isOAuthOnlyProvider(provider: DetectedProvider): boolean {
   return provider.authMethods.length > 0 && provider.authMethods.every((method) => method === "oauth2");
 }
 
-export function providerInfo(provider: ProviderPreset) {
+/**
+ * The common provider payload both the /api/providers catalog and discovery
+ * serialize (the contract's `ProviderProfile`). The routes add the
+ * per-install fields (`domains`, `oauthProvider`, `oauthAvailable`) on top;
+ * annotating this base keeps the producer honest against the wire schema.
+ */
+export function providerInfo(provider: ProviderPreset): ProviderProfile {
   return {
     id: provider.id,
     name: provider.name,
@@ -65,7 +72,7 @@ export function providerInfo(provider: ProviderPreset) {
   };
 }
 
-export function providerDiscovery(provider: DetectedProvider) {
+export function providerDiscovery(provider: DetectedProvider): ProviderDiscovery {
   return {
     ...providerInfo(provider),
     domain: provider.domain,

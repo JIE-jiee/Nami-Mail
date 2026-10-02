@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { createToolRegistry } from "@nami/agent-core";
+import { autoReplyDecisionReasons } from "@nami/agent-contracts";
+import { EncryptedAutoReplyDecisionStore } from "../src/agent/auto-reply-decisions.js";
 import { EncryptedAgentMemoryStore } from "../src/agent/memory.js";
-import { createMemoryTools } from "../src/agent/memory-tools.js";
+import { createAutoReplyDecisionTools, createMemoryTools } from "../src/agent/memory-tools.js";
 import { applyAgentStoreSchema } from "../src/agent/schema.js";
 import { openDatabase } from "../src/db.js";
 
@@ -157,5 +159,31 @@ describe("memory tools", () => {
     const list = registry.get("memory.list")!;
     expect(list.inputSchema.safeParse({ limit: 0 }).success).toBe(false);
     expect(list.inputSchema.safeParse({ limit: 51 }).success).toBe(false);
+  });
+});
+
+describe("auto-reply declined-search tool", () => {
+  it("embeds exactly the contract reason vocabulary in its description", () => {
+    const db = openDatabase(":memory:");
+    try {
+      applyAgentStoreSchema(db, timestamp);
+      const store = new EncryptedAutoReplyDecisionStore(db, randomBytes(32), () => timestamp);
+      const tool = createAutoReplyDecisionTools(store)
+        .find((candidate) => candidate.descriptor.name === "auto-reply.declined.search");
+      expect(tool).toBeDefined();
+      // The description's reason list is derived from the contract array; this
+      // literal is the historical string and must stay byte-for-byte stable so
+      // the model-facing tool text only changes deliberately.
+      const reasonList = autoReplyDecisionReasons.map((reason) => `'${reason}'`).join("|");
+      expect(tool!.descriptor.description).toBe(
+        "Searches the audit list of inbound messages the Agent did not auto-reply to "
+        + "(screened out, out of scope, low value, rejected confirmations, send failures). "
+        + `Input: { query?: string, reason?: ${reasonList}, fromAddress?: string, subject?: string, limit?: number }. `
+        + "Use when the user asks why no auto-reply was sent to someone, or wants to review skipped messages. "
+        + "Returns the most recent decisions first.",
+      );
+    } finally {
+      db.close();
+    }
   });
 });

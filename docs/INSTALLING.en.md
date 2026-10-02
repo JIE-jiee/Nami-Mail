@@ -36,7 +36,7 @@ When a newer stable version is found, the app offers three choices:
 
 - **Update this version**: download and verify the ZIP update in the background. After the download, you still choose when to **Restart and update**; merely finding an update never restarts the app.
 - **Skip this version**: stop offering that version and clear any downloaded update cache for it.
-- **Remind me later**: choose a reminder in one hour, tomorrow, one week, or 30 days.
+- **Remind me later**: choose a reminder in one hour, one day, one week, or 30 days.
 
 Before installation, updates check the version, asset name, size, SHA-512, and release trust chain. The app also closes its local service and outbound queue safely. On success it attempts to remove the update ZIP and temporary extraction directory. Windows file locks can defer cleanup until the next launch; this does not affect installed mail data. A failed update should leave the app usable and show an actionable error. Do not download a replacement ZIP from an unknown link.
 

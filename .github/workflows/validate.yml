@@ -30,7 +30,7 @@ jobs:
       # v7.0.0 (Node.js 24); keep this action pinned for untrusted pull-request code.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 22.14.0
+          node-version: 24.21.0
           cache: npm
       - run: npm ci
       # better-sqlite3 v13 uses a shared Windows x64 N-API prebuild. Verify
@@ -40,20 +40,14 @@ jobs:
       - run: npm run smoke:server-node
       # Fail when committed icons or theme marks no longer match their source artwork.
       - run: npm run build:brand:check
-      - run: node --test scripts/release-policy.test.mjs
-      - run: node --test scripts/build-locale-catalog.test.mjs
-      # Script-level invariants: watchdog restart backoff, kill-safe packaging
-      # trust injection, dev ports pinned to the server PORT default, and the
-      # docs-to-wiki page mapping.
-      - run: node --test scripts/dev-server-backoff.test.mjs scripts/package-win-trust.test.mjs scripts/dev-port-sync.test.mjs
-      # GitHub ZIP update assets: the Ed25519 trust record must never embed the
-      # release private key.
-      - run: node --test scripts/github-update-assets.test.mjs
-      - run: node --test scripts/wiki-sync.test.mjs
-      # The documentation site is generated from `docs/` at deploy time; build it
-      # here too, so a pull request cannot merge a broken internal link or a
-      # heading anchor that no longer exists.
-      - run: node --test scripts/build-docs-site.test.mjs
+      # Every script-level invariant lives in scripts/tests/ and is discovered
+      # by this one run: watchdog restart backoff, kill-safe packaging trust
+      # injection, dev ports pinned to the server PORT default, the docs-to-wiki
+      # page mapping, the docs-site builder (a pull request cannot merge a
+      # broken internal link or a heading anchor that no longer exists) and the
+      # GitHub ZIP update assets (the Ed25519 trust record must never embed the
+      # release private key).
+      - run: node --test "scripts/tests/*.test.mjs"
       - run: node scripts/build-docs-site.mjs
       - run: node scripts/build-locale-catalog.mjs --check
       - run: npm run lint
